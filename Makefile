@@ -22,12 +22,12 @@ RM = rm -f
 #       -DT4COMBINATIONS=1      to replace common instruction sequences
 #       -DT4RELEASE=1           produce fast emulator (no profiling,tracing)
 #
-CFLAGS = -I. -O2 -fomit-frame-pointer -Wall -DCURTERM=1 -DT4SHLINKS=1 -DT4COMBINATIONS=1
+CFLAGS = -I. -O2 -fomit-frame-pointer -Wall -DCURTERM=1 -DT4SHLINKS=1 -DT4COMBINATIONS=1 -DEMUDEBUG -DT4_X11_FB $(shell pkg-config --cflags x11)
 # For a reasonably optimised version for SunOS 4.1.4.
 # CFLAGS = -O2 -Wall -DSUN
 
 # Put any additional libraries here.
-LFLAGS	= -lm
+LFLAGS	= -lm $(shell pkg-config --libs x11)
 
 #
 # https://github.com/JuliaMath/openlibm

@@ -32,12 +32,23 @@ CFLAGS = -I. -Wall -DCURTERM=1 \
 	-DT4NANOMSG=1 \
 	-DT4SHLINKS=1 \
 	-DT4COMBINATIONS=1 \
-	-DT4RELEASE=1
+	-DT4RELEASE=1 \
+	-DEMUDEBUG
+
+X11_CFLAGS := $(shell pkg-config --cflags x11 2>/dev/null)
+X11_LIBS   := $(shell pkg-config --libs x11 2>/dev/null)
+
+ifeq ($(strip $(X11_LIBS)),)
+X11_LIBS := -lX11
+endif
+
+CFLAGS += $(X11_CFLAGS) -DT4_X11_FB
 # For a reasonably optimised version for SunOS 4.1.4.
 # CFLAGS = -O2 -Wall -DSUN
 
 # Put any additional libraries here.
-LFLAGS	= /usr/local/lib/libnanomsg.a -lanl -lpthread -lm
+# Changed from static libnanomsg.a to dynamic -lnanomsg for better portability
+LFLAGS	= -lnanomsg -lanl -lpthread -lm $(X11_LIBS)
 
 #
 # https://github.com/JuliaMath/openlibm

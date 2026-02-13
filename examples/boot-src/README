@@ -1,0 +1,160 @@
+File        : README
+Author      : Stuart Menefy
+Description : README for Minix Boot Monitor
+Header      : $Id: README,v 1.4 1994/04/11 16:40:29 stuart Exp $
+
+
+		     Transputer Minix boot monitor
+		     -----------------------------
+
+The is a brief description of the implementation of the Transputer
+Minix boot monitor. It is designed to make it easier to boot Minix
+onto transputers, as it provides:
+   - Auto-sizing of available memory.
+   - Simple command line interface.
+   - Bootstraping of Minix modules without need for build(1).
+It is mainly designed as an aid to the development of future Transputer
+Minix systems which might require more complex booting strategies.
+
+
+Implementation
+--------------
+
+The boot monitor has three phases:
+  i) Primary bootstrap.
+     This is the bootstrap which the Transputer hardware understands. It:
+       - Initialises the transputer hardware (links, timer and queues).
+       - Loads the secondary bootstrap from same place, and jumps into it.
+
+ ii) Secondard bootstrap.
+     This is used to set up the hardware ready for the boot monitor. It:
+       - Initialises the DUART if required.
+       - Displays a message.
+       - Determines how much memory is available.
+       - Loads the monitor into the top of high memory, and executes it.
+
+iii) Boot monitor.
+     This is the main boot monitor program, which has a full user
+     interface, and is able to load in processes ready for execution.
+
+This three stage bootstrap has been used to make writing the memory
+test easier, and hence allow the boot monitor to be loaded at the top
+of memory. to be used to allow the memory test. 
+
+The memory test is most easily performed while all the code and data
+can be held in internal memory. However because the boot monitor will
+not fit in internal memory, and the code required to perform console
+output while doing the test (and input the monitor using the server
+after it has finished booting) is too big for the primary bootstrap,
+the three phase technique is used.
+
+Unfortunatly this does mean that two differemt types of bootables have
+to be built:
+  link  The primary and secondary bootstrap are built into a single file
+        and written to the link by the iserver, which the starts serving
+        the link. This allows the secondary bootstrap to perform console
+        I/O, and then load the monitor from a separate file from the
+        host. 
+  disk  The boot track must contain the monitor as well as the primary
+        and secondary bootstraps. This is because the rawfs code needed
+        to read the monitor from a file system would be too big to fit
+        in the secondary bootstrap. It thus relies on the M2 maintaining
+        the "CurrentSector" params after loading the secondary
+        bootstrap, so that the monitor can simply be read from the
+        subsequent sectors.
+The build program reflects this, by allowing an arbitary number of
+programs to be concatinated after the initial bootstrap.
+
+
+Memory map
+----------
+
+Top                                             +---------------+
+                                                |               |
+                                                |Monitor code   |
+                                                |               |
+                                                +---------------+
+                                                |Monitor Stack  |
+                                                |               |
+                                                |               |
+                                                |Monitor BSS    |
+                                                +---------------+
+                                                |               |
+                                                |               |
+                                                |               |
+          |               |  |               |  |               |
+80000800  +---------------+  +---------------+  |               |
+          |               |  |Secondary BSS  |  |               |
+          |               |  +---------------+  |               |
+          |               |  |               |  |       ^       |
+          |               |  |Secondary code |  |       |       |
+          |               |  |               |  |       |       |
+          +---------------+  +---------------+  |               |
+          |Primary stack  |  |               |  |    Loaded     |
+          +---------------+  |Secondary stack|  |               |
+          |Primary code   |  |               |  |    Modules    |
+          +---------------+  +---------------+  +---------------+
+          |Channels etc.  |  |Channels etc.  |  |Channels etc.  |
+80000000  +---------------+  +---------------+  +---------------+
+
+             Primary             Secondary         Boot monitor
+
+
+Files
+-----
+
+This shows the sources files which go into each of the executables:
+
+                        Disk version            Link version
+
+primary bootstrap:      bootstrap.S             bootstrap.S
+                        --------------          --------------
+                        bootd                   bootl
+
+secondary bootstrap:    second.S                second.S
+                        csecond.c               csecond.c
+                        secondd.c               secondl.c
+                        diskio.c                linkio.c
+                        termio.c
+                        --------------          --------------
+                        secondd                 secondl
+
+boot monitor:           monitor.S               monitor.S
+                        cmonitor.c              cmonitor.c
+                        monitord.c              monitorl.c
+                        fileio.c                linkio.c
+                        termio.c
+                        rawfs.c
+                        --------------          --------------
+                        monitord                monitorl
+
+Memory Test
+-----------
+
+The memory test uses the same technique as the Inmos tool mtest for
+sizing memory, but omits the full tests for speed. Because it is common
+for the memory map of a Transputer to be only partly decoded,  memory
+will frequently warp round, that is, the same memory location will
+appear at multiple addresses in the memory map. For this reason the
+memory test has to be slightly more complex than is commonly used on
+other machines.
+
+The test works in blocks of 2K, which is chosen to be just above the 2K
+of internal RAM found on early processors. The word at the base of the
+current block is first filled with 0's and then 1's to ensure that it
+is 'real' memory, and then the address is written into the word. To
+check if this location has wrapped round, the first word of each block
+below this is then check to ensure that it still holds it's address. If
+not, then the location just written to must be the first location to
+have wrapped round, and the memory test stops.
+
+The problem with this technique is that the time taken is exponentially 
+related to the amount of memory. For example:
+  	  16M   45 seconds
+	   8M   12 seconds
+	   2M    2 seconds
+One solution would be to increase the block size as memory size grows.
+This risks missing some usable memory, but given the large memory size,
+this would be acceptable. However this would complicate the code
+slightly and unless someone gives me a board with a large amount of
+memory on it, I'm not going to fix it!
