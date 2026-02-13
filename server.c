@@ -87,7 +87,7 @@ int  loop1;
 int  loop2;
 int  FromServerLen = 0;
 int  ToServerLen = 0;
-u_char FromServerBuffer[(16*1024)+5];
+u_char FromServerBuffer[(8*1024*1024)+5];  /* 8MB buffer for large kernel images */
 u_char ToServerBuffer[514];
 void dump_message   (char *msg, u_char *buffer, int len);
 void notimpl_packet (void);

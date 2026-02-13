@@ -180,9 +180,10 @@ unsigned char
 get_char(void)
 {
    char buf;
+   ssize_t ret __attribute__((unused));
 
    fflush(stdout);
-   (void) read(STDIN_FILENO, &buf, sizeof(char));
+   ret = read(STDIN_FILENO, &buf, sizeof(char));
    return (unsigned char)buf;
 }
 
@@ -206,17 +207,19 @@ int getkey(void)
 void gotoxy(int x, int y)
 {
 	char buf[16];
+	ssize_t ret __attribute__((unused));
 
 	sprintf(buf, "%c[%d;%dH", ESC, y, x);
-	(void) write(1, buf, strlen(buf));
+	ret = write(1, buf, strlen(buf));
 }
 
 void clrscr(void)
 {
 	char buf[16];
+	ssize_t ret __attribute__((unused));
 
 	sprintf(buf, "%c[2J", ESC);
-	(void) write(1, buf, strlen(buf));
+	ret = write(1, buf, strlen(buf));
 	gotoxy(0, 0);
 }
 

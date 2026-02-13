@@ -48,6 +48,7 @@
 #include <unistd.h>
 #endif
 #include <math.h>
+#include <inttypes.h>
 #ifdef T4NANOMSG
 #define NN_STATIC_LIB   ON
 #include <nanomsg/nn.h>
@@ -117,7 +118,1357 @@ uint32_t MemByteMask = ((uint32_t)0x001fffff);
 uint32_t CLineTagsSize;
 
 #define InvalidInstr_p  ((uint32_t)0x2ffa2ffa)
+
+static const uint32_t boot_call_start = 0x80000120;
+static const uint32_t boot_call_end = 0x80000130;
+int bootdbg_stop_after_call_enabled = 0;
+int bootdbg_enabled = 0;
+int bootwin_enabled = 0;
+int uart_trace_enabled = 0;
+int sk_byte_trace_enabled = 0;
+int sk_areg_trace_enabled = 0;
+int sk_addr_trace_enabled = 0;
+int wptr_trace_enabled = 0;
+int sk_store_trace_enabled = 0;
+int text_write_trace_enabled = 0;
+static uint32_t text_write_trace_start = 0x80880000;
+static uint32_t text_write_trace_end = 0x80890000;
+int cache_debug_trace_enabled = 0;
+static uint32_t cache_debug_trace_start = 0;
+static uint32_t cache_debug_trace_end = 0;
+uint32_t sk_entry_iptr = 0;
+int sk_entry_dump_enabled = 0;
+static int prolog_map_loaded = 0;
+static uint32_t prolog_text_base = 0x80000070;
+typedef struct {
+	uint32_t text_off;
+	char name[96];
+} prolog_sym;
+static prolog_sym *prolog_syms = NULL;
+static size_t prolog_sym_count = 0;
+typedef struct {
+	uint32_t sym_off;
+	char name[96];
+} link_sym;
+static link_sym *link_syms = NULL;
+static size_t link_sym_count = 0;
+static uint32_t link_text_base = 0;
+static int link_map_loaded = 0;
+static int outbyte_trace_enabled = 0;
+static int outbyte_entry_logged = 0;
+static int sym_dump_logged = 0;
+static int sym_trace_active = 0;
+static int sym_trace_remaining = 0;
+static uint32_t sym_trace_entry = 0;
+static char sym_trace_name[96];
+static int iptr_trace_enabled = 0;
+static uint32_t iptr_trace_start = 0;
+static uint32_t iptr_trace_end = 0;
+static int boot_dump_start_enabled = 0;
+static int boot_dump_start_done = 0;
+static int uart_console_enabled = 1;
+static int link0_trace_enabled = 1;
+static int mmio_trace_enabled = 0;
+static int early_printk_trace_enabled = 0;
+static int nearest_sym_enabled = 0;
+static int iptr_dump_logged = 0;
+static int prolog_text_base_autodone = 0;
+static int sk_entry_dumped = 0;
+static int stop_after_boot_call = 0;
+static int last_boot_call_is_gcall = 0;
+static uint32_t last_boot_call_site = 0;
+static uint32_t last_boot_call_target = 0;
+static uint32_t last_boot_call_return = 0;
+static uint32_t last_boot_call_wptr = 0;
 #define Undefined_p     ((uint32_t)0xdeadbeef)
+
+static void load_prolog_map(void) {
+	const char *path;
+	FILE *fp;
+	char line[256];
+	if (prolog_map_loaded)
+		return;
+	prolog_map_loaded = 1;
+	path = getenv("T4_PROLOG_MAP");
+	if (!path || !*path)
+		return;
+	{
+		const char *base_env = getenv("T4_TEXT_BASE");
+		if (base_env && *base_env)
+			prolog_text_base = (uint32_t)strtoul(base_env, NULL, 0);
+	}
+	fp = fopen(path, "r");
+	if (!fp) {
+		fprintf(stderr, "T4_PROLOG: failed to open %s\n", path);
+		return;
+	}
+	while (fgets(line, sizeof(line), fp)) {
+		char func[96];
+		unsigned int off;
+		if (sscanf(line, "PROLOG: func=%95s text_off=0x%x", func, &off) == 2) {
+			prolog_sym *tmp = realloc(prolog_syms, (prolog_sym_count + 1) * sizeof(*prolog_syms));
+			if (!tmp)
+				break;
+			prolog_syms = tmp;
+			prolog_syms[prolog_sym_count].text_off = off;
+			strncpy(prolog_syms[prolog_sym_count].name, func,
+			        sizeof(prolog_syms[prolog_sym_count].name) - 1);
+			prolog_syms[prolog_sym_count].name[sizeof(prolog_syms[prolog_sym_count].name) - 1] = '\0';
+			prolog_sym_count++;
+		}
+	}
+	fclose(fp);
+	if (prolog_sym_count) {
+		size_t i;
+		for (i = 1; i < prolog_sym_count; i++) {
+			size_t j = i;
+			while (j > 0 && prolog_syms[j - 1].text_off > prolog_syms[j].text_off) {
+				prolog_sym tmp = prolog_syms[j - 1];
+				prolog_syms[j - 1] = prolog_syms[j];
+				prolog_syms[j] = tmp;
+				j--;
+			}
+		}
+		fprintf(stderr, "T4_PROLOG: loaded %zu symbols (text_base=0x%08x)\n",
+		        prolog_sym_count, prolog_text_base);
+	}
+}
+
+static void load_link_map(void) {
+	const char *path;
+	FILE *fp;
+	char line[512];
+	if (link_map_loaded)
+		return;
+	link_map_loaded = 1;
+	path = getenv("T4_SYM_MAP");
+	if (!path || !*path)
+		return;
+	{
+		const char *base_env = getenv("T4_SYM_BASE");
+		if (base_env && *base_env)
+			link_text_base = (uint32_t)strtoul(base_env, NULL, 0);
+	}
+	fp = fopen(path, "r");
+	if (!fp) {
+		fprintf(stderr, "T4_SYM_MAP: failed to open %s\n", path);
+		return;
+	}
+	while (fgets(line, sizeof(line), fp)) {
+		char *p = line;
+		char *end = NULL;
+		unsigned long off;
+		char name[128];
+		char type = '\0';
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!*p || *p == '\n')
+			continue;
+		off = strtoul(p, &end, 16);
+		if (end == p)
+			continue;
+		while (*end == ' ' || *end == '\t')
+			end++;
+		if (!*end || *end == '\n')
+			continue;
+		type = *end;
+		end++;
+		while (*end == ' ' || *end == '\t')
+			end++;
+		if (!*end || *end == '\n')
+			continue;
+		if (sscanf(end, "%127s", name) != 1)
+			continue;
+		(void)type;
+		{
+			link_sym *tmp = realloc(link_syms, (link_sym_count + 1) * sizeof(*link_syms));
+			if (!tmp)
+				break;
+			link_syms = tmp;
+			link_syms[link_sym_count].sym_off = (uint32_t)off;
+			strncpy(link_syms[link_sym_count].name, name,
+			        sizeof(link_syms[link_sym_count].name) - 1);
+			link_syms[link_sym_count].name[sizeof(link_syms[link_sym_count].name) - 1] = '\0';
+			link_sym_count++;
+		}
+	}
+	fclose(fp);
+	if (link_sym_count) {
+		size_t i;
+		for (i = 1; i < link_sym_count; i++) {
+			size_t j = i;
+			while (j > 0 && link_syms[j - 1].sym_off > link_syms[j].sym_off) {
+				link_sym tmp = link_syms[j - 1];
+				link_syms[j - 1] = link_syms[j];
+				link_syms[j] = tmp;
+				j--;
+			}
+		}
+		fprintf(stderr, "T4_SYM_MAP: loaded %zu symbols (text_base=0x%08x)\n",
+		        link_sym_count, link_text_base);
+	}
+}
+
+static const prolog_sym *find_prolog_sym(uint32_t iptr, uint32_t *delta_out) {
+	const prolog_sym *best = NULL;
+	uint32_t off;
+	size_t i;
+	if (!prolog_map_loaded)
+		load_prolog_map();
+	if (!prolog_syms || !prolog_sym_count)
+		return NULL;
+	if (iptr < prolog_text_base)
+		return NULL;
+	off = iptr - prolog_text_base;
+	for (i = 0; i < prolog_sym_count; i++) {
+		if (prolog_syms[i].text_off <= off)
+			best = &prolog_syms[i];
+		else
+			break;
+	}
+	if (best && delta_out)
+		*delta_out = off - best->text_off;
+	return best;
+}
+
+static const prolog_sym *find_prolog_sym_by_name(const char *name) {
+	size_t i;
+	if (!prolog_map_loaded)
+		load_prolog_map();
+	if (!prolog_syms || !prolog_sym_count || !name)
+		return NULL;
+	for (i = 0; i < prolog_sym_count; i++) {
+		if (strcmp(prolog_syms[i].name, name) == 0)
+			return &prolog_syms[i];
+	}
+	return NULL;
+}
+
+static const link_sym *find_link_sym(uint32_t iptr, uint32_t *delta_out) {
+	const link_sym *best = NULL;
+	uint32_t off;
+	size_t i;
+	if (!link_map_loaded)
+		load_link_map();
+	if (!link_syms || !link_sym_count)
+		return NULL;
+	if (!link_text_base)
+		return NULL;
+	if (iptr < link_text_base)
+		return NULL;
+	off = iptr - link_text_base;
+	for (i = 0; i < link_sym_count; i++) {
+		if (link_syms[i].sym_off <= off)
+			best = &link_syms[i];
+		else
+			break;
+	}
+	if (best && delta_out)
+		*delta_out = off - best->sym_off;
+	return best;
+}
+
+static const link_sym *find_link_sym_by_name(const char *name) {
+	size_t i;
+	if (!link_map_loaded)
+		load_link_map();
+	if (!link_syms || !link_sym_count || !name)
+		return NULL;
+	for (i = 0; i < link_sym_count; i++) {
+		if (strcmp(link_syms[i].name, name) == 0)
+			return &link_syms[i];
+	}
+	return NULL;
+}
+
+static void maybe_log_nearest_sym(uint32_t iptr, const char *reason) {
+	uint32_t delta = 0;
+	const link_sym *lsym;
+	const prolog_sym *psym;
+	if (!nearest_sym_enabled)
+		return;
+	lsym = find_link_sym(iptr, &delta);
+	if (lsym) {
+		fprintf(stderr,
+		        "[NEAR_SYM] %s IPtr=0x%08X sym=%s off=0x%X+0x%X\n",
+		        reason ? reason : "iptr", iptr,
+		        lsym->name, lsym->sym_off, delta);
+		return;
+	}
+	psym = find_prolog_sym(iptr, &delta);
+	if (psym) {
+		fprintf(stderr,
+		        "[NEAR_PROLOG] %s IPtr=0x%08X sym=%s text_off=0x%X+0x%X\n",
+		        reason ? reason : "iptr", iptr,
+		        psym->name, psym->text_off, delta);
+	}
+}
+
+static void dump_sym_bytes_once(const char *sym_name) {
+	const prolog_sym *sym;
+	const link_sym *lsym;
+	uint32_t entry_iptr;
+	uint32_t len = 32;
+	uint32_t i;
+	const char *len_env;
+	const char *auto_env;
+	if (sym_dump_logged || !sym_name || !*sym_name)
+		return;
+	auto_env = getenv("T4_TEXT_BASE_AUTO");
+	if (auto_env && *auto_env && !prolog_text_base_autodone)
+		return;
+	lsym = find_link_sym_by_name(sym_name);
+	if (lsym && link_text_base) {
+		entry_iptr = link_text_base + lsym->sym_off;
+	} else {
+		sym = find_prolog_sym_by_name(sym_name);
+		if (!sym)
+			return;
+		entry_iptr = prolog_text_base + sym->text_off;
+	}
+	len_env = getenv("T4_DUMP_SYM_LEN");
+	if (len_env && *len_env)
+		len = (uint32_t)strtoul(len_env, NULL, 0);
+	fprintf(stderr, "[SYM_DUMP] func=%s entry=0x%08X len=%u\n",
+	        sym_name, entry_iptr, len);
+	fprintf(stderr, "[SYM_BYTES] ");
+	for (i = 0; i < len; i++) {
+		fprintf(stderr, "%02X%s", byte_int(entry_iptr + i),
+		        (i + 1 == len) ? "\n" : " ");
+	}
+	sym_dump_logged = 1;
+}
+
+static void dump_iptr_bytes_once(void) {
+	const char *iptr_env;
+	const char *len_env;
+	uint32_t entry_iptr;
+	uint32_t len = 32;
+	uint32_t i;
+	if (iptr_dump_logged)
+		return;
+	iptr_env = getenv("T4_DUMP_IPTR");
+	if (!iptr_env || !*iptr_env)
+		return;
+	entry_iptr = (uint32_t)strtoul(iptr_env, NULL, 0);
+	if (!entry_iptr)
+		return;
+	len_env = getenv("T4_DUMP_IPTR_LEN");
+	if (len_env && *len_env)
+		len = (uint32_t)strtoul(len_env, NULL, 0);
+	if (len > 256)
+		len = 256;
+	fprintf(stderr, "[IPTR_DUMP] addr=0x%08X len=%u\n", entry_iptr, len);
+	fprintf(stderr, "[IPTR_BYTES] ");
+	for (i = 0; i < len; i++) {
+		fprintf(stderr, "%02X%s", byte_int(entry_iptr + i),
+		        (i + 1 == len) ? "\n" : " ");
+	}
+	iptr_dump_logged = 1;
+}
+
+static void setup_sym_trace_once(void) {
+	const char *sym_name;
+	const char *count_env;
+	const prolog_sym *sym;
+	const link_sym *lsym;
+	const char *auto_env;
+	if (sym_trace_entry || sym_trace_active)
+		return;
+	sym_name = getenv("T4_TRACE_SYM");
+	if (!sym_name || !*sym_name)
+		return;
+	auto_env = getenv("T4_TEXT_BASE_AUTO");
+	if (auto_env && *auto_env && !prolog_text_base_autodone)
+		return;
+	lsym = find_link_sym_by_name(sym_name);
+	if (lsym && link_text_base) {
+		sym_trace_entry = link_text_base + lsym->sym_off;
+		strncpy(sym_trace_name, lsym->name, sizeof(sym_trace_name) - 1);
+	} else {
+		sym = find_prolog_sym_by_name(sym_name);
+		if (!sym)
+			return;
+		sym_trace_entry = prolog_text_base + sym->text_off;
+		strncpy(sym_trace_name, sym->name, sizeof(sym_trace_name) - 1);
+	}
+	sym_trace_name[sizeof(sym_trace_name) - 1] = '\0';
+	count_env = getenv("T4_TRACE_SYM_COUNT");
+	sym_trace_remaining = count_env && *count_env ? atoi(count_env) : 64;
+	if (sym_trace_remaining <= 0)
+		sym_trace_remaining = 64;
+	fprintf(stderr, "[SYM_TRACE] armed func=%s entry=0x%08X count=%d\n",
+	        sym_trace_name, sym_trace_entry, sym_trace_remaining);
+}
+
+static void setup_iptr_trace_once(void) {
+	const char *start_env;
+	const char *len_env;
+	uint32_t len = 0;
+	if (iptr_trace_enabled)
+		return;
+	start_env = getenv("T4_TRACE_IPTR");
+	if (!start_env || !*start_env)
+		return;
+	iptr_trace_start = (uint32_t)strtoul(start_env, NULL, 0);
+	if (!iptr_trace_start)
+		return;
+	len_env = getenv("T4_TRACE_IPTR_LEN");
+	if (len_env && *len_env)
+		len = (uint32_t)strtoul(len_env, NULL, 0);
+	if (!len)
+		len = 64;
+	iptr_trace_end = iptr_trace_start + len;
+	iptr_trace_enabled = 1;
+	fprintf(stderr, "[IPTR_TRACE] armed start=0x%08X len=%u\n",
+	        iptr_trace_start, len);
+}
+
+static void setup_text_write_trace_once(void) {
+	static int setup_done = 0;
+	const char *start_env;
+	const char *end_env;
+	const char *len_env;
+	uint32_t start;
+	uint32_t end;
+	uint32_t len;
+
+	if (setup_done)
+		return;
+	setup_done = 1;
+
+	start_env = getenv("T4_TEXT_WRITE_START");
+	end_env = getenv("T4_TEXT_WRITE_END");
+	len_env = getenv("T4_TEXT_WRITE_LEN");
+
+	if (!start_env || !*start_env)
+		return;
+	start = (uint32_t)strtoul(start_env, NULL, 0);
+	if (!start)
+		return;
+
+	if (end_env && *end_env) {
+		end = (uint32_t)strtoul(end_env, NULL, 0);
+	} else if (len_env && *len_env) {
+		len = (uint32_t)strtoul(len_env, NULL, 0);
+		end = start + (len ? len : 0x100);
+	} else {
+		end = start + 0x100;
+	}
+
+	if (end > start) {
+		text_write_trace_start = start;
+		text_write_trace_end = end;
+		fprintf(stderr,
+		        "[TEXT_WRITE] range start=0x%08X end=0x%08X\n",
+		        text_write_trace_start, text_write_trace_end);
+	}
+}
+
+static void setup_cache_debug_trace_once(void) {
+	static int setup_done = 0;
+	const char *start_env;
+	const char *end_env;
+	const char *len_env;
+	uint32_t start;
+	uint32_t end;
+	uint32_t len;
+
+	if (setup_done)
+		return;
+	setup_done = 1;
+
+	start_env = getenv("T4_CACHE_DEBUG_START");
+	end_env = getenv("T4_CACHE_DEBUG_END");
+	len_env = getenv("T4_CACHE_DEBUG_LEN");
+
+	if (!start_env || !*start_env)
+		return;
+	start = (uint32_t)strtoul(start_env, NULL, 0);
+	if (!start)
+		return;
+
+	if (end_env && *end_env) {
+		end = (uint32_t)strtoul(end_env, NULL, 0);
+	} else if (len_env && *len_env) {
+		len = (uint32_t)strtoul(len_env, NULL, 0);
+		end = start + (len ? len : 0x100);
+	} else {
+		end = start + 0x100;
+	}
+
+	if (end > start) {
+		cache_debug_trace_start = start;
+		cache_debug_trace_end = end;
+		cache_debug_trace_enabled = 1;
+		fprintf(stderr,
+		        "[CACHE_DEBUG] range start=0x%08X end=0x%08X\n",
+		        cache_debug_trace_start, cache_debug_trace_end);
+	}
+}
+
+static void maybe_auto_text_base(void) {
+	const char *auto_env;
+	const prolog_sym *sym;
+	const link_sym *lsym;
+	if (prolog_text_base_autodone)
+		return;
+	auto_env = getenv("T4_TEXT_BASE_AUTO");
+	if (!auto_env || !*auto_env)
+		return;
+	if (!last_boot_call_target)
+		return;
+	lsym = find_link_sym_by_name("start_kernel");
+	if (lsym) {
+		link_text_base = last_boot_call_target - lsym->sym_off;
+		prolog_text_base_autodone = 1;
+		fprintf(stderr,
+		        "T4_SYM_MAP: auto text_base=0x%08X (start_kernel iptr=0x%08X off=0x%X)\n",
+		        link_text_base, last_boot_call_target, lsym->sym_off);
+		return;
+	}
+	sym = find_prolog_sym_by_name("start_kernel");
+	if (!sym)
+		return;
+	prolog_text_base = last_boot_call_target - sym->text_off;
+	prolog_text_base_autodone = 1;
+	fprintf(stderr,
+	        "T4_PROLOG: auto text_base=0x%08X (start_kernel iptr=0x%08X off=0x%X)\n",
+	        prolog_text_base, last_boot_call_target, sym->text_off);
+}
+
+/* Simple memory-mapped UART */
+#define UART_BASE       ((uint32_t)0x10000000)
+#define UART_DATA       (UART_BASE + 0x00)  /* Data register (R/W) */
+#define UART_STATUS     (UART_BASE + 0x04)  /* Status register (R) */
+#define UART_STATUS_TXRDY  0x01  /* Transmit ready */
+#define UART_STATUS_RXAVAIL 0x02  /* Receive data available */
+
+/* Memory-mapped Link 0 (IServer) */
+#define LINK0_OUT      ((uint32_t)0x80000000)
+#define LINK0_IN       ((uint32_t)0x80000010)
+
+/* MMIO IServer state */
+enum {
+	MMIO_IDLE = 0,
+	MMIO_LEN_LO,
+	MMIO_LEN_HI,
+	MMIO_PAYLOAD,
+	MMIO_PUTS_STREAM,
+	MMIO_PUTS_LEN_LO,
+	MMIO_PUTS_LEN_HI,
+	MMIO_PUTS_DATA
+};
+
+static struct {
+	int state;
+	uint16_t payload_len;
+	uint16_t payload_left;
+	uint16_t payload_index;
+	uint16_t data_len;
+	uint16_t data_left;
+	u_char cmd;
+	u_char stream;
+} mmio_iserver;
+
+static u_char mmio_resp_buf[256];
+static int mmio_resp_head;
+static int mmio_resp_tail;
+
+static void uart_write_byte(u_char ch);
+void mmio_early_printk_report(void);
+static void uart_direct_track(u_char ch);
+
+int early_printk_seen = 0;
+uint64_t early_printk_bytes = 0;
+uint64_t iserver_stream1_bytes = 0;
+uint64_t iserver_stream1_msgs = 0;
+static int iserver_stream1_active = 0;
+int early_printk_seen_uart = 0;
+uint64_t uart_mmio_bytes = 0;
+static FILE *uart_log_file = NULL;
+
+static void mmio_resp_push(u_char b)
+{
+	int next = (mmio_resp_head + 1) % (int)sizeof(mmio_resp_buf);
+	if (next == mmio_resp_tail)
+		return;
+	mmio_resp_buf[mmio_resp_head] = b;
+	mmio_resp_head = next;
+}
+
+static u_char mmio_resp_pop(void)
+{
+	u_char b = 0;
+	if (mmio_resp_head == mmio_resp_tail)
+		return 0;
+	b = mmio_resp_buf[mmio_resp_tail];
+	mmio_resp_tail = (mmio_resp_tail + 1) % (int)sizeof(mmio_resp_buf);
+	return b;
+}
+
+static void mmio_iserver_reset(void)
+{
+	mmio_iserver.state = MMIO_IDLE;
+	mmio_iserver.payload_len = 0;
+	mmio_iserver.payload_left = 0;
+	mmio_iserver.payload_index = 0;
+	mmio_iserver.data_len = 0;
+	mmio_iserver.data_left = 0;
+	mmio_iserver.cmd = 0;
+	mmio_iserver.stream = 0;
+	iserver_stream1_active = 0;
+}
+
+static void mmio_iserver_finish_payload(void)
+{
+	if (iserver_stream1_active) {
+		iserver_stream1_msgs++;
+	}
+	if (mmio_iserver.cmd == SP_WRITE) {
+		mmio_resp_push(0);
+		mmio_resp_push(0);
+	}
+	mmio_iserver_reset();
+}
+
+static void mmio_iserver_write_byte(u_char value)
+{
+	static int mmio_log_count = 0;
+	if (mmio_trace_enabled && mmio_log_count < 4) {
+		fprintf(stderr, "[MMIO_OUT: 0x%02X]\n", value);
+		mmio_log_count++;
+	}
+	switch (mmio_iserver.state) {
+	case MMIO_IDLE:
+		if (value == SP_PUTS) {
+			mmio_iserver.state = MMIO_PUTS_STREAM;
+			break;
+		}
+		mmio_iserver.payload_len = value;
+		mmio_iserver.state = MMIO_LEN_HI;
+		break;
+	case MMIO_LEN_HI:
+		mmio_iserver.payload_len |= ((uint16_t)value << 8);
+		mmio_iserver.payload_left = mmio_iserver.payload_len;
+		mmio_iserver.payload_index = 0;
+		mmio_iserver.data_len = 0;
+		mmio_iserver.data_left = 0;
+		mmio_iserver.cmd = 0;
+		mmio_iserver.state = MMIO_PAYLOAD;
+		break;
+	case MMIO_PAYLOAD:
+		if (mmio_iserver.payload_left == 0) {
+			mmio_iserver_finish_payload();
+			break;
+		}
+		if (mmio_iserver.payload_index == 0) {
+			mmio_iserver.cmd = value;
+		} else if (mmio_iserver.payload_index == 1) {
+			mmio_iserver.stream = value;
+			iserver_stream1_active = (value == 1);
+		} else if (mmio_iserver.payload_index == 5) {
+			mmio_iserver.data_len = value;
+		} else if (mmio_iserver.payload_index == 6) {
+			mmio_iserver.data_len |= ((uint16_t)value << 8);
+			mmio_iserver.data_left = mmio_iserver.data_len;
+		} else if (mmio_iserver.payload_index >= 7 &&
+			   mmio_iserver.data_left > 0) {
+			if (mmio_iserver.cmd == SP_WRITE)
+				uart_write_byte(value);
+			if (iserver_stream1_active)
+				iserver_stream1_bytes++;
+			mmio_iserver.data_left--;
+		}
+		mmio_iserver.payload_index++;
+		mmio_iserver.payload_left--;
+		if (mmio_iserver.payload_left == 0)
+			mmio_iserver_finish_payload();
+		break;
+	case MMIO_PUTS_STREAM:
+		mmio_iserver.stream = value;
+		iserver_stream1_active = (value == 1);
+		mmio_iserver.state = MMIO_PUTS_LEN_LO;
+		break;
+	case MMIO_PUTS_LEN_LO:
+		mmio_iserver.data_len = value;
+		mmio_iserver.state = MMIO_PUTS_LEN_HI;
+		break;
+	case MMIO_PUTS_LEN_HI:
+		mmio_iserver.data_len |= ((uint16_t)value << 8);
+		mmio_iserver.data_left = mmio_iserver.data_len;
+		mmio_iserver.state = MMIO_PUTS_DATA;
+		break;
+	case MMIO_PUTS_DATA:
+		if (mmio_iserver.data_left > 0) {
+			uart_write_byte(value);
+			if (iserver_stream1_active)
+				iserver_stream1_bytes++;
+			mmio_iserver.data_left--;
+		}
+		if (mmio_iserver.data_left == 0)
+			mmio_iserver_reset();
+		break;
+	default:
+		mmio_iserver_reset();
+		break;
+	}
+}
+
+static u_char mmio_iserver_read_byte(void)
+{
+	return mmio_resp_pop();
+}
+
+/* SDL2 VGA Framebuffer (8-bit indexed color) */
+#ifdef T4_X11_FB
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xos.h>
+#include <X11/keysym.h>
+
+#define FB_BASE         ((uint32_t)0x90000000)  /* Framebuffer base address */
+#define FB_WIDTH        640                      /* Width in pixels */
+#define FB_HEIGHT       480                      /* Height in pixels */
+#define FB_BPP          4                        /* Bytes per pixel (32bpp) */
+#define FB_SIZE         (FB_WIDTH * FB_HEIGHT * FB_BPP)  /* Total size in bytes */
+#define FB_LIMIT        (FB_BASE + FB_SIZE)     /* End of framebuffer */
+#define FB_CONSOLE_COLS (FB_WIDTH / 8)
+#define FB_CONSOLE_ROWS (FB_HEIGHT / 8)
+
+/* VGA Controller Registers at 0xA0000000 */
+#define VGA_CTRL_BASE       ((uint32_t)0xA0000000)
+#define VGA_CTRL_CONTROL    (VGA_CTRL_BASE + 0x00)  /* Control register */
+#define VGA_CTRL_FB_BASE    (VGA_CTRL_BASE + 0x04)  /* Framebuffer base */
+#define VGA_CTRL_WIDTH      (VGA_CTRL_BASE + 0x08)  /* Width */
+#define VGA_CTRL_HEIGHT     (VGA_CTRL_BASE + 0x0C)  /* Height */
+#define VGA_CTRL_STRIDE     (VGA_CTRL_BASE + 0x10)  /* Stride */
+#define VGA_CTRL_ENABLE     0x01                    /* Enable bit */
+
+/* VGA controller state */
+static uint32_t vga_ctrl_control = 0;
+static uint32_t vga_ctrl_fb_base = FB_BASE;
+static uint32_t vga_ctrl_width = FB_WIDTH;
+static uint32_t vga_ctrl_height = FB_HEIGHT;
+static uint32_t vga_ctrl_stride = FB_WIDTH * FB_BPP;
+
+/* SDL2 globals */
+ Display *vga_display = NULL;
+ Window vga_window = 0;
+ GC vga_gc = 0;
+ XImage *vga_image = NULL;
+uint32_t vga_palette[256];                      /* 8-bit indexed palette (RGB332) */
+unsigned char vga_framebuffer[FB_SIZE];         /* Framebuffer memory (32bpp) */
+int vga_dirty = 0;                              /* Needs redraw flag */
+struct timeval vga_last_update;                 /* Last display update time */
+static int fb_console_enabled = 0;
+static int fb_console_row = 0;
+static int fb_console_col = 0;
+
+/* 8x8 font for ASCII 0x20..0x7f (font8x8_basic) */
+static const unsigned char fb_font8x8[128][8] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* 0x00 */
+    {0x7e,0x81,0xa5,0x81,0xbd,0x99,0x81,0x7e}, /* 0x01 */
+    {0x7e,0xff,0xdb,0xff,0xc3,0xe7,0xff,0x7e}, /* 0x02 */
+    {0x6c,0xfe,0xfe,0xfe,0x7c,0x38,0x10,0x00}, /* 0x03 */
+    {0x10,0x38,0x7c,0xfe,0x7c,0x38,0x10,0x00}, /* 0x04 */
+    {0x38,0x7c,0x38,0xfe,0xfe,0xd6,0x10,0x38}, /* 0x05 */
+    {0x10,0x38,0x7c,0xfe,0xfe,0x7c,0x10,0x38}, /* 0x06 */
+    {0x00,0x00,0x18,0x3c,0x3c,0x18,0x00,0x00}, /* 0x07 */
+    {0xff,0xff,0xe7,0xc3,0xc3,0xe7,0xff,0xff}, /* 0x08 */
+    {0x00,0x3c,0x66,0x42,0x42,0x66,0x3c,0x00}, /* 0x09 */
+    {0xff,0xc3,0x99,0xbd,0xbd,0x99,0xc3,0xff}, /* 0x0a */
+    {0x0f,0x07,0x0f,0x7d,0xcc,0xcc,0xcc,0x78}, /* 0x0b */
+    {0x3c,0x66,0x66,0x66,0x3c,0x18,0x7e,0x18}, /* 0x0c */
+    {0x3f,0x33,0x3f,0x30,0x30,0x70,0xf0,0xe0}, /* 0x0d */
+    {0x7f,0x63,0x7f,0x63,0x63,0x67,0xe6,0xc0}, /* 0x0e */
+    {0x99,0x5a,0x3c,0xe7,0xe7,0x3c,0x5a,0x99}, /* 0x0f */
+    {0x80,0xe0,0xf8,0xfe,0xf8,0xe0,0x80,0x00}, /* 0x10 */
+    {0x02,0x0e,0x3e,0xfe,0x3e,0x0e,0x02,0x00}, /* 0x11 */
+    {0x18,0x3c,0x7e,0x18,0x18,0x7e,0x3c,0x18}, /* 0x12 */
+    {0x66,0x66,0x66,0x66,0x66,0x00,0x66,0x00}, /* 0x13 */
+    {0x7f,0xdb,0xdb,0x7b,0x1b,0x1b,0x1b,0x00}, /* 0x14 */
+    {0x3e,0x63,0x38,0x6c,0x6c,0x38,0xcc,0x78}, /* 0x15 */
+    {0x00,0x00,0x00,0x00,0x7e,0x7e,0x7e,0x00}, /* 0x16 */
+    {0x18,0x3c,0x7e,0x18,0x7e,0x3c,0x18,0xff}, /* 0x17 */
+    {0x18,0x3c,0x7e,0x18,0x18,0x18,0x18,0x00}, /* 0x18 */
+    {0x18,0x18,0x18,0x18,0x7e,0x3c,0x18,0x00}, /* 0x19 */
+    {0x00,0x18,0x0c,0xfe,0x0c,0x18,0x00,0x00}, /* 0x1a */
+    {0x00,0x30,0x60,0xfe,0x60,0x30,0x00,0x00}, /* 0x1b */
+    {0x00,0x00,0xc0,0xc0,0xc0,0xfe,0x00,0x00}, /* 0x1c */
+    {0x00,0x24,0x66,0xff,0x66,0x24,0x00,0x00}, /* 0x1d */
+    {0x00,0x18,0x3c,0x7e,0xff,0xff,0x00,0x00}, /* 0x1e */
+    {0x00,0xff,0xff,0x7e,0x3c,0x18,0x00,0x00}, /* 0x1f */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* 0x20 */
+    {0x18,0x3c,0x3c,0x18,0x18,0x00,0x18,0x00}, /* 0x21 */
+    {0x36,0x36,0x12,0x00,0x00,0x00,0x00,0x00}, /* 0x22 */
+    {0x36,0x36,0x7f,0x36,0x7f,0x36,0x36,0x00}, /* 0x23 */
+    {0x0c,0x3e,0x03,0x1e,0x30,0x1f,0x0c,0x00}, /* 0x24 */
+    {0x00,0x63,0x33,0x18,0x0c,0x66,0x63,0x00}, /* 0x25 */
+    {0x1c,0x36,0x1c,0x6e,0x3b,0x33,0x6e,0x00}, /* 0x26 */
+    {0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00}, /* 0x27 */
+    {0x18,0x0c,0x06,0x06,0x06,0x0c,0x18,0x00}, /* 0x28 */
+    {0x06,0x0c,0x18,0x18,0x18,0x0c,0x06,0x00}, /* 0x29 */
+    {0x00,0x66,0x3c,0xff,0x3c,0x66,0x00,0x00}, /* 0x2a */
+    {0x00,0x0c,0x0c,0x3f,0x0c,0x0c,0x00,0x00}, /* 0x2b */
+    {0x00,0x00,0x00,0x00,0x00,0x0c,0x0c,0x06}, /* 0x2c */
+    {0x00,0x00,0x00,0x3f,0x00,0x00,0x00,0x00}, /* 0x2d */
+    {0x00,0x00,0x00,0x00,0x00,0x0c,0x0c,0x00}, /* 0x2e */
+    {0x60,0x30,0x18,0x0c,0x06,0x03,0x01,0x00}, /* 0x2f */
+    {0x3e,0x63,0x73,0x7b,0x6f,0x67,0x3e,0x00}, /* 0x30 */
+    {0x0c,0x0e,0x0c,0x0c,0x0c,0x0c,0x3f,0x00}, /* 0x31 */
+    {0x1e,0x33,0x30,0x1c,0x06,0x33,0x3f,0x00}, /* 0x32 */
+    {0x1e,0x33,0x30,0x1c,0x30,0x33,0x1e,0x00}, /* 0x33 */
+    {0x38,0x3c,0x36,0x33,0x7f,0x30,0x78,0x00}, /* 0x34 */
+    {0x3f,0x03,0x1f,0x30,0x30,0x33,0x1e,0x00}, /* 0x35 */
+    {0x1c,0x06,0x03,0x1f,0x33,0x33,0x1e,0x00}, /* 0x36 */
+    {0x3f,0x33,0x30,0x18,0x0c,0x0c,0x0c,0x00}, /* 0x37 */
+    {0x1e,0x33,0x33,0x1e,0x33,0x33,0x1e,0x00}, /* 0x38 */
+    {0x1e,0x33,0x33,0x3e,0x30,0x18,0x0e,0x00}, /* 0x39 */
+    {0x00,0x0c,0x0c,0x00,0x00,0x0c,0x0c,0x00}, /* 0x3a */
+    {0x00,0x0c,0x0c,0x00,0x00,0x0c,0x0c,0x06}, /* 0x3b */
+    {0x18,0x0c,0x06,0x03,0x06,0x0c,0x18,0x00}, /* 0x3c */
+    {0x00,0x00,0x3f,0x00,0x00,0x3f,0x00,0x00}, /* 0x3d */
+    {0x06,0x0c,0x18,0x30,0x18,0x0c,0x06,0x00}, /* 0x3e */
+    {0x1e,0x33,0x30,0x18,0x0c,0x00,0x0c,0x00}, /* 0x3f */
+    {0x3e,0x63,0x7b,0x7b,0x7b,0x03,0x1e,0x00}, /* 0x40 */
+    {0x0c,0x1e,0x33,0x33,0x3f,0x33,0x33,0x00}, /* 0x41 */
+    {0x3f,0x66,0x66,0x3e,0x66,0x66,0x3f,0x00}, /* 0x42 */
+    {0x3c,0x66,0x03,0x03,0x03,0x66,0x3c,0x00}, /* 0x43 */
+    {0x1f,0x36,0x66,0x66,0x66,0x36,0x1f,0x00}, /* 0x44 */
+    {0x7f,0x46,0x16,0x1e,0x16,0x46,0x7f,0x00}, /* 0x45 */
+    {0x7f,0x46,0x16,0x1e,0x16,0x06,0x0f,0x00}, /* 0x46 */
+    {0x3c,0x66,0x03,0x03,0x73,0x66,0x7c,0x00}, /* 0x47 */
+    {0x33,0x33,0x33,0x3f,0x33,0x33,0x33,0x00}, /* 0x48 */
+    {0x1e,0x0c,0x0c,0x0c,0x0c,0x0c,0x1e,0x00}, /* 0x49 */
+    {0x78,0x30,0x30,0x30,0x33,0x33,0x1e,0x00}, /* 0x4a */
+    {0x67,0x66,0x36,0x1e,0x36,0x66,0x67,0x00}, /* 0x4b */
+    {0x0f,0x06,0x06,0x06,0x46,0x66,0x7f,0x00}, /* 0x4c */
+    {0x63,0x77,0x7f,0x7f,0x6b,0x63,0x63,0x00}, /* 0x4d */
+    {0x63,0x67,0x6f,0x7b,0x73,0x63,0x63,0x00}, /* 0x4e */
+    {0x1c,0x36,0x63,0x63,0x63,0x36,0x1c,0x00}, /* 0x4f */
+    {0x3f,0x66,0x66,0x3e,0x06,0x06,0x0f,0x00}, /* 0x50 */
+    {0x1e,0x33,0x33,0x33,0x3b,0x1e,0x38,0x00}, /* 0x51 */
+    {0x3f,0x66,0x66,0x3e,0x36,0x66,0x67,0x00}, /* 0x52 */
+    {0x1e,0x33,0x07,0x0e,0x38,0x33,0x1e,0x00}, /* 0x53 */
+    {0x3f,0x2d,0x0c,0x0c,0x0c,0x0c,0x1e,0x00}, /* 0x54 */
+    {0x33,0x33,0x33,0x33,0x33,0x33,0x3f,0x00}, /* 0x55 */
+    {0x33,0x33,0x33,0x33,0x33,0x1e,0x0c,0x00}, /* 0x56 */
+    {0x63,0x63,0x63,0x6b,0x7f,0x77,0x63,0x00}, /* 0x57 */
+    {0x63,0x63,0x36,0x1c,0x1c,0x36,0x63,0x00}, /* 0x58 */
+    {0x33,0x33,0x33,0x1e,0x0c,0x0c,0x1e,0x00}, /* 0x59 */
+    {0x7f,0x63,0x31,0x18,0x4c,0x66,0x7f,0x00}, /* 0x5a */
+    {0x1e,0x06,0x06,0x06,0x06,0x06,0x1e,0x00}, /* 0x5b */
+    {0x03,0x06,0x0c,0x18,0x30,0x60,0x40,0x00}, /* 0x5c */
+    {0x1e,0x18,0x18,0x18,0x18,0x18,0x1e,0x00}, /* 0x5d */
+    {0x08,0x1c,0x36,0x63,0x00,0x00,0x00,0x00}, /* 0x5e */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff}, /* 0x5f */
+    {0x0c,0x0c,0x18,0x00,0x00,0x00,0x00,0x00}, /* 0x60 */
+    {0x00,0x00,0x1e,0x30,0x3e,0x33,0x6e,0x00}, /* 0x61 */
+    {0x07,0x06,0x06,0x3e,0x66,0x66,0x3b,0x00}, /* 0x62 */
+    {0x00,0x00,0x1e,0x33,0x03,0x33,0x1e,0x00}, /* 0x63 */
+    {0x38,0x30,0x30,0x3e,0x33,0x33,0x6e,0x00}, /* 0x64 */
+    {0x00,0x00,0x1e,0x33,0x3f,0x03,0x1e,0x00}, /* 0x65 */
+    {0x1c,0x36,0x06,0x0f,0x06,0x06,0x0f,0x00}, /* 0x66 */
+    {0x00,0x00,0x6e,0x33,0x33,0x3e,0x30,0x1f}, /* 0x67 */
+    {0x07,0x06,0x36,0x6e,0x66,0x66,0x67,0x00}, /* 0x68 */
+    {0x0c,0x00,0x0e,0x0c,0x0c,0x0c,0x1e,0x00}, /* 0x69 */
+    {0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1e}, /* 0x6a */
+    {0x07,0x06,0x66,0x36,0x1e,0x36,0x67,0x00}, /* 0x6b */
+    {0x0e,0x0c,0x0c,0x0c,0x0c,0x0c,0x1e,0x00}, /* 0x6c */
+    {0x00,0x00,0x33,0x7f,0x7f,0x6b,0x63,0x00}, /* 0x6d */
+    {0x00,0x00,0x1b,0x37,0x33,0x33,0x33,0x00}, /* 0x6e */
+    {0x00,0x00,0x1e,0x33,0x33,0x33,0x1e,0x00}, /* 0x6f */
+    {0x00,0x00,0x3b,0x66,0x66,0x3e,0x06,0x0f}, /* 0x70 */
+    {0x00,0x00,0x6e,0x33,0x33,0x3e,0x30,0x78}, /* 0x71 */
+    {0x00,0x00,0x1b,0x36,0x36,0x0e,0x06,0x0f}, /* 0x72 */
+    {0x00,0x00,0x3e,0x03,0x1e,0x30,0x1f,0x00}, /* 0x73 */
+    {0x08,0x0c,0x3e,0x0c,0x0c,0x2c,0x18,0x00}, /* 0x74 */
+    {0x00,0x00,0x33,0x33,0x33,0x33,0x6e,0x00}, /* 0x75 */
+    {0x00,0x00,0x33,0x33,0x33,0x1e,0x0c,0x00}, /* 0x76 */
+    {0x00,0x00,0x63,0x6b,0x7f,0x7f,0x36,0x00}, /* 0x77 */
+    {0x00,0x00,0x63,0x36,0x1c,0x36,0x63,0x00}, /* 0x78 */
+    {0x00,0x00,0x33,0x33,0x33,0x3e,0x30,0x1f}, /* 0x79 */
+    {0x00,0x00,0x3f,0x19,0x0c,0x26,0x3f,0x00}, /* 0x7a */
+    {0x38,0x0c,0x0c,0x07,0x0c,0x0c,0x38,0x00}, /* 0x7b */
+    {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00}, /* 0x7c */
+    {0x07,0x0c,0x0c,0x38,0x0c,0x0c,0x07,0x00}, /* 0x7d */
+    {0x6e,0x3b,0x00,0x00,0x00,0x00,0x00,0x00}, /* 0x7e */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}  /* 0x7f */
+};
+
+extern int32_t quit;
+void vga_cleanup(void);
+
+static inline int fb_addr_in_range(uint32_t addr)
+{
+    return (addr >= FB_BASE) && (addr < FB_LIMIT);
+}
+
+static inline int fb_range_intersects(uint32_t addr, uint32_t len)
+{
+    uint64_t start = addr;
+    uint64_t end = start + (uint64_t)len;
+
+    if (len == 0)
+        return 0;
+    if (end <= FB_BASE)
+        return 0;
+    if (start >= FB_LIMIT)
+        return 0;
+    return 1;
+}
+
+static void fb_console_scroll(void)
+{
+    /* 32bpp: each row is FB_WIDTH * 4 bytes, scroll 8 rows at a time */
+    size_t row_bytes = FB_WIDTH * FB_BPP;
+    size_t scroll_bytes = row_bytes * 8;  /* 8 pixel rows per text row */
+    memmove(vga_framebuffer, vga_framebuffer + scroll_bytes,
+            row_bytes * (FB_HEIGHT - 8));
+    memset(vga_framebuffer + row_bytes * (FB_HEIGHT - 8), 0, scroll_bytes);
+    vga_dirty = 1;
+    fb_console_row = FB_CONSOLE_ROWS - 1;
+    fb_console_col = 0;
+}
+
+static void fb_console_putc(u_char ch)
+{
+    int row, col, x, y;
+    unsigned char glyph;
+    int i, j;
+
+    if (!fb_console_enabled)
+        return;
+
+    if (ch == '\n') {
+        fb_console_row++;
+        fb_console_col = 0;
+        if (fb_console_row >= FB_CONSOLE_ROWS)
+            fb_console_scroll();
+        return;
+    }
+    if (ch == '\r') {
+        fb_console_col = 0;
+        return;
+    }
+    if (ch < 0x20 || ch >= 0x80)
+        ch = '.';
+
+    row = fb_console_row;
+    col = fb_console_col;
+    x = col * 8;
+    y = row * 8;
+
+    /* 32bpp: write full 32-bit pixels for text rendering */
+    uint32_t *fb32 = (uint32_t *)vga_framebuffer;
+    for (i = 0; i < 8; i++) {
+        glyph = fb_font8x8[(unsigned char)ch][i];
+        for (j = 0; j < 8; j++) {
+            int px = x + j;
+            int py = y + i;
+            if (px < 0 || px >= FB_WIDTH || py < 0 || py >= FB_HEIGHT)
+                continue;
+            /* White (0xFFFFFFFF) or black (0x00000000) */
+            fb32[py * FB_WIDTH + px] = (glyph & (1 << j)) ? 0xFFFFFFFF : 0x00000000;
+        }
+    }
+    vga_dirty = 1;
+
+    fb_console_col++;
+    if (fb_console_col >= FB_CONSOLE_COLS) {
+        fb_console_col = 0;
+        fb_console_row++;
+        if (fb_console_row >= FB_CONSOLE_ROWS)
+            fb_console_scroll();
+    }
+}
+
+static inline void fb_write_bytes(uint32_t addr, const unsigned char *src, size_t len)
+{
+    if (!len)
+        return;
+    uint64_t start = addr;
+    uint64_t end = start + len;
+    uint64_t fb_start = start < FB_BASE ? FB_BASE : start;
+    uint64_t fb_end = end > FB_LIMIT ? FB_LIMIT : end;
+
+    if (fb_start >= fb_end)
+        return;
+
+    size_t fb_offset = fb_start - FB_BASE;
+    size_t src_offset = fb_start - start;
+    size_t copy_len = fb_end - fb_start;
+
+    memcpy(&vga_framebuffer[fb_offset], src + src_offset, copy_len);
+    vga_dirty = 1;
+}
+
+static inline void fb_write_byte(uint32_t addr, unsigned char value)
+{
+    static int fb_write_count = 0;
+    if (!fb_addr_in_range(addr))
+        return;
+    vga_framebuffer[addr - FB_BASE] = value;
+    vga_dirty = 1;
+    /* Log first 50 framebuffer writes for debugging */
+    if (fb_write_count < 50) {
+        fprintf(stderr, "[FB_WR#%d] addr=0x%08X offset=0x%X val=0x%02X\n",
+                fb_write_count, addr, addr - FB_BASE, value);
+        fb_write_count++;
+    }
+}
+
+static inline unsigned char fb_read_byte(uint32_t addr)
+{
+    if (!fb_addr_in_range(addr))
+        return 0;
+    return vga_framebuffer[addr - FB_BASE];
+}
+
+static void vga_pump_events(void)
+{
+    XEvent event;
+
+    while (XPending(vga_display)) {
+        XNextEvent(vga_display, &event);
+        switch (event.type) {
+        case ClientMessage:
+            quit = TRUE;
+            break;
+        case KeyPress:
+            if (XLookupKeysym(&event.xkey, 0) == XK_Escape)
+                quit = TRUE;
+            break;
+        case ButtonPress:
+            quit = TRUE;
+            break;
+        case Expose:
+            /* Window needs repaint - mark framebuffer dirty */
+            vga_dirty = 1;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+/* Initialize VGA display */
+void vga_init(void)
+{
+    fprintf(stderr, "[VGA] Initializing X11 display...\n");
+    vga_display = XOpenDisplay(NULL);
+    if (!vga_display) {
+        fprintf(stderr, "[VGA] XOpenDisplay failed\n");
+        return;
+    }
+    fprintf(stderr, "[VGA] XOpenDisplay succeeded\n");
+
+    int screen = DefaultScreen(vga_display);
+    Window root = RootWindow(vga_display, screen);
+
+    vga_window = XCreateSimpleWindow(vga_display, root, 0, 0, FB_WIDTH, FB_HEIGHT, 1,
+                                     BlackPixel(vga_display, screen),
+                                     WhitePixel(vga_display, screen));
+
+    XStoreName(vga_display, vga_window, "Transputer T4 - VGA Display");
+
+    XSelectInput(vga_display, vga_window, ExposureMask | KeyPressMask | ButtonPressMask);
+
+    XMapWindow(vga_display, vga_window);
+    XSync(vga_display, False);  /* Wait for window to be mapped */
+
+    vga_gc = XCreateGC(vga_display, vga_window, 0, NULL);
+
+    /* Create XImage for framebuffer */
+    int depth = DefaultDepth(vga_display, screen);
+    fprintf(stderr, "[VGA] X11 depth: %d bits\n", depth);
+
+    vga_image = XCreateImage(vga_display, DefaultVisual(vga_display, screen),
+                             depth, ZPixmap, 0,
+                             (char *)malloc(FB_WIDTH * FB_HEIGHT * 4), FB_WIDTH, FB_HEIGHT,
+                             32, FB_WIDTH * 4);
+
+    if (!vga_image) {
+        fprintf(stderr, "XCreateImage failed\n");
+        XCloseDisplay(vga_display);
+        return;
+    }
+    fprintf(stderr, "[VGA] XImage: width=%d height=%d bpp=%d depth=%d bytes_per_line=%d\n",
+            vga_image->width, vga_image->height, vga_image->bits_per_pixel,
+            vga_image->depth, vga_image->bytes_per_line);
+    fprintf(stderr, "[VGA] XImage: byte_order=%d (LSB=%d MSB=%d) bitmap_bit_order=%d\n",
+            vga_image->byte_order, LSBFirst, MSBFirst, vga_image->bitmap_bit_order);
+    fprintf(stderr, "[VGA] X11 server byte_order=%d\n", ImageByteOrder(vga_display));
+
+    /* Initialize RGB332 palette (8-bit indexed color) */
+    for (int i = 0; i < 256; i++) {
+        int r = ((i >> 5) & 0x07) * 255 / 7;  /* 3 bits red */
+        int g = ((i >> 2) & 0x07) * 255 / 7;  /* 3 bits green */
+        int b = ((i >> 0) & 0x03) * 255 / 3;  /* 2 bits blue */
+        vga_palette[i] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    /* Clear framebuffer to black */
+    memset(vga_framebuffer, 0, FB_SIZE);
+    vga_dirty = 1;
+
+    gettimeofday(&vga_last_update, NULL);
+
+    atexit(vga_cleanup);
+
+    fprintf(stderr, "[VGA] Initialized %dx%d framebuffer at 0x%08X-0x%08X\n",
+            FB_WIDTH, FB_HEIGHT, FB_BASE, FB_LIMIT - 1);
+
+    /* TEST: Show blue screen for 1 second before booting */
+    {
+        uint32_t *fb32 = (uint32_t *)vga_framebuffer;
+        fprintf(stderr, "[VGA] Displaying blue test screen for 1 second...\n");
+
+        /* Fill with blue (0xFF0000FF in ARGB with swapped RB = blue for X11) */
+        for (int i = 0; i < FB_WIDTH * FB_HEIGHT; i++) {
+            fb32[i] = 0xFF0000FF;  /* Blue (X11 expects BGRA) */
+        }
+
+        /* Draw "TEST" text in white at top-left using simple block letters */
+        for (int y = 10; y < 30; y++) {
+            for (int x = 10; x < 100; x++) {
+                fb32[y * FB_WIDTH + x] = 0xFFFFFFFF;  /* White strip */
+            }
+        }
+
+        /* Direct XPutImage for test screen (bypass vga_update control check) */
+        memcpy(vga_image->data, vga_framebuffer, FB_WIDTH * FB_HEIGHT * 4);
+        XPutImage(vga_display, vga_window, vga_gc, vga_image, 0, 0, 0, 0, FB_WIDTH, FB_HEIGHT);
+        XFlush(vga_display);
+        fprintf(stderr, "[VGA] Test screen displayed via direct XPutImage\n");
+
+        /* Wait 100ms (reduced from 1 second to avoid boot delays) */
+        usleep(100000);
+
+        /* Clear back to black */
+        memset(vga_framebuffer, 0, FB_SIZE);
+        vga_dirty = 1;
+        fprintf(stderr, "[VGA] Blue test complete, continuing boot...\n");
+    }
+
+    /* Save initial framebuffer state to verify pattern */
+    FILE *fb_dump = fopen("framebuffer_init.raw", "wb");
+    if (fb_dump) {
+        fwrite(vga_framebuffer, 1, FB_SIZE, fb_dump);
+        fclose(fb_dump);
+        fprintf(stderr, "[VGA] Initial framebuffer saved to framebuffer_init.raw\n");
+    }
+}
+
+/* BMP file header structure */
+#pragma pack(push, 1)
+typedef struct {
+    unsigned short bfType;
+    unsigned int bfSize;
+    unsigned short bfReserved1;
+    unsigned short bfReserved2;
+    unsigned int bfOffBits;
+} BITMAPFILEHEADER;
+
+typedef struct {
+    unsigned int biSize;
+    int biWidth;
+    int biHeight;
+    unsigned short biPlanes;
+    unsigned short biBitCount;
+    unsigned int biCompression;
+    unsigned int biSizeImage;
+    int biXPelsPerMeter;
+    int biYPelsPerMeter;
+    unsigned int biClrUsed;
+    unsigned int biClrImportant;
+} BITMAPINFOHEADER;
+#pragma pack(pop)
+
+/* Save framebuffer to BMP file for debugging */
+void vga_dump_framebuffer_bmp(const char *filename, int frame_number)
+{
+    FILE *fb_dump = fopen(filename, "wb");
+    if (!fb_dump) {
+        fprintf(stderr, "[VGA] Failed to save framebuffer to %s\n", filename);
+        return;
+    }
+
+    // BMP header for 24-bit RGB image
+    BITMAPFILEHEADER bmfh;
+    BITMAPINFOHEADER bmih;
+
+    int width = FB_WIDTH;
+    int height = FB_HEIGHT;
+    int bytes_per_pixel = 3; // 24-bit RGB
+    int row_size = ((width * bytes_per_pixel + 3) & ~3); // DWORD aligned
+    int image_size = row_size * height;
+
+    // Fill BMP file header
+    bmfh.bfType = 0x4D42; // 'BM'
+    bmfh.bfSize = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + image_size;
+    bmfh.bfReserved1 = 0;
+    bmfh.bfReserved2 = 0;
+    bmfh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+
+    // Fill BMP info header
+    bmih.biSize = sizeof(BITMAPINFOHEADER);
+    bmih.biWidth = width;
+    bmih.biHeight = -height; // Negative for top-down
+    bmih.biPlanes = 1;
+    bmih.biBitCount = 24;
+    bmih.biCompression = 0; // BI_RGB
+    bmih.biSizeImage = image_size;
+    bmih.biXPelsPerMeter = 2835; // 72 DPI
+    bmih.biYPelsPerMeter = 2835; // 72 DPI
+    bmih.biClrUsed = 0;
+    bmih.biClrImportant = 0;
+
+    // Write headers
+    fwrite(&bmfh, sizeof(BITMAPFILEHEADER), 1, fb_dump);
+    fwrite(&bmih, sizeof(BITMAPINFOHEADER), 1, fb_dump);
+
+    // Convert 32bpp framebuffer to 24-bit RGB (BGR order for BMP)
+    uint32_t *fb32 = (uint32_t *)vga_framebuffer;
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            uint32_t pixel = fb32[y * width + x];
+
+            // Extract BGRA components (pixel is in 0xAABBGGRR format for X11)
+            unsigned char b = (pixel >> 16) & 0xFF;
+            unsigned char g = (pixel >> 8) & 0xFF;
+            unsigned char r = pixel & 0xFF;
+
+            // Write BGR (BMP format)
+            fputc(b, fb_dump);
+            fputc(g, fb_dump);
+            fputc(r, fb_dump);
+        }
+
+        // Pad row to DWORD boundary
+        int padding = (4 - (width * 3) % 4) % 4;
+        for (int p = 0; p < padding; p++) {
+            fputc(0, fb_dump);
+        }
+    }
+
+    fclose(fb_dump);
+    fprintf(stderr, "[VGA] Framebuffer saved to %s (frame %d)\n", filename, frame_number);
+}
+
+/* Save framebuffer to file for debugging */
+void vga_dump_framebuffer(const char *filename)
+{
+    FILE *fb_dump = fopen(filename, "wb");
+    if (fb_dump) {
+        fwrite(vga_framebuffer, 1, FB_SIZE, fb_dump);
+        fclose(fb_dump);
+        fprintf(stderr, "[VGA] Framebuffer saved to %s\n", filename);
+    } else {
+        fprintf(stderr, "[VGA] Failed to save framebuffer to %s\n", filename);
+    }
+}
+
+/* Update VGA display from framebuffer */
+void vga_update(void)
+{
+    static int update_count = 0;
+    if (!vga_image || !vga_dirty)
+        return;
+
+    /* Check if display is enabled by kernel via VGA control register */
+    if (!(vga_ctrl_control & VGA_CTRL_ENABLE)) {
+        static int skip_logged = 0;
+        if (skip_logged < 3) {
+            fprintf(stderr, "[VGA_UPDATE] Skipping - display not enabled (ctrl=0x%08X)\n",
+                    vga_ctrl_control);
+            skip_logged++;
+        }
+        return;  /* Display not enabled yet */
+    }
+
+    /* Log first few updates for debugging */
+    if (update_count < 5) {
+        uint32_t *fb32_dbg = (uint32_t *)vga_framebuffer;
+        fprintf(stderr, "[VGA_UPDATE#%d] dirty=1, first pixels: 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                update_count, fb32_dbg[0], fb32_dbg[1], fb32_dbg[640], fb32_dbg[1280]);
+        update_count++;
+    }
+
+    /* 32bpp framebuffer: copy directly to XImage data */
+    /* This is much faster than XPutPixel per-pixel */
+    memcpy(vga_image->data, vga_framebuffer, FB_WIDTH * FB_HEIGHT * 4);
+
+    /* Put image to window */
+    XPutImage(vga_display, vga_window, vga_gc, vga_image, 0, 0, 0, 0, FB_WIDTH, FB_HEIGHT);
+    XFlush(vga_display);  /* Ensure X11 buffer is flushed to display */
+
+    vga_dirty = 0;
+    gettimeofday(&vga_last_update, NULL);
+}
+
+/* Check if display needs periodic update (for smooth animation) */
+void vga_check_update(void)
+{
+    static int frame_count = 0;
+    struct timeval now;
+    long elapsed_us;
+
+    gettimeofday(&now, NULL);
+    elapsed_us = (now.tv_sec - vga_last_update.tv_sec) * 1000000L +
+                 (now.tv_usec - vga_last_update.tv_usec);
+
+    /* Update at ~60 Hz (16666 microseconds per frame) */
+    if (elapsed_us >= 16666) {
+        vga_update();
+        frame_count++;
+
+        /* Save framebuffer at specific frames */
+        if (frame_count == 1) {
+            vga_dump_framebuffer_bmp("frame_1.bmp", frame_count);
+        }
+        if (frame_count == 10) {
+            vga_dump_framebuffer_bmp("frame_10.bmp", frame_count);
+        }
+        if (frame_count == 100) {
+            vga_dump_framebuffer_bmp("frame_100.bmp", frame_count);
+        }
+    }
+}
+
+void vga_process_events(void)
+{
+    if (!vga_window)
+        return;
+
+    vga_pump_events();
+    vga_check_update();
+}
+
+/* Cleanup VGA display */
+void vga_cleanup(void)
+{
+    if (vga_image) {
+        XDestroyImage(vga_image);
+        vga_image = NULL;
+    }
+    if (vga_gc) {
+        XFreeGC(vga_display, vga_gc);
+        vga_gc = 0;
+    }
+    if (vga_window) {
+        XDestroyWindow(vga_display, vga_window);
+        vga_window = 0;
+    }
+    if (vga_display) {
+        XCloseDisplay(vga_display);
+        vga_display = NULL;
+    }
+}
+
+#endif /* T4_SDL2_FB */
 
 uint32_t word_int (uint32_t);
 
@@ -230,11 +1581,16 @@ u_char Instruction;
 u_char Icode;
 u_char Idata;
 int  Timers;
+int  TimerEnableHi = 1;
+int  TimerEnableLo = 1;
 uint32_t t4_overflow;
 uint32_t t4_carry;
 uint32_t t4_normlen;
 uint32_t t4_carry64;            /* shl64 shifted out bit */
 uint32_t ProcPriority;
+volatile uint64_t heartbeat_counter = 0;
+int EnableJ0BreakFlag = 0;
+static const uint32_t ProductIdentity = 0x00000000;
 #define TimersGo   1
 #define TimersStop 0
 int loop;
@@ -259,6 +1615,17 @@ void UpdateWdescReg (uint32_t wdesc)
         WdescReg     = wdesc;
         WPtr         = GetDescWPtr(wdesc);
         ProcPriority = GetDescPriority(wdesc);
+}
+
+static void handle_j0_break(void)
+{
+        uint32_t offset = (ProcPriority == HiPriority) ? 0 : 2;
+        uint32_t base = MemStart + (offset * BytesPerWord);
+        writeword_int(base, WPtr);
+        writeword_int(base + BytesPerWord, IPtr);
+        WPtr = word_int(base);
+        IPtr = word_int(base + BytesPerWord);
+        UpdateWdescReg(WPtr | ProcPriority);
 }
 
 #define Wdesc           WdescReg
@@ -1479,7 +2846,7 @@ void print_fpreg (char *ident, char name, REAL *fpreg, int printempty)
                 else
                         sprintf (tmp, "%.15le", r64.fp);
 */
-                printf ("%sF%cReg          #%016llX   (%s)\n", ident, name, r64.bits, tmp);
+                printf ("%sF%cReg          #%016" PRIx64 "   (%s)\n", ident, name, r64.bits, tmp);
         }
         else if (fpreg->length == FP_REAL32)
         {
@@ -1497,7 +2864,7 @@ void print_fpreg (char *ident, char name, REAL *fpreg, int printempty)
         else if (printempty)
         {
                 r64 = fpreg->u.db;
-                printf ("%sF%cReg          #%016llX   (Empty)\n", ident, name, r64.bits);
+                printf ("%sF%cReg          #%016" PRIx64 "   (Empty)\n", ident, name, r64.bits);
         }
 
         fp_clrexcept ();
@@ -1761,12 +3128,78 @@ void mainloop (void)
 #endif
         m2dSourceStride = m2dDestStride = m2dLength = Undefined_p;
 
+	fprintf(stderr, "[DEBUG: Entering mainloop, IPtr=0x%08X Wptr=0x%08X]\n", IPtr, WPtr);
+
 	count1 = 0;
 	count2 = 0;
 	count3 = 0;
 	timeslice = 0;
 	Timers = TimersStop;
+	TimerEnableHi = 1;
+	TimerEnableLo = 1;
 
+	{
+		const char *outbyte_env = getenv("T4_OUTBYTE_TRACE");
+		if (outbyte_env && *outbyte_env)
+			outbyte_trace_enabled = 1;
+	}
+	{
+		const char *uart_env = getenv("T4_UART_CONSOLE");
+		if (uart_env && *uart_env)
+			uart_console_enabled = (int)strtoul(uart_env, NULL, 0) != 0;
+	}
+	{
+		const char *uart_force_env = getenv("T4_UART_CONSOLE_FORCE");
+		if (uart_force_env && *uart_force_env &&
+		    (int)strtoul(uart_force_env, NULL, 0) != 0) {
+			uart_console_enabled = 1;
+			uart_trace_enabled = 0;
+		}
+	}
+	{
+		const char *link_env = getenv("T4_LINK0_TRACE");
+		if (link_env && *link_env)
+			link0_trace_enabled = (int)strtoul(link_env, NULL, 0) != 0;
+	}
+	{
+		const char *mmio_env = getenv("T4_MMIO_TRACE");
+		if (mmio_env && *mmio_env)
+			mmio_trace_enabled = (int)strtoul(mmio_env, NULL, 0) != 0;
+	}
+	{
+		const char *ep_env = getenv("T4_EARLY_PRINTK_TRACE");
+		if (ep_env && *ep_env)
+			early_printk_trace_enabled = (int)strtoul(ep_env, NULL, 0) != 0;
+	}
+	{
+		const char *near_env = getenv("T4_NEAREST_SYM");
+		if (near_env && *near_env)
+			nearest_sym_enabled = (int)strtoul(near_env, NULL, 0) != 0;
+	}
+	{
+		const char *boot_dump_env = getenv("T4_BOOT_DUMP_START");
+		if (boot_dump_env && *boot_dump_env)
+			boot_dump_start_enabled = (int)strtoul(boot_dump_env, NULL, 0) != 0;
+	}
+#ifdef T4_X11_FB
+	{
+		const char *fb_console_env = getenv("T4_FB_CONSOLE");
+		if (fb_console_env && *fb_console_env)
+			fb_console_enabled = (int)strtoul(fb_console_env, NULL, 0) != 0;
+	}
+#endif
+
+	/* Open UART log file */
+	{
+		const char *uart_log_env = getenv("T4_UART_LOG");
+		const char *uart_log_path = uart_log_env && *uart_log_env ?
+		                            uart_log_env : "boot.uart";
+		uart_log_file = fopen(uart_log_path, "w");
+		if (uart_log_file) {
+			fprintf(stderr, "[UART] Logging to %s\n", uart_log_path);
+			setbuf(uart_log_file, NULL);  /* Unbuffered for real-time logging */
+		}
+	}
 
         islot = MAX_ICACHE;
         PROFILE(update_tod (&StartTOD));
@@ -1784,6 +3217,207 @@ void mainloop (void)
                 /* Save current value of Error flag */
                 PrevError = ReadError;
 
+                /* Process VGA/X11 events periodically (every 1000 instructions for smoother display) */
+#ifdef T4_X11_FB
+                {
+                        static uint32_t sdl_event_counter = 0;
+                        if ((++sdl_event_counter % 1000) == 0) {
+                                vga_process_events();
+                        }
+                }
+#endif
+
+                if (bootdbg_enabled && bootdbg_stop_after_call_enabled && stop_after_boot_call) {
+                        fprintf(stderr,
+                                "[BOOTDBG] stopping after %s @ 0x%08X target=0x%08X return=0x%08X WPtr=0x%08X\n",
+                                last_boot_call_is_gcall ? "GCALL" : "CALL",
+                                last_boot_call_site, last_boot_call_target,
+                                last_boot_call_return, last_boot_call_wptr);
+                        return;
+                }
+
+                /* Periodic IPtr heartbeat for early-boot hangs */
+                if (bootdbg_enabled) {
+                        static uint32_t iptr_heartbeat = 0;
+                        if ((iptr_heartbeat++ % 1000000) == 0) {
+                                fprintf(stderr, "[BOOTDBG] heartbeat IPtr=0x%08X WPtr=0x%08X\n",
+                                        IPtr, WPtr);
+                        }
+                }
+
+		if (outbyte_trace_enabled && !outbyte_entry_logged) {
+			const link_sym *lsym = NULL;
+			const prolog_sym *sym = NULL;
+			uint32_t entry_iptr = 0;
+			lsym = find_link_sym_by_name("__outbyte");
+			if (!lsym)
+				lsym = find_link_sym_by_name("transputer_outbyte");
+			if (lsym && link_text_base) {
+				entry_iptr = link_text_base + lsym->sym_off;
+				fprintf(stderr,
+				        "[OUTBYTE_DUMP] func=%s entry=0x%08X\n",
+				        lsym->name, entry_iptr);
+			} else {
+				sym = find_prolog_sym_by_name("__outbyte");
+				if (!sym)
+					sym = find_prolog_sym_by_name("transputer_outbyte");
+				if (sym)
+					entry_iptr = prolog_text_base + sym->text_off;
+				if (sym) {
+					fprintf(stderr,
+					        "[OUTBYTE_DUMP] func=%s entry=0x%08X\n",
+					        sym->name, entry_iptr);
+				}
+			}
+			if (entry_iptr) {
+				fprintf(stderr, "[OUTBYTE_BYTES] ");
+				for (i = 0; i < 32; i++) {
+					fprintf(stderr, "%02X%s", byte_int(entry_iptr + i),
+					        (i == 31) ? "\n" : " ");
+				}
+				outbyte_entry_logged = 1;
+			}
+		}
+		if (!sym_dump_logged) {
+			const char *sym_name = getenv("T4_DUMP_SYM");
+			if (sym_name && *sym_name)
+				dump_sym_bytes_once(sym_name);
+		}
+		if (boot_dump_start_enabled && !boot_dump_start_done && IPtr == MemStart) {
+			uint32_t w0 = word(index(WPtr, 0));
+			uint32_t w1 = word(index(WPtr, 1));
+			fprintf(stderr,
+			        "[BOOTSTART] IPtr=0x%08X WPtr=0x%08X WPtr[0]=0x%08X WPtr[1]=0x%08X\n",
+			        IPtr, WPtr, w0, w1);
+			boot_dump_start_done = 1;
+		}
+		if (!iptr_dump_logged)
+			dump_iptr_bytes_once();
+		setup_sym_trace_once();
+		setup_iptr_trace_once();
+		setup_text_write_trace_once();
+		setup_cache_debug_trace_once();
+
+                /* Short-range trace around head.S BSS loop */
+                if (bootdbg_enabled && IPtr >= 0x80000090 && IPtr <= 0x800000B0) {
+                        static int iptr_trace_count = 0;
+                        if (iptr_trace_count < 32) {
+                                fprintf(stderr, "[BOOTDBG] IPtr=0x%08X\n", IPtr);
+                                iptr_trace_count++;
+                        }
+                }
+                /* Short-range trace around bare-metal bootstrap entry. */
+                if (bootdbg_enabled && IPtr >= 0x80000070 && IPtr <= 0x80000090) {
+                        static int iptr_trace0_count = 0;
+                        if (iptr_trace0_count < 64) {
+                                uint8_t op0 = byte_int(IPtr);
+                                uint8_t op1 = byte_int(IPtr + 1);
+                                const char *mnemo = mnemonic(Icode, OReg, AReg, 0);
+                                fprintf(stderr,
+                                        "[BOOTDBG] entry IPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X O=0x%08X op=%02X %02X err=%d ho=%d icode=0x%02X ins=0x%02X idata=0x%X mnemo=%s\n",
+                                        IPtr, AReg, BReg, CReg, OReg, op0, op1,
+                                        ReadError ? 1 : 0, ReadHaltOnError ? 1 : 0,
+                                        Icode, Instruction, Idata, mnemo);
+                                iptr_trace0_count++;
+                        }
+                }
+                if (bootdbg_enabled && IPtr >= 0x800000B5 && IPtr <= 0x80000110) {
+                        static int iptr_trace2_count = 0;
+                        if (iptr_trace2_count < 64) {
+                                fprintf(stderr, "[BOOTDBG] post-bss IPtr=0x%08X\n", IPtr);
+                                iptr_trace2_count++;
+                        }
+                }
+                if (bootdbg_enabled && IPtr >= 0x80000180 && IPtr <= 0x800001B0) {
+                        static int iptr_trace3_count = 0;
+                        if (iptr_trace3_count < 128) {
+                                uint8_t op0 = byte_int(IPtr);
+                                uint8_t op1 = byte_int(IPtr + 1);
+                                fprintf(stderr,
+                                        "[BOOTDBG] boot2 IPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X O=0x%08X op=%02X %02X icode=0x%02X ins=0x%02X idata=0x%X mnemo=%s\n",
+                                        IPtr, AReg, BReg, CReg, OReg, op0, op1,
+                                        Icode, Instruction, Idata,
+                                        mnemonic(Icode, OReg, AReg, 0));
+                                iptr_trace3_count++;
+                        }
+                }
+                /* Bare-metal entry trace: first hit into .text or an explicit range. */
+                {
+                        static int entry_trace_init = 0;
+                        static int entry_trace_enabled = 0;
+                        static int entry_trace_done = 0;
+                        static uint32_t entry_start = 0;
+                        static uint32_t entry_end = 0;
+                        if (!entry_trace_init) {
+                                const char *env = getenv("T4_ENTRY_TRACE");
+                                const char *env_start = getenv("T4_ENTRY_START");
+                                const char *env_end = getenv("T4_ENTRY_END");
+                                const char *env_iptr = getenv("T4_ENTRY_IPTR");
+                                entry_trace_enabled = (env && *env);
+                                if (env_iptr && *env_iptr) {
+                                        entry_start = (uint32_t)strtoul(env_iptr, NULL, 0);
+                                        entry_end = entry_start;
+                                } else {
+                                        entry_start = env_start && *env_start ? (uint32_t)strtoul(env_start, NULL, 0) : 0x80000120;
+                                        entry_end = env_end && *env_end ? (uint32_t)strtoul(env_end, NULL, 0) : 0x80002000;
+                                }
+                                entry_trace_init = 1;
+                        }
+                        if (entry_trace_enabled && !entry_trace_done) {
+                                if ((entry_start == entry_end && IPtr == entry_start) ||
+                                    (entry_start != entry_end && IPtr >= entry_start && IPtr <= entry_end)) {
+                                        fprintf(stderr,
+                                                "[ENTRY] IPtr=0x%08X WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X O=0x%08X\n",
+                                                IPtr, WPtr, AReg, BReg, CReg, OReg);
+                                        entry_trace_done = 1;
+                                }
+                        }
+                }
+                if (bootdbg_enabled && IPtr == 0x800000B5) {
+                        static int bss_done_logged = 0;
+                        if (!bss_done_logged) {
+                                fprintf(stderr, "[BOOTDBG] Reached bss_clear_done\n");
+                                bss_done_logged = 1;
+                        }
+                }
+                if (bootdbg_enabled && IPtr >= 0x80883780 && IPtr <= 0x80883840) {
+                        static int start_kernel_seen = 0;
+                        if (!start_kernel_seen) {
+                                fprintf(stderr,
+                                        "[BOOTDBG] entered start_kernel IPtr=0x%08X WPtr=0x%08X\n",
+                                        IPtr, WPtr);
+                                start_kernel_seen = 1;
+                        }
+                }
+                if (bootdbg_enabled && last_boot_call_target != 0 && IPtr == last_boot_call_target) {
+                        static int post_gcall_seen = 0;
+                        if (!post_gcall_seen) {
+                                fprintf(stderr,
+                                        "[BOOTDBG] post-GCALL IPtr=0x%08X return=0x%08X WPtr=0x%08X\n",
+                                        IPtr, last_boot_call_return, WPtr);
+                                post_gcall_seen = 1;
+                        }
+                }
+
+                /* One-shot snapshot at bss_clear_loop in head.S */
+                if (bootdbg_enabled && IPtr == 0x800000A3) {
+                        static int bss_logged = 0;
+                        static uint32_t bss_loop_count = 0;
+                        uint32_t bss_start = word_int(index(WPtr, 3));
+                        uint32_t bss_stop = word_int(index(WPtr, 4));
+                        if (!bss_logged) {
+                                fprintf(stderr,
+                                        "[BOOTDBG] IPtr=0x%08X WPtr=0x%08X bss_start=0x%08X bss_stop=0x%08X\n",
+                                        IPtr, WPtr, bss_start, bss_stop);
+                                bss_logged = 1;
+                        }
+                        if ((bss_loop_count++ % 100000) == 0) {
+                                fprintf(stderr,
+                                        "[BOOTDBG] bss_loop=%u current_ptr=0x%08X end_ptr=0x%08X\n",
+                                        bss_loop_count, bss_start, bss_stop);
+                        }
+                }
+
 		/* Move timers on if necessary, and increment timeslice counter. */
                 if (++count1 > delayCount1)
                 {
@@ -1797,6 +3431,9 @@ void mainloop (void)
 
                 if (ReadGotoSNP)
                 {
+                        fprintf(stderr, "[SNP] GotoSNP set! IPtr=0x%08X WPtr=0x%08X heartbeat=%llu\n",
+                                IPtr, WPtr, (unsigned long long)heartbeat_counter);
+                        fflush(stderr);
                         if (start_process ())
                                 return;
                 }
@@ -1805,12 +3442,24 @@ void mainloop (void)
         ResetRounding = FALSE;
 
         pslot = islot;
-        if (IPtr != Icache[islot = IHASH(IPtr)].IPtr)
+        islot = IHASH(IPtr);
+        if (IPtr != Icache[islot].IPtr)
         {
                 PROFILE(profile[PRO_ICMISS]++);
                 Icache[islot].IPtr = IPtr;
                 SetCached(IPtr);
-                OReg = 0;
+                /* OReg is preserved across icache misses; do not reset here. */
+                /* Cache debug tracing for miss */
+                if (cache_debug_trace_enabled &&
+                    IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
+                        uint8_t mem_op0 = byte_int(IPtr);
+                        uint8_t mem_op1 = byte_int(IPtr + 1);
+                        uint8_t mem_op2 = byte_int(IPtr + 2);
+                        uint8_t mem_op3 = byte_int(IPtr + 3);
+                        fprintf(stderr,
+                                "[CACHE_MISS] slot=0x%X IPtr=0x%08X mem=%02X%02X%02X%02X OReg=0x%08X WPtr=0x%08X\n",
+                                islot, IPtr, mem_op0, mem_op1, mem_op2, mem_op3, OReg, WPtr);
+                }
 #ifdef EMUDEBUG
                 if (cachedebug)
                         printf ("-I-EMU414: Icache miss @ #%08X\n", IPtr);
@@ -1818,8 +3467,39 @@ void mainloop (void)
 
 FetchNext:      Instruction = byte_int (IPtr);
 	        Icode = Instruction & 0xf0;
-	        Idata = Instruction & 0x0f;
-	        OReg  = OReg | Idata;
+                if (sk_entry_dump_enabled && !sk_entry_dumped && IPtr == sk_entry_iptr) {
+                        int off;
+                        fprintf(stderr, "[SKWPT] IPtr=0x%08X WPtr=0x%08X\n", IPtr, WPtr);
+                        for (off = -16; off <= 16; off += 4) {
+                                uint32_t addr = WPtr + off;
+                                uint32_t val = word_int(addr);
+                                fprintf(stderr,
+                                        "[SKWPT] 0x%08X: 0x%08X\n",
+                                        addr, val);
+                        }
+                        sk_entry_dumped = 1;
+                }
+                Idata = Instruction & 0x0f;
+                OReg = OReg + Idata;
+
+                if (sym_trace_entry && !sym_trace_active && IPtr == sym_trace_entry) {
+                        sym_trace_active = 1;
+                }
+                if (sym_trace_active && sym_trace_remaining > 0) {
+                        fprintf(stderr,
+                                "[SYM_TRACE] func=%s IPtr=0x%08X Instruction=0x%02X Icode=0x%02X OReg=0x%08X Mnemo=%s AReg=0x%08X BReg=0x%08X CReg=0x%08X\n",
+                                sym_trace_name, IPtr, Instruction, Icode, OReg,
+                                mnemonic(Icode, OReg, AReg, 0), AReg, BReg, CReg);
+                        sym_trace_remaining--;
+                        if (sym_trace_remaining == 0)
+                                sym_trace_active = 0;
+                }
+                if (iptr_trace_enabled && IPtr >= iptr_trace_start && IPtr < iptr_trace_end) {
+                        fprintf(stderr,
+                                "[IPTR_TRACE] IPtr=0x%08X Instruction=0x%02X Icode=0x%02X OReg=0x%08X Mnemo=%s AReg=0x%08X BReg=0x%08X CReg=0x%08X\n",
+                                IPtr, Instruction, Icode, OReg,
+                                mnemonic(Icode, OReg, AReg, 0), AReg, BReg, CReg);
+                }
 
 #ifdef EMUDEBUG
                 if (cachedebug)
@@ -1831,6 +3511,12 @@ FetchNext:      Instruction = byte_int (IPtr);
                 {
 		        OReg = OReg << 4;
 			IPtr++;
+			heartbeat_counter++;
+			if ((heartbeat_counter % 10000000) == 0) {
+				fprintf(stderr, "[PFXHB] %lluM IPtr=0x%08X OReg=0x%08X WPtr=0x%08X\n",
+					(unsigned long long)(heartbeat_counter / 1000000), IPtr, OReg, WPtr);
+				fflush(stderr);
+			}
                         goto FetchNext;
                 }
                 else if (0x60 == Icode)
@@ -1839,9 +3525,22 @@ FetchNext:      Instruction = byte_int (IPtr);
 			IPtr++;
                         goto FetchNext;
                 }
+                if (bootdbg_enabled && IPtr >= 0x80000190 && IPtr <= 0x80000198) {
+                        fprintf(stderr,
+                                "[BOOTDBG2] OReg new=0x%08X IPtr=0x%08X Icode=0x%02X Idata=0x%X\n",
+                                OReg, IPtr, Icode, Idata);
+                }
                 Icache[islot].NextIPtr = IPtr;
                 Icache[islot].OReg     = OReg;
                 Icache[islot].Icode    = Icode;
+                /* Cache debug tracing for store */
+                if (cache_debug_trace_enabled &&
+                    Icache[islot].IPtr >= cache_debug_trace_start &&
+                    Icache[islot].IPtr < cache_debug_trace_end) {
+                        fprintf(stderr,
+                                "[CACHE_STORE] slot=0x%X origIPtr=0x%08X NextIPtr=0x%08X OReg=0x%08X Icode=0x%02X WPtr=0x%08X\n",
+                                islot, Icache[islot].IPtr, IPtr, OReg, Icode, WPtr);
+                }
 
 #ifdef EMUDEBUG
                 Icache[islot].Instruction = Instruction;
@@ -1868,7 +3567,6 @@ FetchNext:      Instruction = byte_int (IPtr);
                                 Icache[pslot].OReg  = combined[i].ccode;
                                 Icache[pslot].Icode = 0xF0;
                                 Icache[pslot].Pcode = ProfileCode (Icache[pslot].Icode, Icache[pslot].OReg);
-
                                 EMUDBG4 ("-I-EMU414: OReg=#%X Arg0=#%X Arg1=#%X\n", Icache[pslot].OReg, Acache[pslot]._Arg0, Acache[pslot]._Arg1);
                         }
                 }
@@ -1882,6 +3580,18 @@ FetchNext:      Instruction = byte_int (IPtr);
         IPtr  = Icache[islot].NextIPtr;
         OReg  = Icache[islot].OReg;
         Icode = Icache[islot].Icode;
+        /* Cache debug tracing */
+        if (cache_debug_trace_enabled &&
+            IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
+                uint8_t mem_op0 = byte_int(Icache[islot].IPtr);
+                uint8_t mem_op1 = byte_int(Icache[islot].IPtr + 1);
+                uint8_t mem_op2 = byte_int(Icache[islot].IPtr + 2);
+                uint8_t mem_op3 = byte_int(Icache[islot].IPtr + 3);
+                fprintf(stderr,
+                        "[CACHE_HIT] slot=0x%X origIPtr=0x%08X NextIPtr=0x%08X OReg=0x%08X Icode=0x%02X mem=%02X%02X%02X%02X WPtr=0x%08X\n",
+                        islot, Icache[islot].IPtr, IPtr, OReg, Icode,
+                        mem_op0, mem_op1, mem_op2, mem_op3, WPtr);
+        }
 
 ExecuteInstr:
 #ifdef EMUDEBUG
@@ -1969,60 +3679,182 @@ ExecuteInstr:
 		add_profile (Icode);
 #endif
 
+	heartbeat_counter++;
+	if ((heartbeat_counter % 100) == 0) {
+		fprintf(stderr, "[HB] %llu IPtr=0x%08X WPtr=0x%08X AReg=0x%08X Icode=0x%02X\n",
+			(unsigned long long)heartbeat_counter, IPtr, WPtr, AReg, Icode);
+		fflush(stderr);
+	}
+
 	switch (Icode)
 	{
 		case 0x00: /* j     */
 			   IPtr++;
-			   IPtr = IPtr + OReg;
-			   D_check();
+			   if (OReg == 0 && EnableJ0BreakFlag) {
+			           handle_j0_break();
+			   } else {
+			           IPtr = IPtr + OReg;
+			           D_check();
+			   }
 			   break;
 		case 0x10: /* ldlp  */
-			   CReg = BReg;
-			   BReg = AReg;
-			   AReg = index (WPtr, OReg);
+			   {
+			       uint32_t oldA = AReg;
+			       CReg = BReg;
+			       BReg = AReg;
+			       AReg = index (WPtr, OReg);
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] LDLP IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X WPtr=0x%08X\n",
+			                   IPtr, OReg, oldA, AReg, WPtr);
+			       }
+			       if (sk_addr_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKADDR] LDLP IPtr=0x%08X OReg=0x%X WPtr=0x%08X addr=0x%08X\n",
+			                   IPtr, OReg, WPtr, AReg);
+			       }
+			   }
 			   IPtr++;
 			   break;
 		case 0x20: /* pfix  */
-			   OReg = OReg << 4;
 			   IPtr++;
 			   break;
 		case 0x30: /* ldnl  */
                            T4DEBUG(checkWordAligned ("LDNL", AReg));
-			   AReg = word (index (AReg, OReg));
+			   {
+			       uint32_t oldA = AReg;
+			       uint32_t addr = index(AReg, OReg);
+			       uint32_t value = word(addr);
+			       /* Debug: Show critical ldnl operations in bootstrap range */
+			       if (IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			           printf("[LDNL] IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X value=0x%08X\n",
+			                  IPtr, AReg, OReg, addr, value);
+			       }
+			       AReg = value;
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] LDNL IPtr=0x%08X OReg=0x%X addr=0x%08X AReg:0x%08X->0x%08X\n",
+			                   IPtr, OReg, addr, oldA, AReg);
+			       }
+			       if (sk_addr_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKADDR] LDNL IPtr=0x%08X OReg=0x%X addr=0x%08X value=0x%08X\n",
+			                   IPtr, OReg, addr, value);
+			       }
+			   }
 			   IPtr++;
 			   break;
 		case 0x40: /* ldc   */
-			   CReg = BReg;
-			   BReg = AReg;
-			   AReg = OReg;
+			   {
+			       uint32_t oldA = AReg;
+			       CReg = BReg;
+			       BReg = AReg;
+			       AReg = OReg;
+			       /* Trace LDC that loads framebuffer address */
+			       if ((AReg & 0xF0000000) == 0x90000000) {
+			           fprintf(stderr, "[FB_LDC] IPtr=0x%08X loaded=0x%08X\n", IPtr, AReg);
+			       }
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] LDC IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X\n",
+			                   IPtr, OReg, oldA, AReg);
+			       }
+			   }
 			   IPtr++;
 			   break;
 		case 0x50: /* ldnlp */
                            /* NB. Minix demo uses unaligned AReg! */
                            T4DEBUG(checkWordAligned ("LDNLP", AReg));
-			   AReg = index (AReg, OReg);
+			   {
+			       uint32_t oldA = AReg;
+			       AReg = index (AReg, OReg);
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] LDNLP IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X\n",
+			                   IPtr, OReg, oldA, AReg);
+			       }
+			   }
 			   IPtr++;
 			   break;
 		case 0x60: /* nfix  */
-			   OReg = (~OReg) << 4;
 			   IPtr++;
 			   break;
 		case 0x70: /* ldl   */
-			   CReg = BReg;
-			   BReg = AReg;
-			   AReg = word (index (WPtr, OReg));
+			   {
+			       uint32_t oldA = AReg;
+			       uint32_t addr = index(WPtr, OReg);
+			       CReg = BReg;
+			       BReg = AReg;
+			       AReg = word(addr);
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] LDL IPtr=0x%08X OReg=0x%X addr=0x%08X AReg:0x%08X->0x%08X\n",
+			                   IPtr, OReg, addr, oldA, AReg);
+			       }
+			       if (sk_addr_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKADDR] LDL IPtr=0x%08X OReg=0x%X WPtr=0x%08X addr=0x%08X value=0x%08X\n",
+			                   IPtr, OReg, WPtr, addr, AReg);
+			       }
+			   }
+			   /* Debug: Trace ldl in bootstrap range */
+			   if (IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			       printf("[LDL] IPtr=0x%08X local=%d addr=0x%08X value=0x%08X → AReg\n",
+			              IPtr, OReg, index(WPtr, OReg), AReg);
+			   }
 			   IPtr++;
 			   break;
 		case 0x80: /* adc   */
 			   t4_overflow = FALSE;
 			   t4_carry = 0;
-			   AReg = t4_eadd32 (AReg, OReg);
+			   {
+			       uint32_t oldA = AReg;
+			       AReg = t4_eadd32 (AReg, OReg);
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] ADC IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X\n",
+			                   IPtr, OReg, oldA, AReg);
+			       }
+			   }
 			   if (t4_overflow == TRUE)
 				SetError;
 			   IPtr++;
 			   break;
 		case 0x90: /* call  */
 			   IPtr++;
+			   /* Log kernel function calls */
+			   if (IPtr >= 0x80000000 && IPtr < 0x81000000) {
+			       printf("[CALL] from=0x%08X to=0x%08X WPtr=0x%08X→0x%08X\n",
+			              IPtr - 1, IPtr + OReg, WPtr, index(WPtr, -4));
+			   }
+			   maybe_log_nearest_sym(IPtr - 1, "CALL");
+			   if (wptr_trace_enabled) {
+			       printf("[WPtr] CALL IPtr=0x%08X target=0x%08X WPtr=0x%08X→0x%08X\n",
+			              IPtr - 1, IPtr + OReg, WPtr, index(WPtr, -4));
+			   }
+			   if (bootdbg_stop_after_call_enabled &&
+			       (IPtr - 1) >= boot_call_start && (IPtr - 1) <= boot_call_end) {
+			       last_boot_call_is_gcall = 0;
+			       last_boot_call_site = IPtr - 1;
+			       last_boot_call_target = IPtr + OReg;
+			       last_boot_call_return = IPtr;
+			       last_boot_call_wptr = WPtr;
+			       maybe_auto_text_base();
+			       stop_after_boot_call = 1;
+			       if (bootdbg_enabled)
+			               fprintf(stderr,
+			                       "[BOOTDBG] armed stop after CALL @ 0x%08X target=0x%08X return=0x%08X\n",
+			                       last_boot_call_site, last_boot_call_target, last_boot_call_return);
+			   }
 			   writeword (index (WPtr, -1), CReg);
 			   writeword (index (WPtr, -2), BReg);
 			   writeword (index (WPtr, -3), AReg);
@@ -2033,22 +3865,63 @@ ExecuteInstr:
                            /* Pop BReg. */
                            BReg = CReg;
 			   IPtr = IPtr + OReg;
+			   /* Cache debug tracing for CALL target */
+			   if (cache_debug_trace_enabled &&
+			       IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
+			       uint8_t t0 = byte_int(IPtr);
+			       uint8_t t1 = byte_int(IPtr + 1);
+			       uint8_t t2 = byte_int(IPtr + 2);
+			       uint8_t t3 = byte_int(IPtr + 3);
+			       uint8_t t4 = byte_int(IPtr + 4);
+			       uint8_t t5 = byte_int(IPtr + 5);
+			       uint8_t t6 = byte_int(IPtr + 6);
+			       uint8_t t7 = byte_int(IPtr + 7);
+			       fprintf(stderr,
+			               "[CALL_TARGET] IPtr=0x%08X bytes=%02X%02X%02X%02X%02X%02X%02X%02X WPtr=0x%08X ret=0x%08X\n",
+			               IPtr, t0, t1, t2, t3, t4, t5, t6, t7, WPtr, AReg);
+			   }
 			   break;
 		case 0xa0: /* cj    */
-			   IPtr++;
 			   if (AReg != 0)
 			   {
 				AReg = BReg;
 				BReg = CReg;
+				IPtr++;
 			   }
 			   else
 			   {
+				IPtr++;
 				IPtr = IPtr + OReg;
 			   }
 			   break;
 		case 0xb0: /* ajw   */
-                           UpdateWdescReg (index (WPtr, OReg) | ProcPriority);
-                           T4DEBUG(checkWPtr ("AJW", WPtr));
+			   {
+			       /* OReg is already correctly set by prefix instructions (PFIX/NFIX).
+			        * NFIX complements OReg for negative values.
+			        * No sign-extension needed here - bare 4-bit values 0-15 are positive. */
+			       int32_t delta = (int32_t)OReg;
+			       uint32_t new_wptr = index(WPtr, delta);
+			       /* Cache debug tracing for AJW */
+			       if (cache_debug_trace_enabled &&
+			           IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
+			           fprintf(stderr,
+			                   "[AJW_DEBUG] IPtr=0x%08X OReg=0x%08X delta=%d WPtr=0x%08X→0x%08X\n",
+			                   IPtr, OReg, delta, WPtr, new_wptr);
+			       }
+			       /* Log ALL workspace changes in bootstrap range, or significant changes in kernel */
+			       if ((IPtr >= 0x80000070 && IPtr <= 0x80000200) ||
+			           (IPtr >= 0x80000000 && IPtr < 0x81000000 && (delta > 10 || delta < -10))) {
+			           printf("[AJW] IPtr=0x%08X delta=%d WPtr=0x%08X→0x%08X\n",
+			                  IPtr, delta, WPtr, new_wptr);
+			       }
+			       /* Validate workspace pointer - use actual configured memory size */
+			       if (new_wptr == 0x2FFA2FFA || new_wptr < MemStart || new_wptr >= (MemStart + MemSize)) {
+			           printf("[ERROR] Invalid WPtr after ajw: 0x%08X at IPtr=0x%08X (valid range: 0x%08X-0x%08X)\n",
+			                  new_wptr, IPtr, MemStart, MemStart + MemSize);
+			       }
+                               UpdateWdescReg (new_wptr | ProcPriority);
+                               T4DEBUG(checkWPtr ("AJW", WPtr));
+			   }
 			   IPtr++;
 			   break;
 		case 0xc0: /* eqc   */
@@ -2063,14 +3936,116 @@ ExecuteInstr:
 			   IPtr++;
 			   break;
 		case 0xd0: /* stl   */
-			   writeword (index (WPtr, OReg), AReg);
+			   {
+			       uint32_t addr = index(WPtr, OReg);
+			       if (text_write_trace_enabled &&
+			           addr >= text_write_trace_start &&
+			           addr < text_write_trace_end) {
+			           uint32_t delta = 0;
+			           const link_sym *lsym = find_link_sym(IPtr, &delta);
+			           const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+			           fprintf(stderr,
+			                   "[TEXT_STL] IPtr=0x%08X WPtr=0x%08X OReg=0x%X addr=0x%08X AReg=0x%08X%s%s\n",
+			                   IPtr, WPtr, OReg, addr, AReg,
+			                   (lsym || sym) ? " sym=" : "",
+			                   lsym ? lsym->name : (sym ? sym->name : ""));
+			           if (lsym) {
+			               fprintf(stderr, "            sym_off=0x%X+0x%X\n",
+			                       lsym->sym_off, delta);
+			           } else if (sym) {
+			               fprintf(stderr, "            sym_off=0x%X+0x%X\n",
+			                       sym->text_off, delta);
+			           }
+			       }
+			       writeword(addr, AReg);
+			   }
+			   /* Debug: Trace stl in bootstrap range */
+			   if (IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			       printf("[STL] IPtr=0x%08X local=%d addr=0x%08X AReg=0x%08X stored\n",
+			              IPtr, OReg, index(WPtr, OReg), AReg);
+			   }
+			   if (sk_store_trace_enabled && sk_entry_iptr &&
+			       IPtr >= sk_entry_iptr && IPtr <= (sk_entry_iptr + 0x200)) {
+			       printf("[SKSTL] IPtr=0x%08X local=%d addr=0x%08X AReg=0x%08X\n",
+			              IPtr, OReg, index(WPtr, OReg), AReg);
+			   }
+			   if (sk_areg_trace_enabled &&
+			       IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			       fprintf(stderr,
+			               "[SKA] STL IPtr=0x%08X AReg:0x%08X->0x%08X\n",
+			               IPtr, AReg, BReg);
+			   }
 			   AReg = BReg;
 			   BReg = CReg;
 			   IPtr++;
 			   break;
 		case 0xe0: /* stnl  */
                            T4DEBUG(checkWordAligned ("STNL", AReg));
+			   /* Debug: catch any STNL to framebuffer/VGA area */
+			   {
+			       uint32_t stnl_addr = index(AReg, OReg);
+			       /* Trace VGA register writes (0xA0000000 range) */
+			       if ((stnl_addr & 0xFFFFF000) == 0xA0000000) {
+			           fprintf(stderr, "[VGA_STNL] IPtr=0x%08X addr=0x%08X val=0x%08X\n",
+			                   IPtr, stnl_addr, BReg);
+			       }
+			       /* Debug: trace ALL STNLs in setup_arch to find FB writes */
+			       if (IPtr >= 0x8053c57b && IPtr < 0x8053d57b) {
+			           static int setup_stnl_count = 0;
+			           if (setup_stnl_count < 200) {
+			               fprintf(stderr, "[SETUP_STNL#%d] IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X val=0x%08X\n",
+			                       setup_stnl_count, IPtr, AReg, OReg, stnl_addr, BReg);
+			               setup_stnl_count++;
+			           }
+			       }
+			       if ((stnl_addr & 0xF0000000) == 0x90000000) {
+			           static int fb_stnl_count = 0;
+			           if (fb_stnl_count < 50) {
+			               fprintf(stderr, "[FB_STNL#%d] IPtr=0x%08X addr=0x%08X val=0x%08X\n",
+			                       fb_stnl_count, IPtr, stnl_addr, BReg);
+			               fb_stnl_count++;
+			           }
+			       }
+			   }
+			   if (bootdbg_enabled && IPtr >= 0x80883FE0 && IPtr <= 0x80884020) {
+			       uint32_t addr = index(AReg, OReg);
+			       fprintf(stderr, "[BOOTDBG] STNL IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X BReg=0x%08X\n",
+			               IPtr, AReg, OReg, addr, BReg);
+			   }
+			   if (sk_store_trace_enabled && sk_entry_iptr &&
+			       IPtr >= sk_entry_iptr && IPtr <= (sk_entry_iptr + 0x200)) {
+			       uint32_t addr = index(AReg, OReg);
+			       printf("[SKSTNL] IPtr=0x%08X addr=0x%08X BReg=0x%08X\n",
+			              IPtr, addr, BReg);
+			   }
+			   {
+			       uint32_t addr = index(AReg, OReg);
+			       if (text_write_trace_enabled &&
+			           addr >= 0x80880000 && addr < 0x80890000) {
+			           uint32_t delta = 0;
+			           const link_sym *lsym = find_link_sym(IPtr, &delta);
+			           const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+			           fprintf(stderr,
+			                   "[TEXT_STNL] IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X BReg=0x%08X WPtr=0x%08X%s%s\n",
+			                   IPtr, AReg, OReg, addr, BReg, WPtr,
+			                   (lsym || sym) ? " sym=" : "",
+			                   lsym ? lsym->name : (sym ? sym->name : ""));
+			           if (lsym) {
+			               fprintf(stderr, "             sym_off=0x%X+0x%X\n",
+			                       lsym->sym_off, delta);
+			           } else if (sym) {
+			               fprintf(stderr, "             sym_off=0x%X+0x%X\n",
+			                       sym->text_off, delta);
+			           }
+			       }
+			   }
 			   writeword (index (AReg, OReg), BReg);
+			   if (sk_areg_trace_enabled &&
+			       IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			       fprintf(stderr,
+			               "[SKA] STNL IPtr=0x%08X AReg:0x%08X->0x%08X\n",
+			               IPtr, AReg, CReg);
+			   }
 			   AReg = CReg;
 			   IPtr++;
 			   break;
@@ -2080,9 +4055,18 @@ ExecuteInstr:
 	switch (OReg)
 	{
 		case 0x00: /* rev         */
-			   temp = AReg;
-			   AReg = BReg;
-			   BReg = temp;
+			   {
+			       uint32_t oldA = AReg;
+			       temp = AReg;
+			       AReg = BReg;
+			       BReg = temp;
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] REV IPtr=0x%08X AReg:0x%08X->0x%08X BReg=0x%08X\n",
+			                   IPtr, oldA, AReg, BReg);
+			       }
+			   }
 			   IPtr++;
 			   break;
 		case 0x01: /* lb          */
@@ -2131,10 +4115,46 @@ ExecuteInstr:
 			   IPtr++;
 			   break;
 		case 0x06: /* gcall       */
+			   {
+			       uint32_t call_site = IPtr;
+			   /* Debug: Show gcall in bootstrap range */
+			   if (IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			       printf("[GCALL] IPtr=0x%08X AReg=0x%08X (target) WPtr=0x%08X BReg=0x%08X CReg=0x%08X\n",
+			              IPtr, AReg, WPtr, BReg, CReg);
+			   }
+			   maybe_log_nearest_sym(IPtr, "GCALL");
+			   if (wptr_trace_enabled) {
+			       printf("[WPtr] GCALL IPtr=0x%08X target=0x%08X WPtr=0x%08X\n",
+			              IPtr, AReg, WPtr);
+			   }
 			   IPtr++;
 			   temp = AReg;
 			   AReg = IPtr;
 			   IPtr = temp;
+			   if (bootdbg_enabled && temp >= 0x804BAC00 && temp <= 0x804BB000) {
+			       fprintf(stderr,
+			               "[BOOTDBG] gcall target IPtr=0x%08X return_addr=0x%08X WPtr=0x%08X\n",
+			               IPtr, AReg, WPtr);
+			   }
+			   /* Show where we're jumping to */
+			   if (IPtr >= 0x80000070 && IPtr <= 0x80000200 || temp >= 0x80000070 && temp <= 0x80000200) {
+			       printf("[GCALL] Jumping to IPtr=0x%08X return_addr=0x%08X\n", IPtr, AReg);
+			   }
+			   last_boot_call_is_gcall = 1;
+			   last_boot_call_site = call_site;
+			   last_boot_call_target = IPtr;
+			   last_boot_call_return = AReg;
+			   last_boot_call_wptr = WPtr;
+			   maybe_auto_text_base();
+			   if (bootdbg_stop_after_call_enabled &&
+			       call_site >= boot_call_start && call_site <= boot_call_end) {
+			       stop_after_boot_call = 1;
+			       if (bootdbg_enabled)
+			               fprintf(stderr,
+			                       "[BOOTDBG] armed stop after GCALL @ 0x%08X target=0x%08X return=0x%08X\n",
+			                       last_boot_call_site, last_boot_call_target, last_boot_call_return);
+			   }
+			   }
 			   break;
 		case 0x07: /* in          */
 OprIn:                     if (IsLinkOut(BReg)) /* M.Bruestle 22.1.2012 */
@@ -2607,9 +4627,33 @@ DescheduleOutWord:
 			   IPtr++;
 			   break;
 		case 0x20: /* ret         */
-			   IPtr = word (WPtr);
-			   UpdateWdescReg (index (WPtr, 4) | ProcPriority);
-                           T4DEBUG(checkWPtr ("RET", WPtr));
+			   {
+			       uint32_t return_addr = word(WPtr);
+			       uint32_t new_wptr = index(WPtr, 4);
+			       uint32_t old_iptr = IPtr;
+			       /* Log kernel function returns */
+			       if (IPtr >= 0x80000000 && IPtr < 0x81000000) {
+			           printf("[RET] from=0x%08X to=0x%08X WPtr=0x%08X→0x%08X\n",
+			                  IPtr, return_addr, WPtr, new_wptr);
+			       }
+			       /* Validate return address */
+			       if (return_addr == 0x2FFA2FFA || return_addr == 0x80000000) {
+			           printf("[ERROR] Invalid return address 0x%08X at IPtr=0x%08X WPtr=0x%08X\n",
+			                  return_addr, IPtr, WPtr);
+			       }
+			       /* TCWG spec: "The ret instruction restores the Iptr and adjusts the
+			        * workspace pointer to deallocate the four locations." */
+			       IPtr = return_addr;
+			       UpdateWdescReg (new_wptr | ProcPriority);
+                               T4DEBUG(checkWPtr ("RET", WPtr));
+			       /* Cache debug tracing for RET */
+			       if (cache_debug_trace_enabled &&
+			           (old_iptr >= cache_debug_trace_start && old_iptr < cache_debug_trace_end)) {
+			           fprintf(stderr,
+			                   "[RET_DEBUG] from=0x%08X to=0x%08X WPtr=0x%08X\n",
+			                   old_iptr, IPtr, WPtr);
+			       }
+			   }
 			   break;
 		case 0x21: /* lend        */ /****/
 			   temp = word (index (BReg, 1));
@@ -2885,6 +4929,22 @@ DescheduleOutWord:
 			   IPtr++;
 			   break;
 		case 0x3b: /* XXX sb          */
+			   if (sk_areg_trace_enabled &&
+			       IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			       fprintf(stderr,
+			               "[SKA] SB IPtr=0x%08X AReg=0x%08X BReg=0x%08X\n",
+			               IPtr, AReg, BReg);
+                               if (AReg == 0x10000000) {
+                                       fprintf(stderr,
+                                               "[SKA] SB_UART_HIT IPtr=0x%08X BReg=0x%08X\n",
+                                               IPtr, BReg);
+                               }
+			   }
+			   if (sk_store_trace_enabled && sk_entry_iptr &&
+			       IPtr >= sk_entry_iptr && IPtr <= (sk_entry_iptr + 0x200)) {
+			       printf("[SKSB] IPtr=0x%08X addr=0x%08X BReg=0x%08X\n",
+			              IPtr, AReg, BReg);
+			   }
 			   writebyte (AReg, BReg);
 			   AReg = CReg;
                            CReg = 0;
@@ -2894,6 +4954,10 @@ DescheduleOutWord:
                            /* XXX: proc prio toggle trick of AReg lsb=1       */
                            T4DEBUG(checkWordAligned ("GAJW", AReg));
 			   temp = AReg;
+                           if (wptr_trace_enabled) {
+                                   printf("[WPtr] GAJW IPtr=0x%08X WPtr=0x%08X→0x%08X\n",
+                                          IPtr, WPtr, temp);
+                           }
 			   AReg = WPtr;
 			   UpdateWdescReg (temp | ProcPriority);
                            T4DEBUG(checkWPtr ("GAJW", WPtr));
@@ -3487,7 +5551,50 @@ DescheduleOutWord:
                            BReg = CReg;
 		           IPtr++;
 		           break;
-                case 0x80: /* XXX fpsttest -- M.Bruestle  */
+		case 0xb1: /* break */
+			   IPtr++;
+			   handle_j0_break();
+			   break;
+		case 0xb2: /* clrj0break */
+			   EnableJ0BreakFlag = 0;
+			   IPtr++;
+			   break;
+		case 0xb3: /* setj0break */
+			   EnableJ0BreakFlag = 1;
+			   IPtr++;
+			   break;
+		case 0xb4: /* testj0break */
+			   CReg = BReg;
+			   BReg = AReg;
+			   AReg = EnableJ0BreakFlag ? true_t : false_t;
+			   IPtr++;
+			   break;
+		case 0x7a: /* timerdisableh */
+			   TimerEnableHi = 0;
+			   IPtr++;
+			   break;
+		case 0x7b: /* timerdisablel */
+			   TimerEnableLo = 0;
+			   IPtr++;
+			   break;
+		case 0x7c: /* timerenableh */
+			   TimerEnableHi = 1;
+			   IPtr++;
+			   break;
+		case 0x7d: /* timerenablel */
+			   TimerEnableLo = 1;
+			   IPtr++;
+			   break;
+		case 0x7e: /* ldmemstartval */
+			   CReg = BReg;
+			   BReg = AReg;
+			   AReg = MemStart;
+			   IPtr++;
+			   break;
+		case 0xfa: /* skip invalid opcode */
+			   IPtr++;
+			   break;
+		case 0x80: /* XXX fpsttest -- M.Bruestle  */
                            temp = FAReg.length;
                            if (FAReg.length == FP_REAL64)
                            {
@@ -4105,6 +6212,7 @@ DescheduleOutWord:
 			              break;
                            default  :  
                                       printf ("-E-EMU414: Error - bad Icode! (#%02X - %s)\n", OReg, mnemonic (Icode, OReg, AReg, 0));
+                                      maybe_log_nearest_sym(IPtr, "bad-icode");
                                       processor_state ();
 			              handler (-1);
 			              break;
@@ -4150,17 +6258,40 @@ DescheduleOutWord:
 			   IPtr++;
 		           PROFILE(profile[PRO_INSTR]++);
                            break;
-                case 0x102: /* eqc cj */
-			   IPtr++;
-			   if (AReg == Arg0)
+                 case 0x102: /* eqc cj */
+			   /* EQC: AReg = (AReg == Arg0) ? 1 : 0
+			    * CJ: if AReg == 0, jump (no pop); if AReg != 0, continue (pop)
+			    * Combined: if original AReg != Arg0, jump; else continue and pop
+			    * Fix for while(0): if Arg0 == 0, jump if original AReg == 0, else pop
+			    */
 			   {
-				AReg = BReg;
-				BReg = CReg;
-			   }
-			   else
-			   {
-                                AReg = false_t;
-				IPtr = IPtr + Arg1;
+			       static int eqc_cj_count = 0;
+			       eqc_cj_count++;
+			       IPtr++;
+			       if (Arg0 == 0) {
+			       	   /* Special case for while(0): always exit loop */
+			       	   AReg = 0; // hack to force continue
+			       	   if (eqc_cj_count < 10)
+			       	       fprintf(stderr, "[EQC_CJ] #%d CONTINUE (while0) AReg=0x%08X Arg0=0x%08X\n",
+			       	               eqc_cj_count, AReg, Arg0);
+			       	   AReg = BReg;
+			       	   BReg = CReg;
+			       } else {
+			       	   if (AReg == Arg0) {
+			       	       /* Equal: EQC gives 1, CJ continues (AReg != 0), pop stack */
+			       	       if (eqc_cj_count < 10)
+			       	           fprintf(stderr, "[EQC_CJ] #%d CONTINUE AReg=0x%08X Arg0=0x%08X\n",
+			       	                   eqc_cj_count, AReg, Arg0);
+			       	       AReg = BReg;
+			       	       BReg = CReg;
+			       	   } else {
+			       	       /* Not equal: EQC gives 0, CJ jumps (AReg == 0), NO pop */
+			       	       if (eqc_cj_count < 10)
+			       	           fprintf(stderr, "[EQC_CJ] #%d JUMP AReg=0x%08X Arg0=0x%08X Arg1=%d\n",
+			       	                   eqc_cj_count, AReg, Arg0, (int)Arg1);
+			       	       IPtr = IPtr + Arg1;
+			       	   }
+			       }
 			   }
 		           PROFILE(profile[PRO_INSTR]++);
                            break;
@@ -4270,7 +6401,31 @@ DescheduleOutWord:
 			   BReg = AReg;
 			   AReg = word (index (WPtr, Arg0));
                            T4DEBUG(checkWordAligned ("STNL", AReg));
-			   writeword (index (AReg, Arg1), BReg);
+			   {
+			       uint32_t addr = index (AReg, Arg1);
+			       /* Debug: catch framebuffer combo stores */
+			       if ((addr & 0xF0000000) == 0x90000000) {
+			           static int fb_combo_count = 0;
+			           if (fb_combo_count < 50) {
+			               fprintf(stderr, "[FB_LDL_STNL#%d] IPtr=0x%08X addr=0x%08X val=0x%08X\n",
+			                       fb_combo_count, IPtr, addr, BReg);
+			               fb_combo_count++;
+			           }
+			       }
+			       if (text_write_trace_enabled &&
+			           addr >= text_write_trace_start &&
+			           addr < text_write_trace_end) {
+			           uint32_t delta = 0;
+			           const link_sym *lsym = find_link_sym(IPtr, &delta);
+			           const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+			           fprintf(stderr,
+			                   "[TEXT_STNL_COMBO] IPtr=0x%08X addr=0x%08X BReg=0x%08X WPtr=0x%08X%s%s\n",
+			                   IPtr, addr, BReg, WPtr,
+			                   (lsym || sym) ? " sym=" : "",
+			                   lsym ? lsym->name : (sym ? sym->name : ""));
+			       }
+			       writeword (addr, BReg);
+			   }
 			   AReg = CReg;
 			   IPtr++;
 		           PROFILE(profile[PRO_INSTR]++);
@@ -4320,7 +6475,31 @@ DescheduleOutWord:
 			   AReg = index (AReg, BReg);
 			   BReg = CReg;
                            T4DEBUG(checkWordAligned ("STNL", AReg));
-			   writeword (index (AReg, Arg1), BReg);
+			   {
+			       uint32_t addr = index (AReg, Arg1);
+			       /* Debug: catch framebuffer combo stores */
+			       if ((addr & 0xF0000000) == 0x90000000) {
+			           static int fb_wsub_count = 0;
+			           if (fb_wsub_count < 50) {
+			               fprintf(stderr, "[FB_WSUB_STNL#%d] IPtr=0x%08X addr=0x%08X val=0x%08X\n",
+			                       fb_wsub_count, IPtr, addr, BReg);
+			               fb_wsub_count++;
+			           }
+			       }
+			       if (text_write_trace_enabled &&
+			           addr >= text_write_trace_start &&
+			           addr < text_write_trace_end) {
+			           uint32_t delta = 0;
+			           const link_sym *lsym = find_link_sym(IPtr, &delta);
+			           const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+			           fprintf(stderr,
+			                   "[TEXT_STNL_COMBO] IPtr=0x%08X addr=0x%08X BReg=0x%08X WPtr=0x%08X%s%s\n",
+			                   IPtr, addr, BReg, WPtr,
+			                   (lsym || sym) ? " sym=" : "",
+			                   lsym ? lsym->name : (sym ? sym->name : ""));
+			       }
+			       writeword (addr, BReg);
+			   }
 			   AReg = CReg;
 			   IPtr++;
 		           PROFILE(profile[PRO_INSTR]++);
@@ -4347,9 +6526,10 @@ DescheduleOutWord:
 			   IPtr++;
                            break;
 #endif
-                case 0x17c: /* XXX lddevid    */
-                           if (IsT800) /* TTH */
-                                BReg = CReg;
+                case 0x17c: /* lddevid */
+                           CReg = BReg;
+                           BReg = AReg;
+                           AReg = ProductIdentity;
                            IPtr++;
                            break;
                 case 0x1ff: /* XXX start    */
@@ -4361,17 +6541,24 @@ DescheduleOutWord:
 BadCode:
 #endif
                            printf ("-E-EMU414: Error - bad Icode! (#%02X - %s)\n", OReg, mnemonic (Icode, OReg, AReg, 0));
+                           maybe_log_nearest_sym(IPtr, "bad-icode");
                            processor_state ();
-			   handler (-1);
-			   break;
+                           handler (-1);
+                           break;
 	} /* switch OReg */
 			   break;
 		default  : 
                            printf ("-E-EMU414: Error - bad Icode! (#%02X - %s)\n", OReg, mnemonic (Icode, OReg, AReg, 0));
+                           maybe_log_nearest_sym(IPtr, "bad-icode");
                            processor_state ();
-			   handler (-1);
-			   break;
+                           handler (-1);
+                           break;
 	} /* switch (Icode) */
+
+        /* Clear operand accumulator after executing a non-prefix instruction. */
+        if (Icode != 0x20 && Icode != 0x60) {
+                OReg = 0;
+        }
                 /* Reset rounding mode to round nearest. */
                 if (ResetRounding && (RoundingMode != ROUND_N))
                         fp_setrounding ("reset", ROUND_N);
@@ -4380,10 +6567,18 @@ BadCode:
 
                 /* Halt when Error flag was set */
 		if ((!PrevError && ReadError) &&
-                    (exitonerror || (ReadHaltOnError)))
+                    (exitonerror || (ReadHaltOnError))) {
+			fprintf(stderr, "[EXIT] Error flag set! IPtr=0x%08X WPtr=0x%08X AReg=0x%08X exitonerror=%d HaltOnError=%d heartbeat=%llu\n",
+				IPtr, WPtr, AReg, exitonerror, ReadHaltOnError, (unsigned long long)heartbeat_counter);
+			fflush(stderr);
 			break;
-		if (quit == TRUE)
+		}
+		if (quit == TRUE) {
+			fprintf(stderr, "[EXIT] quit=TRUE IPtr=0x%08X WPtr=0x%08X heartbeat=%llu\n",
+				IPtr, WPtr, (unsigned long long)heartbeat_counter);
+			fflush(stderr);
 			break;
+		}
 
 #ifndef NDEBUG
                 fp_chkexcept ("mainloop");
@@ -4953,9 +7148,9 @@ INLINE void update_time (void)
 
 	count2 += elapsed_usec;
 
-	/* Check high priority timer queue if HiPriority or interrupts enabled. */
-        /* ??? Timers may be not enabled. */
-        schedule_timerq (HiPriority);
+        /* Check high priority timer queue if enabled. */
+        if (TimerEnableHi)
+                schedule_timerq (HiPriority);
 
 	if (count2 > 64) /* ~ 64us */
 	{
@@ -4964,8 +7159,9 @@ INLINE void update_time (void)
 		count3 += (count2 / 64);
 		count2  =  count2 & 63;
 
-		/* Check low priority timer queue if HiPriority or interrupts enabled. */
-                schedule_timerq (LoPriority);
+		/* Check low priority timer queue if enabled. */
+                if (TimerEnableLo)
+                        schedule_timerq (LoPriority);
 
 		if (count3 > 16) /* ~ 1024us */
 		{
@@ -4978,6 +7174,9 @@ INLINE void update_time (void)
 		check_input();
 #endif
 	}
+#ifdef T4_X11_FB
+    vga_process_events();
+#endif
 }
 
 #define CoreAddr(a)     (INT32(a) < INT32(ExtMemStart))
@@ -4986,10 +7185,160 @@ INLINE void update_time (void)
 #define ExtMemRange(a,n)(ExtMemAddr(a) && ExtMemAddr((a)+(n)))
 #define MemWordPtr(a)   ((CoreAddr(a) ? core : mem) + (MemWordMask & (a)))
 
+/* UART helper functions */
+static int uart_rx_available(void)
+{
+#ifndef _MSC_VER
+	struct timeval tv = {0, 0};
+	fd_set readfds;
+	FD_ZERO(&readfds);
+	FD_SET(STDIN_FILENO, &readfds);
+	return select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv) > 0;
+#else
+	return 0;
+#endif
+}
+
+static u_char uart_read_byte(void)
+{
+	u_char ch = 0;
+#ifndef _MSC_VER
+	ssize_t ret __attribute__((unused));
+	ret = read(STDIN_FILENO, &ch, 1);
+#endif
+	return ch;
+}
+
+#ifdef T4_X11_FB
+static void fb_console_flush_buffer(const char *buf)
+{
+	if (!fb_console_enabled || !buf || !*buf)
+		return;
+	for (const char *p = buf; *p; ++p)
+		fb_console_putc((u_char)*p);
+}
+#endif
+
+static void uart_write_byte(u_char ch)
+{
+	static char early_buf[128];
+	static size_t early_len = 0;
+#ifdef T4_X11_FB
+	static int fb_console_active = 0;
+#endif
+
+	early_printk_bytes++;
+	if (ch >= 32 && ch < 127) {
+		if (early_len < sizeof(early_buf) - 1) {
+			early_buf[early_len++] = (char)ch;
+		} else {
+			memmove(early_buf, early_buf + 1, sizeof(early_buf) - 2);
+			early_buf[sizeof(early_buf) - 2] = (char)ch;
+		}
+		early_buf[early_len < sizeof(early_buf) ? early_len : sizeof(early_buf) - 1] = '\0';
+		if (!early_printk_seen) {
+			if (strstr(early_buf, "Linux version") ||
+			    strstr(early_buf, "early console") ||
+			    strstr(early_buf, "Transputer Linux") ||
+			    strstr(early_buf, "EPK:")) {
+				early_printk_seen = 1;
+				if (early_printk_trace_enabled)
+					fprintf(stderr, "[EARLY_PRINTK] detected\n");
+#ifdef T4_X11_FB
+				if (fb_console_enabled) {
+					fb_console_active = 1;
+					fb_console_flush_buffer(early_buf);
+				}
+#endif
+			}
+		}
+	}
+	/* Write directly to stdout */
+	putchar(ch);
+	fflush(stdout);
+#ifdef T4_X11_FB
+	if (fb_console_enabled && fb_console_active)
+		fb_console_putc(ch);
+#endif
+}
+
+void mmio_early_printk_report(void)
+{
+	fprintf(stderr,
+	        "[EARLY_PRINTK] %s bytes=%llu iserver_stream1=%llu msgs=%llu uart_mmio=%llu uart_seen=%s\n",
+	        early_printk_seen ? "seen" : "not-seen",
+	        (unsigned long long)early_printk_bytes,
+	        (unsigned long long)iserver_stream1_bytes,
+	        (unsigned long long)iserver_stream1_msgs,
+	        (unsigned long long)uart_mmio_bytes,
+	        early_printk_seen_uart ? "yes" : "no");
+}
+
+static void uart_direct_track(u_char ch)
+{
+	static char uart_buf[128];
+	static size_t uart_len = 0;
+
+	/* Log to UART file */
+	if (uart_log_file) {
+		fputc(ch, uart_log_file);
+	}
+
+	uart_mmio_bytes++;
+	if (ch >= 32 && ch < 127) {
+		if (uart_len < sizeof(uart_buf) - 1) {
+			uart_buf[uart_len++] = (char)ch;
+		} else {
+			memmove(uart_buf, uart_buf + 1, sizeof(uart_buf) - 2);
+			uart_buf[sizeof(uart_buf) - 2] = (char)ch;
+		}
+		uart_buf[uart_len < sizeof(uart_buf) ? uart_len : sizeof(uart_buf) - 1] = '\0';
+		if (!early_printk_seen_uart) {
+			if (strstr(uart_buf, "Linux version") ||
+			    strstr(uart_buf, "early console") ||
+			    strstr(uart_buf, "Transputer Linux") ||
+			    strstr(uart_buf, "EPK:")) {
+				early_printk_seen_uart = 1;
+				if (early_printk_trace_enabled)
+					fprintf(stderr, "[EARLY_PRINTK] uart-direct detected\n");
+			}
+		}
+	}
+}
+
 /* Read a word from memory. */
 uint32_t word_int (uint32_t ptr)
 {
 	uint32_t result;
+
+	if (ptr == LINK0_IN)
+		return (uint32_t)mmio_iserver_read_byte();
+
+	/* Check for UART register access */
+	if (ptr == UART_STATUS) {
+		if (uart_trace_enabled)
+			fprintf(stderr, "[UART_RD_WORD: addr=0x%08X]\n", ptr);
+		result = UART_STATUS_TXRDY;  /* TX always ready */
+		if (uart_rx_available())
+			result |= UART_STATUS_RXAVAIL;
+		return result;
+	}
+	if (ptr == UART_DATA) {
+		if (uart_trace_enabled)
+			fprintf(stderr, "[UART_RD_WORD: addr=0x%08X]\n", ptr);
+		result = uart_read_byte();
+		return result;
+	}
+
+#ifdef T4_X11_FB
+	if (fb_range_intersects(ptr, sizeof(uint32_t))) {
+		result = 0;
+		for (int i = 0; i < 4; i++) {
+			result |= ((uint32_t)fb_read_byte(ptr + i)) << (8 * i);
+		}
+		return result;
+	}
+#endif
 #if BYTE_ORDER==1234
 #ifndef _MSC_VER
 #warning Using little-endian access!
@@ -5050,6 +7399,191 @@ uint32_t word (uint32_t ptr)
 /* Write a word to memory. */
 void writeword_int (uint32_t ptr, uint32_t value)
 {
+	static int write_count = 0;
+	static int uart_col = 0;  /* Track column position for console output */
+	u_char ch = 0;
+
+	if (ptr == LINK0_OUT) {
+		static int mmio_word_log_count = 0;
+		if (link0_trace_enabled && mmio_word_log_count < 8) {
+		if (mmio_trace_enabled) {
+			fprintf(stderr, "[MMIO_OUT_WORD: addr=0x%08X val=0x%08X]\n", ptr, value);
+		}
+			mmio_word_log_count++;
+		}
+		mmio_iserver_write_byte((u_char)(value & 0xFF));
+		return;
+	}
+
+	/* Debug: Log ALL writes to see UART activity */
+	/* DISABLED: Too verbose during memory init */
+	/* fprintf(stderr, "[WR#%d: addr=0x%08X val=0x%08X]\n", write_count, ptr, value); */
+
+	/* BUT: Log UART writes specifically for debugging */
+	if (ptr == UART_DATA) {
+		ch = (u_char)(value & 0xFF);
+		if (uart_trace_enabled) {
+			fprintf(stderr, "[UART_WR_WORD: addr=0x%08X val=0x%08X]\n", ptr, value);
+			fprintf(stderr, "[UART_WR_WORD_IPTR: IPtr=0x%08X addr=0x%08X val=0x%08X]\n",
+			        IPtr, ptr, value);
+		}
+		if (outbyte_trace_enabled) {
+			uint32_t delta = 0;
+			const link_sym *lsym = find_link_sym(IPtr, &delta);
+			const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+			fprintf(stderr,
+			        "[UART_WR_IPTR] IPtr=0x%08X val=0x%02X%s%s\n",
+			        IPtr, value & 0xFF,
+			        (lsym || sym) ? " sym=" : "",
+			        lsym ? lsym->name : (sym ? sym->name : ""));
+			if (lsym) {
+				fprintf(stderr, "             sym_off=0x%X+0x%X\n",
+				        lsym->sym_off, delta);
+			} else if (sym) {
+				fprintf(stderr, "             sym_off=0x%X+0x%X\n",
+				        sym->text_off, delta);
+			}
+		}
+		if (uart_console_enabled && uart_trace_enabled) {
+			fprintf(stderr, "[UART#%d: val=0x%02X='%c']\n", write_count, value & 0xFF,
+			        (value >= 32 && value < 127) ? (char)(value & 0xFF) : '?');
+		}
+	}
+	write_count++;
+
+	/* Trace writes into kernel text region to catch self-modifying clobbers. */
+	if (text_write_trace_enabled &&
+	    ptr >= 0x80880000 && ptr < 0x80890000 &&
+	    IPtr != 0) {
+		uint32_t delta = 0;
+		const link_sym *lsym = find_link_sym(IPtr, &delta);
+		const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+		u_char op0 = byte_int(IPtr);
+		u_char op1 = byte_int(IPtr + 1);
+		u_char op2 = byte_int(IPtr + 2);
+		u_char op3 = byte_int(IPtr + 3);
+		fprintf(stderr,
+		        "[TEXT_WR] IPtr=0x%08X op=%02X %02X %02X %02X A=0x%08X B=0x%08X C=0x%08X O=0x%08X addr=0x%08X val=0x%08X%s%s\n",
+		        IPtr, op0, op1, op2, op3, AReg, BReg, CReg, OReg, ptr, value,
+		        (lsym || sym) ? " sym=" : "",
+		        lsym ? lsym->name : (sym ? sym->name : ""));
+		if (lsym) {
+			fprintf(stderr, "         sym_off=0x%X+0x%X\n",
+			        lsym->sym_off, delta);
+		} else if (sym) {
+			fprintf(stderr, "         sym_off=0x%X+0x%X\n",
+			        sym->text_off, delta);
+		}
+	}
+
+	/* Check for UART register access FIRST (before general logging) */
+		if (ptr == UART_DATA) {
+		/* Debug: log to stderr that we're writing to UART */
+		const char *env = getenv("T4_UART_VERBOSE");
+		if (env && *env) {
+			fprintf(stderr, "[UART_LOG] IPtr=0x%08X WPtr=0x%08X ch=0x%02X '%c'\n",
+				IPtr, WPtr, ch, (ch >= 32 && ch < 127) ? ch : '?');
+		} else {
+			fprintf(stderr, "[UART_LOG] ch=0x%02X '%c'\n", ch, (ch >= 32 && ch < 127) ? ch : '?');
+		}
+		uart_direct_track(ch);
+		if (!uart_console_enabled)
+			return;
+
+		/* Emit to console - handle newlines properly */
+		if (ch == '\n') {
+			putchar('\n');
+			fflush(stdout);
+			uart_col = 0;
+		} else if (ch == '\r') {
+			putchar('\r');
+			fflush(stdout);
+			uart_col = 0;
+		} else if (ch >= 32 && ch < 127) {
+			/* Printable ASCII */
+			putchar(ch);
+			fflush(stdout);
+			uart_col++;
+			if (uart_col >= 80) {
+				putchar('\n');
+				fflush(stdout);
+				uart_col = 0;
+			}
+		} else {
+			/* Non-printable - suppress RET instruction artifacts */
+			if (ch != 0xF0) {  /* Filter out OPR 0 (REV/RET) artifacts */
+				fprintf(stderr, "[0x%02X]", ch);
+				uart_col += 6;
+			}
+			/* Suppress 0xF0 which appears from RET instruction logging */
+		}
+		return;
+	}
+	if (ptr == UART_STATUS) {
+		if (uart_trace_enabled)
+			fprintf(stderr, "[UART_WR_WORD_STATUS: addr=0x%08X ignored]\n", ptr);
+		/* Status register is read-only, ignore writes */
+		fprintf(stderr, "[UART_WR_STATUS: addr=0x%08X ignored]\n", ptr);
+		return;
+	}
+
+#ifdef T4_X11_FB
+	/* VGA Controller register handling at 0xA0000000 */
+	if (ptr == VGA_CTRL_CONTROL) {
+		uint32_t old_ctrl = vga_ctrl_control;
+		vga_ctrl_control = value;
+		fprintf(stderr, "[VGA] Control register set to 0x%08X (%s)\n",
+		        value, (value & VGA_CTRL_ENABLE) ? "ENABLED" : "disabled");
+		/* Force immediate refresh when display is first enabled */
+		if ((value & VGA_CTRL_ENABLE) && !(old_ctrl & VGA_CTRL_ENABLE)) {
+			fprintf(stderr, "[VGA] Display enabled - forcing immediate refresh\n");
+			vga_dirty = 1;
+			vga_update();
+		}
+		return;
+	}
+	if (ptr == VGA_CTRL_FB_BASE) {
+		vga_ctrl_fb_base = value;
+		fprintf(stderr, "[VGA] Framebuffer base set to 0x%08X\n", value);
+		return;
+	}
+	if (ptr == VGA_CTRL_WIDTH) {
+		vga_ctrl_width = value;
+		fprintf(stderr, "[VGA] Width set to %u\n", value);
+		return;
+	}
+	if (ptr == VGA_CTRL_HEIGHT) {
+		vga_ctrl_height = value;
+		fprintf(stderr, "[VGA] Height set to %u\n", value);
+		return;
+	}
+	if (ptr == VGA_CTRL_STRIDE) {
+		vga_ctrl_stride = value;
+		fprintf(stderr, "[VGA] Stride set to %u\n", value);
+		return;
+	}
+
+	if (fb_range_intersects(ptr, sizeof(uint32_t))) {
+		static int fb_word_count = 0;
+		/* Log first 50 FB writes, or any write to first 4 rows (addresses 0x90000000-0x90001E00) */
+		if (fb_word_count < 50 || ptr < 0x90002800) {
+			fprintf(stderr, "[FB_WR_WORD#%d] addr=0x%08X val=0x%08X IPtr=0x%08X\n",
+			        fb_word_count, ptr, value, IPtr);
+		}
+		fb_word_count++;
+		for (int i = 0; i < 4; i++) {
+			writebyte_int(ptr + i, (u_char)((value >> (8 * i)) & 0xFF));
+		}
+		return;
+	}
+#endif
+
+	/* Debug: Track any write to 0x9xxxxxxx range even if not caught by fb_range_intersects */
+	if ((ptr & 0xF0000000) == 0x90000000) {
+		fprintf(stderr, "[SUSPICIOUS_FB_ADDR] addr=0x%08X val=0x%08X - not caught by fb_range!\n",
+		        ptr, value);
+	}
+
 #if BYTE_ORDER==1234
 #ifndef _MSC_VER
 #warning Using little-endian access!
@@ -5103,6 +7637,29 @@ u_char byte_int (uint32_t ptr)
 {
 	u_char result;
 
+	if (ptr == LINK0_IN)
+		return mmio_iserver_read_byte();
+
+	/* Check for UART register access */
+	if ((ptr & ~3) == UART_BASE) {
+		int offset = ptr & 3;
+		if (ptr == UART_STATUS) {
+			uint32_t status = UART_STATUS_TXRDY;
+			if (uart_rx_available())
+				status |= UART_STATUS_RXAVAIL;
+			return (u_char)((status >> (offset * 8)) & 0xFF);
+		}
+
+		/* Treat all other offsets in the 4-byte window as data register */
+		result = uart_read_byte();
+		return result;
+	}
+
+#ifdef T4_X11_FB
+	if (fb_addr_in_range(ptr))
+		return fb_read_byte(ptr);
+#endif
+
 	/* Get byte, ensuring memory reference is in range. */
         if (CoreAddr(ptr))
 	        result = core[(ptr & MemByteMask)];
@@ -5128,6 +7685,42 @@ u_char byte (uint32_t ptr)
 /* Write a byte to memory. */
 INLINE void writebyte_int (uint32_t ptr, u_char value)
 {
+	if (ptr == LINK0_OUT) {
+		mmio_iserver_write_byte(value);
+		return;
+	}
+
+	/* Check for UART register access */
+	if ((ptr & ~3) == UART_BASE) {
+		if (uart_trace_enabled) {
+			fprintf(stderr, "[UART_WR_BYTE: addr=0x%08X val=0x%02X]\n", ptr, value);
+			fprintf(stderr, "[UART_WR_BYTE_IPTR: IPtr=0x%08X addr=0x%08X val=0x%02X]\n",
+			        IPtr, ptr, value);
+		}
+		if (ptr == UART_STATUS) {
+			if (uart_trace_enabled)
+				fprintf(stderr, "[UART_WR_BYTE_STATUS: addr=0x%08X ignored]\n", ptr);
+			return;
+		}
+		uart_direct_track(value);
+		if (uart_console_enabled) {
+			if (uart_trace_enabled) {
+				fprintf(stderr, "[UART_WR_BYTE: addr=0x%08X val=0x%02X ch='%c']\n",
+				        ptr, value, (value >= 32 && value < 127) ? (char)value : '.');
+			}
+			uart_write_byte(value);
+		}
+		return;
+	}
+
+#ifdef T4_X11_FB
+	/* Check for framebuffer access */
+	if (fb_addr_in_range(ptr)) {
+		fb_write_byte(ptr, value);
+		return;
+	}
+#endif
+
 	/* Write byte, ensuring memory reference is in range. */
         if (CoreAddr(ptr))
                 core[(ptr & MemByteMask)] = value;
@@ -5141,6 +7734,15 @@ INLINE void writebyte_int (uint32_t ptr, u_char value)
 INLINE u_char* memrange (uint32_t ptr, u_char *data, uint32_t len)
 {
         u_char *dst;
+#ifdef T4_X11_FB
+        if (len)
+        {
+                uint64_t start = ptr;
+                uint64_t end = start + (uint64_t)len;
+                if ((start >= FB_BASE) && (end <= FB_LIMIT))
+                        return vga_framebuffer + (ptr - FB_BASE);
+        }
+#endif
         if (CoreRange(ptr,len))
         {
                 dst = core + (ptr & MemByteMask);
@@ -5158,6 +7760,10 @@ INLINE u_char* memrange (uint32_t ptr, u_char *data, uint32_t len)
 INLINE void writebytes_int (uint32_t ptr, u_char *data, uint32_t len)
 {
         u_char *dst;
+#ifdef T4_X11_FB
+        if (fb_range_intersects(ptr, len))
+                fb_write_bytes(ptr, data, len);
+#endif
 	/* Write byte, ensuring memory reference is in range. */
         if (CoreRange(ptr,len))
         {
@@ -5183,6 +7789,23 @@ INLINE void writebytes_int (uint32_t ptr, u_char *data, uint32_t len)
 INLINE void movebytes_int (uint32_t dst, uint32_t src, uint32_t len)
 {
         u_char *p, *q;
+
+#ifdef T4_X11_FB
+        if (len && (fb_range_intersects(dst, len) || fb_range_intersects(src, len)))
+        {
+                if (dst < src)
+                {
+                        for (uint32_t i = 0; i < len; i++)
+                                writebyte_int (dst + i, byte_int (src + i));
+                }
+                else if (dst > src)
+                {
+                        for (uint32_t i = len; i > 0; i--)
+                                writebyte_int (dst + i - 1, byte_int (src + i - 1));
+                }
+                return;
+        }
+#endif
 
 	/* Write byte, ensuring memory reference is in range. */
         if (CoreRange(src,len) && CoreRange(dst,len))
@@ -5213,6 +7836,15 @@ INLINE void movebytes_int (uint32_t dst, uint32_t src, uint32_t len)
 INLINE u_char* bytes_int (uint32_t ptr, u_char *data, uint32_t len)
 {
         u_char *dst;
+#ifdef T4_X11_FB
+        if (len)
+        {
+                uint64_t start = ptr;
+                uint64_t end = start + (uint64_t)len;
+                if ((start >= FB_BASE) && (end <= FB_LIMIT))
+                        return vga_framebuffer + (ptr - FB_BASE);
+        }
+#endif
 	/* Write byte, ensuring memory reference is in range. */
         if (CoreRange(ptr,len))
         {

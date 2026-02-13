@@ -51,6 +51,11 @@ typedef intptr_t pid_t;
 #include "processor.h"
 #include "netcfg.h"
 
+#ifdef T4_X11_FB
+extern void vga_init(void);
+extern void vga_cleanup(void);
+#endif
+
 #ifdef __MWERKS__
   #include "mac_input.h"
   #include <profiler.h>
@@ -232,7 +237,7 @@ int main (int argc, char **argv)
 	static char CopyFileName[256];
         static char InpFileName[256], OutFileName[256];
         char IBoardSize[32], SpyNet[256];
-	int reset       = FALSE;
+	int reset __attribute__((unused)) = FALSE;
 	int arg;
 	int temp;
 	int temp2;
@@ -244,6 +249,55 @@ int main (int argc, char **argv)
 #ifdef EMUDEBUG
         msgdebug = NULL != getenv ("MSGDEBUG");
 #endif
+        {
+                char *stop_after_gcall = getenv("T4_STOP_AFTER_GCALL");
+                char *bootdbg = getenv("T4_BOOTDBG");
+                char *bootwin = getenv("T4_BOOTWIN");
+                char *uart_trace = getenv("T4_UART_TRACE");
+                char *sk_bytes = getenv("T4_SK_BYTE_TRACE");
+                char *sk_areg = getenv("T4_SK_AREG_TRACE");
+                char *sk_addr = getenv("T4_SK_ADDR_TRACE");
+                char *sk_store = getenv("T4_SK_STORE_TRACE");
+                char *text_write = getenv("T4_TEXT_WRITE_TRACE");
+                char *wptr_trace = getenv("T4_WPTR_TRACE");
+                char *sk_entry = getenv("T4_SK_ENTRY_IPTR");
+                extern int bootdbg_stop_after_call_enabled;
+                extern int bootdbg_enabled;
+                extern int bootwin_enabled;
+                extern int uart_trace_enabled;
+                extern int sk_byte_trace_enabled;
+                extern int sk_areg_trace_enabled;
+                extern int sk_addr_trace_enabled;
+                extern int sk_store_trace_enabled;
+                extern int text_write_trace_enabled;
+                extern int wptr_trace_enabled;
+                extern uint32_t sk_entry_iptr;
+                extern int sk_entry_dump_enabled;
+                if (stop_after_gcall && stop_after_gcall[0] != '\0')
+                        bootdbg_stop_after_call_enabled = atoi(stop_after_gcall) != 0;
+                if (bootdbg && bootdbg[0] != '\0')
+                        bootdbg_enabled = atoi(bootdbg) != 0;
+                if (bootwin && bootwin[0] != '\0')
+                        bootwin_enabled = atoi(bootwin) != 0;
+                if (uart_trace && uart_trace[0] != '\0')
+                        uart_trace_enabled = atoi(uart_trace) != 0;
+                if (sk_bytes && sk_bytes[0] != '\0')
+                        sk_byte_trace_enabled = atoi(sk_bytes) != 0;
+                if (sk_areg && sk_areg[0] != '\0')
+                        sk_areg_trace_enabled = atoi(sk_areg) != 0;
+                if (sk_addr && sk_addr[0] != '\0')
+                        sk_addr_trace_enabled = atoi(sk_addr) != 0;
+                if (sk_store && sk_store[0] != '\0')
+                        sk_store_trace_enabled = atoi(sk_store) != 0;
+                if (text_write && text_write[0] != '\0')
+                        text_write_trace_enabled = atoi(text_write) != 0;
+                if (wptr_trace && wptr_trace[0] != '\0')
+                        wptr_trace_enabled = atoi(wptr_trace) != 0;
+                if (sk_entry && sk_entry[0] != '\0') {
+                        sk_entry_iptr = (uint32_t)strtoul(sk_entry, NULL, 0);
+                        sk_entry_dump_enabled = 1;
+                }
+        }
         CopyIn = InpFile = OutFile = (FILE *) NULL;
         for (temp = 0; temp < 4; temp++)
         {
@@ -286,10 +340,22 @@ int main (int argc, char **argv)
 #ifdef EMUDEBUG
                 printf("    -sw \"string\"         Trigger execution trace on SP_WRITE (string).\n");
                 printf("    -sx [number]         Execution trace (8 - cache, 4 - mem ld/st, 2 - iserver, 1 - instructions).\n");
+                printf("    --debug              Enable all debug output (same as -sx 15).\n");
 #endif
 		printf("\n");
 		handler (-1);
 	}
+
+	/* Handle --debug long option before regular parsing */
+#ifdef EMUDEBUG
+	for (arg=1; arg<argc; arg++) {
+		if (strcmp(argv[arg], "--debug") == 0) {
+			tracing = 15;  /* Enable all: instructions, iserver, mem, cache */
+			set_debug();
+			printf("[DEBUG] Enabled all debug tracing (tracing=%d)\n", tracing);
+		}
+	}
+#endif
 
 	/* Set up signal handler. */
 	signal (SIGINT, handler);
@@ -734,6 +800,10 @@ int main (int argc, char **argv)
         /* Initialize processor. */
         init_processor ();
 
+#ifdef T4_X11_FB
+        vga_init();
+#endif
+
         if ((FALSE == serve) && (nodeid >= 0))
         {
                 temp = 1;
@@ -777,7 +847,12 @@ int main (int argc, char **argv)
 
                 /* TVS tbo code is bootstrap code. */
 	        temp = getc (CopyIn);
-	        if (temp < 2)
+	        if (temp == 0)
+	        {
+		        /* Allow a zero-length bootstrap for netload-generated images. */
+		        fprintf(stderr, "-I-EMUBOOT: No bootstrap present; loading payload at MemStart\n");
+	        }
+	        else if (temp < 2)
 	        {
 		        printf ("\nFile does not start with bootstrap code!\n");
 		        handler (-1);
@@ -788,7 +863,50 @@ int main (int argc, char **argv)
 		        writebyte_int ((MemStart+temp2), getc (CopyIn));
 	        }
 	        WPtr = MemStart + temp2;
-        }
+
+		fprintf(stderr, "-I-EMUBOOT: Loaded bootstrap: %d bytes at 0x%08X\n", temp, MemStart);
+		fprintf(stderr, "-I-EMUBOOT: Full bootstrap dump (%d bytes):\n", temp);
+		for (int i=0; i<temp; i++) {
+			if (i % 16 == 0) fprintf(stderr, "  %04X: ", i);
+			fprintf(stderr, "%02X ", byte_int(MemStart + i));
+			if (i % 16 == 15 || i == temp-1) fprintf(stderr, "\n");
+		}
+
+	        /* Decode chunked BTL data after bootstrap when no inline bootstrap was used. */
+	        if (temp == 0) {
+	            long current_pos, end_pos, remaining;
+	            unsigned long load_addr = MemStart + temp2;
+	            int chunk_len;
+	            unsigned char buffer[256];
+
+	            current_pos = ftell(CopyIn);
+	            fseek(CopyIn, 0, SEEK_END);
+	            end_pos = ftell(CopyIn);
+	            fseek(CopyIn, current_pos, SEEK_SET);
+	            remaining = end_pos - current_pos;
+
+	            fprintf(stderr, "-I-EMUBOOT-DEBUG: current_pos=%ld end_pos=%ld remaining=%ld\n",
+	                   current_pos, end_pos, remaining);
+
+	            if (remaining > 0) {
+	                fprintf(stderr, "-I-EMUBOOT: Decoding chunked BTL to memory at 0x%08lx (%ld bytes remaining)\n",
+	                       load_addr, remaining);
+	            }
+
+	            while ((chunk_len = getc(CopyIn)) != EOF) {
+	                if (chunk_len == 0)
+	                    break;
+	                if (fread(buffer, 1, chunk_len, CopyIn) != (size_t)chunk_len)
+	                    break;
+	                for (temp = 0; temp < chunk_len; temp++) {
+	                    writebyte_int(load_addr++, buffer[temp]);
+	                }
+	            }
+		            fprintf(stderr, "-I-EMUBOOT: Loaded %ld bytes total to memory\n", load_addr - MemStart);
+		            copy = FALSE;  /* Don't use link protocol */
+		        }
+
+	        }
 
 	while ((WPtr & 0x00000003) != 0x00000000)
 		WPtr++;
@@ -934,6 +1052,8 @@ int main (int argc, char **argv)
 }
 
 
+void mmio_early_printk_report(void);
+
 void handler (int signal)
 {
 #ifdef __MWERKS__
@@ -955,6 +1075,12 @@ void handler (int signal)
         stop_xputers ();
 
         close_channels ();
+
+#ifdef T4_X11_FB
+        vga_cleanup();
+#endif
+
+        mmio_early_printk_report();
 
 
 #ifdef CURTERM
