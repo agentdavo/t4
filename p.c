@@ -6259,39 +6259,19 @@ DescheduleOutWord:
 		           PROFILE(profile[PRO_INSTR]++);
                            break;
                  case 0x102: /* eqc cj */
-			   /* EQC: AReg = (AReg == Arg0) ? 1 : 0
-			    * CJ: if AReg == 0, jump (no pop); if AReg != 0, continue (pop)
-			    * Combined: if original AReg != Arg0, jump; else continue and pop
-			    * Fix for while(0): if Arg0 == 0, jump if original AReg == 0, else pop
-			    */
+			   /* Preserve exact standalone semantics for:
+			    *   EQC Arg0; CJ Arg1
+			    * EQC sets AReg to 1 when equal, else 0.
+			    * CJ pops on non-zero (continue), jumps on zero (no pop). */
+			   IPtr++;
+			   if (AReg == Arg0)
 			   {
-			       static int eqc_cj_count = 0;
-			       eqc_cj_count++;
-			       IPtr++;
-			       if (Arg0 == 0) {
-			       	   /* Special case for while(0): always exit loop */
-			       	   AReg = 0; // hack to force continue
-			       	   if (eqc_cj_count < 10)
-			       	       fprintf(stderr, "[EQC_CJ] #%d CONTINUE (while0) AReg=0x%08X Arg0=0x%08X\n",
-			       	               eqc_cj_count, AReg, Arg0);
-			       	   AReg = BReg;
-			       	   BReg = CReg;
-			       } else {
-			       	   if (AReg == Arg0) {
-			       	       /* Equal: EQC gives 1, CJ continues (AReg != 0), pop stack */
-			       	       if (eqc_cj_count < 10)
-			       	           fprintf(stderr, "[EQC_CJ] #%d CONTINUE AReg=0x%08X Arg0=0x%08X\n",
-			       	                   eqc_cj_count, AReg, Arg0);
-			       	       AReg = BReg;
-			       	       BReg = CReg;
-			       	   } else {
-			       	       /* Not equal: EQC gives 0, CJ jumps (AReg == 0), NO pop */
-			       	       if (eqc_cj_count < 10)
-			       	           fprintf(stderr, "[EQC_CJ] #%d JUMP AReg=0x%08X Arg0=0x%08X Arg1=%d\n",
-			       	                   eqc_cj_count, AReg, Arg0, (int)Arg1);
-			       	       IPtr = IPtr + Arg1;
-			       	   }
-			       }
+				AReg = BReg;
+				BReg = CReg;
+			   }
+			   else
+			   {
+				IPtr = IPtr + Arg1;
 			   }
 		           PROFILE(profile[PRO_INSTR]++);
                            break;
