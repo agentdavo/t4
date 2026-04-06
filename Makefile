@@ -22,12 +22,18 @@ RM = rm -f
 #       -DT4COMBINATIONS=1      to replace common instruction sequences
 #       -DT4RELEASE=1           produce fast emulator (no profiling,tracing)
 #
-CFLAGS = -I. -O2 -fomit-frame-pointer -Wall -DCURTERM=1 -DT4SHLINKS=1 -DT4COMBINATIONS=1
-# For a reasonably optimised version for SunOS 4.1.4.
-# CFLAGS = -O2 -Wall -DSUN
+# Release build: -O3, no debug overhead
+CFLAGS = -I. -O3 -march=native -fomit-frame-pointer -Wall \
+	-DCURTERM=1 -DT4SHLINKS=1 -DT4COMBINATIONS=1 -DT4RELEASE=1 -DNDEBUG \
+	-DT4_SDL_FB $(shell pkg-config --cflags sdl2) $(shell pkg-config --cflags libpng)
+
+# Debug build flags (use with: make t4-debug)
+CFLAGS_DEBUG = -I. -O2 -fomit-frame-pointer -Wall -g \
+	-DCURTERM=1 -DT4SHLINKS=1 -DT4COMBINATIONS=1 -DEMUDEBUG \
+	-DT4_SDL_FB $(shell pkg-config --cflags sdl2) $(shell pkg-config --cflags libpng)
 
 # Put any additional libraries here.
-LFLAGS	= -lm
+LFLAGS	= -lm $(shell pkg-config --libs sdl2) $(shell pkg-config --libs libpng)
 
 #
 # https://github.com/JuliaMath/openlibm
@@ -37,12 +43,16 @@ FDMSRC  = k_standard.c s_scalbn.c s_scalbnf.c s_ldexp.c s_ldexpf.c \
 FDMOBJ	= k_standard.o s_scalbn.o s_scalbnf.o s_ldexp.o s_ldexpf.o \
 	  e_fmod.o e_remainder.o e_sqrt.o w_remainder.o w_sqrt.o
 
-SRC	= $(FDMSRC) curterm.c arithmetic.c fparithmetic.c netcfg.c shlink.c server.c p.c main.c
-OBJ	= $(FDMOBJ) curterm.o arithmetic.o fparithmetic.o netcfg.o shlink.o server.o p.o main.o
+SRC	= $(FDMSRC) curterm.c arithmetic.c fparithmetic.c netcfg.c shlink.c server.c display_backend_sdl.c p.c main.c
+OBJ	= $(FDMOBJ) curterm.o arithmetic.o fparithmetic.o netcfg.o shlink.o server.o display_backend_sdl.o p.o main.o
 
 t4 : $(SRC)
 	$(CC) $(CFLAGS) $(SRC) $(LFLAGS) -o t4
 	strip t4
+	ls -l t4
+
+t4-debug : $(SRC)
+	$(CC) $(CFLAGS_DEBUG) $(SRC) $(LFLAGS) -o t4
 	ls -l t4
 
 clean	:

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <fenv.h>
+#include <inttypes.h>
 #include "t4debug.h"
 #include "arithmetic.h"
 #include "fparithmetic.h"
@@ -421,7 +422,7 @@ int fp_zerosn(fpreal32_t fp)
 
 void db_dump (char *msg, fpreal64_t x)
 {
-        printf ("%s: fp = %lf (#%016llX, %d,%04d,%014llX)\n",
+        printf ("%s: fp = %lf (#%016" PRIx64 ", %d,%04d,%014" PRIx64 ")\n",
                 msg, x.fp, x.bits,
                 fp_signdb(x) ? 1 : 0,
                 fp_expdb(x),

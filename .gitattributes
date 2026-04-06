@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.btl binary
+bin/* binary
+itools/**/* binary

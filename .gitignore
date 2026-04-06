@@ -14,3 +14,4 @@ dump
 *.c8h
 *.cah
 *.cfb
+*.Identifier

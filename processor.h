@@ -64,7 +64,8 @@ extern uint32_t CLineTagsSize;
 
 extern uint32_t CoreSize;
 
-#define IsT800  (Txxx == 800)
+#define IsT800  (Txxx == 800 || Txxx == 806)
+#define IsT806  (Txxx == 806)
 #define IsT414  (Txxx == 414)
 #define IsTVS   (Txxx == 1144)
 

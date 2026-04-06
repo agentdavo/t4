@@ -50,6 +50,17 @@ typedef intptr_t pid_t;
 #include "t4debug.h"
 #include "processor.h"
 #include "netcfg.h"
+#include "display_backend.h"
+
+#ifdef T4_SDL_FB
+extern void save_framebuffer_png(const char *filename);
+extern void vga_dump_framebuffer_bmp(const char *filename, int frame_number);
+#endif
+
+/* T4Net — simple MMIO NIC with TAP backend */
+extern void t4net_init(const char *tap_name);
+extern void t4net_cleanup(void);
+extern void t4net_poll_rx(void);
 
 #ifdef __MWERKS__
   #include "mac_input.h"
@@ -88,6 +99,8 @@ int nxputers    = 0;
 pid_t xputers[1024 + 1];
 
 int membits     = 0;
+char *png_save_filename = NULL;
+char *tap_device_name = NULL;
 
 #ifdef EMUDEBUG
 int tracing     = 0;
@@ -232,7 +245,7 @@ int main (int argc, char **argv)
 	static char CopyFileName[256];
         static char InpFileName[256], OutFileName[256];
         char IBoardSize[32], SpyNet[256];
-	int reset       = FALSE;
+	int reset __attribute__((unused)) = FALSE;
 	int arg;
 	int temp;
 	int temp2;
@@ -244,6 +257,55 @@ int main (int argc, char **argv)
 #ifdef EMUDEBUG
         msgdebug = NULL != getenv ("MSGDEBUG");
 #endif
+        {
+                char *stop_after_gcall = getenv("T4_STOP_AFTER_GCALL");
+                char *bootdbg = getenv("T4_BOOTDBG");
+                char *bootwin = getenv("T4_BOOTWIN");
+                char *uart_trace = getenv("T4_UART_TRACE");
+                char *sk_bytes = getenv("T4_SK_BYTE_TRACE");
+                char *sk_areg = getenv("T4_SK_AREG_TRACE");
+                char *sk_addr = getenv("T4_SK_ADDR_TRACE");
+                char *sk_store = getenv("T4_SK_STORE_TRACE");
+                char *text_write = getenv("T4_TEXT_WRITE_TRACE");
+                char *wptr_trace = getenv("T4_WPTR_TRACE");
+                char *sk_entry = getenv("T4_SK_ENTRY_IPTR");
+                extern int bootdbg_stop_after_call_enabled;
+                extern int bootdbg_enabled;
+                extern int bootwin_enabled;
+                extern int uart_trace_enabled;
+                extern int sk_byte_trace_enabled;
+                extern int sk_areg_trace_enabled;
+                extern int sk_addr_trace_enabled;
+                extern int sk_store_trace_enabled;
+                extern int text_write_trace_enabled;
+                extern int wptr_trace_enabled;
+                extern uint32_t sk_entry_iptr;
+                extern int sk_entry_dump_enabled;
+                if (stop_after_gcall && stop_after_gcall[0] != '\0')
+                        bootdbg_stop_after_call_enabled = atoi(stop_after_gcall) != 0;
+                if (bootdbg && bootdbg[0] != '\0')
+                        bootdbg_enabled = atoi(bootdbg) != 0;
+                if (bootwin && bootwin[0] != '\0')
+                        bootwin_enabled = atoi(bootwin) != 0;
+                if (uart_trace && uart_trace[0] != '\0')
+                        uart_trace_enabled = atoi(uart_trace) != 0;
+                if (sk_bytes && sk_bytes[0] != '\0')
+                        sk_byte_trace_enabled = atoi(sk_bytes) != 0;
+                if (sk_areg && sk_areg[0] != '\0')
+                        sk_areg_trace_enabled = atoi(sk_areg) != 0;
+                if (sk_addr && sk_addr[0] != '\0')
+                        sk_addr_trace_enabled = atoi(sk_addr) != 0;
+                if (sk_store && sk_store[0] != '\0')
+                        sk_store_trace_enabled = atoi(sk_store) != 0;
+                if (text_write && text_write[0] != '\0')
+                        text_write_trace_enabled = atoi(text_write) != 0;
+                if (wptr_trace && wptr_trace[0] != '\0')
+                        wptr_trace_enabled = atoi(wptr_trace) != 0;
+                if (sk_entry && sk_entry[0] != '\0') {
+                        sk_entry_iptr = (uint32_t)strtoul(sk_entry, NULL, 0);
+                        sk_entry_dump_enabled = 1;
+                }
+        }
         CopyIn = InpFile = OutFile = (FILE *) NULL;
         for (temp = 0; temp < 4; temp++)
         {
@@ -272,6 +334,7 @@ int main (int argc, char **argv)
                 printf("Extra options:\n");
                 printf("    -s4                  Select T414 mode. (default)\n");
                 printf("    -s8                  Select T800 mode.\n");
+                printf("    -s806                Select T806 mode (T800 @ 200MHz).\n");
 #ifndef NDEBUG
                 printf("    -sg                  Halt on uninitialized memory read.\n");
 #endif
@@ -286,13 +349,42 @@ int main (int argc, char **argv)
 #ifdef EMUDEBUG
                 printf("    -sw \"string\"         Trigger execution trace on SP_WRITE (string).\n");
                 printf("    -sx [number]         Execution trace (8 - cache, 4 - mem ld/st, 2 - iserver, 1 - instructions).\n");
+                printf("    --debug              Enable all debug output (same as -sx 15).\n");
 #endif
 		printf("\n");
 		handler (-1);
 	}
 
+	/* Handle long options before regular parsing */
+#ifdef EMUDEBUG
+	for (arg=1; arg<argc; arg++) {
+		if (strcmp(argv[arg], "--debug") == 0) {
+			tracing = 15;  /* Enable all: instructions, iserver, mem, cache */
+			set_debug();
+			printf("[DEBUG] Enabled all debug tracing (tracing=%d)\n", tracing);
+		}
+	}
+#endif
+	for (arg=1; arg<argc; arg++) {
+		if (strcmp(argv[arg], "--save-fb") == 0 && arg+1 < argc) {
+			png_save_filename = argv[arg+1];
+			arg++;
+			printf("[PNG] Framebuffer will be saved to %s after execution\n", png_save_filename);
+		}
+		if (strcmp(argv[arg], "--tap") == 0 && arg+1 < argc) {
+			tap_device_name = argv[arg+1];
+			arg++;
+		} else if (strcmp(argv[arg], "--tap") == 0) {
+			tap_device_name = "tap0";  /* default */
+		}
+	}
+
+	/* Initialize T4Net NIC (TAP backend) */
+	t4net_init(tap_device_name);
+
 	/* Set up signal handler. */
 	signal (SIGINT, handler);
+	signal (SIGTERM, handler);
 
 	/* Build full command line string for server to return on request. */
 	for (arg=0;arg<argc;arg++)
@@ -324,7 +416,15 @@ int main (int argc, char **argv)
                                                 ExtMemStart = 0x80000800;
                                           }
 					  break;
-				case '8': if (argv[arg][3]!='\0')
+				case '8': if (argv[arg][3]=='0' && argv[arg][4]=='6' && argv[arg][5]=='\0')
+					  {
+                                                /* T806: T800 core @ 200MHz */
+                                                Txxx=806;
+                                                CoreSize    = 4 * 1024;
+                                                MemStart    = 0x80000070;
+                                                ExtMemStart = 0x80001000;
+					  }
+					  else if (argv[arg][3]!='\0')
 					  {
 						strcat (CommandLineMost, argv[arg]);
 						strcat (CommandLineMost, " ");
@@ -715,7 +815,7 @@ int main (int argc, char **argv)
                                 cmdargs[1] = "-sl";
                                 cmdargs[2] = "-sn";
                                 cmdargs[3] = snid;
-                                cmdargs[4] = 800 == Txxx ? "-s8" : NULL;
+                                cmdargs[4] = (Txxx == 806) ? "-s806" : (Txxx == 800) ? "-s8" : NULL;
                                 cmdargs[5] = NULL;
                                 if ((xputers[i] = SpawnVP ("t4", cmdargs)) < 0)
                                 {
@@ -733,6 +833,10 @@ int main (int argc, char **argv)
 
         /* Initialize processor. */
         init_processor ();
+
+#ifdef T4_SDL_FB
+        display_init();
+#endif
 
         if ((FALSE == serve) && (nodeid >= 0))
         {
@@ -777,7 +881,12 @@ int main (int argc, char **argv)
 
                 /* TVS tbo code is bootstrap code. */
 	        temp = getc (CopyIn);
-	        if (temp < 2)
+	        if (temp == 0)
+	        {
+		        /* Allow a zero-length bootstrap for netload-generated images. */
+		        fprintf(stderr, "-I-EMUBOOT: No bootstrap present; loading payload at MemStart\n");
+	        }
+	        else if (temp < 2)
 	        {
 		        printf ("\nFile does not start with bootstrap code!\n");
 		        handler (-1);
@@ -788,11 +897,57 @@ int main (int argc, char **argv)
 		        writebyte_int ((MemStart+temp2), getc (CopyIn));
 	        }
 	        WPtr = MemStart + temp2;
-        }
+
+		fprintf(stderr, "-I-EMUBOOT: Loaded bootstrap: %d bytes at 0x%08X\n", temp, MemStart);
+		fprintf(stderr, "-I-EMUBOOT: Full bootstrap dump (%d bytes):\n", temp);
+		for (int i=0; i<temp; i++) {
+			if (i % 16 == 0) fprintf(stderr, "  %04X: ", i);
+			fprintf(stderr, "%02X ", byte_int(MemStart + i));
+			if (i % 16 == 15 || i == temp-1) fprintf(stderr, "\n");
+		}
+
+	        /* Decode chunked BTL data after bootstrap when no inline bootstrap was used. */
+	        if (temp == 0) {
+	            long current_pos, end_pos, remaining;
+	            unsigned long load_addr = MemStart + temp2;
+	            int chunk_len;
+	            unsigned char buffer[256];
+
+	            current_pos = ftell(CopyIn);
+	            fseek(CopyIn, 0, SEEK_END);
+	            end_pos = ftell(CopyIn);
+	            fseek(CopyIn, current_pos, SEEK_SET);
+	            remaining = end_pos - current_pos;
+
+	            fprintf(stderr, "-I-EMUBOOT-DEBUG: current_pos=%ld end_pos=%ld remaining=%ld\n",
+	                   current_pos, end_pos, remaining);
+
+	            if (remaining > 0) {
+	                fprintf(stderr, "-I-EMUBOOT: Decoding chunked BTL to memory at 0x%08lx (%ld bytes remaining)\n",
+	                       load_addr, remaining);
+	            }
+
+	            while ((chunk_len = getc(CopyIn)) != EOF) {
+	                if (chunk_len == 0)
+	                    break;
+	                if (fread(buffer, 1, chunk_len, CopyIn) != (size_t)chunk_len)
+	                    break;
+	                for (temp = 0; temp < chunk_len; temp++) {
+	                    writebyte_int(load_addr++, buffer[temp]);
+	                }
+	            }
+		            fprintf(stderr, "-I-EMUBOOT: Loaded %ld bytes total to memory\n", load_addr - MemStart);
+		            WPtr = load_addr;
+		            copy = FALSE;  /* Don't use link protocol */
+		        }
+
+	        }
 
 	while ((WPtr & 0x00000003) != 0x00000000)
 		WPtr++;
         UpdateWdescReg (WPtr | LoPriority);
+        fprintf(stderr, "-I-EMUBOOT: Entering mainloop WPtr=0x%08X copy=%d\n",
+                WPtr, copy ? 1 : 0);
 
 #ifdef CURTERM
         /* Initialise terminal settings. */
@@ -877,6 +1032,7 @@ int main (int argc, char **argv)
 
 
         stop_xputers ();
+        t4net_cleanup();
 
         close_channels ();
 
@@ -934,6 +1090,8 @@ int main (int argc, char **argv)
 }
 
 
+void mmio_early_printk_report(void);
+
 void handler (int signal)
 {
 #ifdef __MWERKS__
@@ -953,8 +1111,23 @@ void handler (int signal)
                 fclose (OutFile);
 
         stop_xputers ();
+        t4net_cleanup();
+
+        /* Save SD card image if file-backed */
+        { extern void sd_save(void); sd_save(); }
 
         close_channels ();
+
+#ifdef T4_SDL_FB
+        if (png_save_filename) {
+            save_framebuffer_png(png_save_filename);
+        }
+        /* Always dump framebuffer as BMP for headless/WSL use */
+        vga_dump_framebuffer_bmp("framebuffer.bmp", 0);
+        display_shutdown();
+#endif
+
+        mmio_early_printk_report();
 
 
 #ifdef CURTERM
