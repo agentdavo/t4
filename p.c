@@ -1,3 +1,8 @@
+/* Feature test macros before any system headers (sched_setaffinity). */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 /*
  * Copyright (c) 1993-1996 Julian Highfield. All rights reserved.
  *
@@ -28,6 +33,12 @@
  */
 
 #define INLINE
+
+/* Branch prediction hints for hot paths */
+#ifndef likely
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
 #include "t4debug.h"
 
 /*
@@ -43,11 +54,78 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #ifndef _MSC_VER
 #include <sys/time.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sched.h>
 #endif
+#endif
+#include "timer_integration.h"
+#include "debug.h"
+#include "decode_cache.h"
+
+/* Direct-mapped instruction decode cache (1MB, 64K entries).
+ * Caches pre-resolved prefix chains for fast dispatch.
+ * OFF by default: must fill Icache on hit path or boot hangs. */
+static dcache_t g_dcache;
+static int dcache_enabled = 0; /* set via T4_DCACHE=1 */
+
+#ifndef EMUDEBUG
+static int fast_primary_enabled = -1;
+static int fast_block_enabled = -1;
+
+#define T4_FAST_BLOCK_BITS 15
+#define T4_FAST_BLOCK_SIZE (1U << T4_FAST_BLOCK_BITS)
+#define T4_FAST_BLOCK_MASK (T4_FAST_BLOCK_SIZE - 1U)
+/* P3: larger basic-block cache for straight-line primary ops */
+#define T4_FAST_BLOCK_MAX_INSNS 32
+
+typedef struct t4_fast_op {
+        u_char op;
+        u_char imm;
+} t4_fast_op_t;
+
+typedef struct t4_fast_block {
+        uint32_t tag;
+        u_char len;
+        u_char bytes[T4_FAST_BLOCK_MAX_INSNS];
+        t4_fast_op_t ops[T4_FAST_BLOCK_MAX_INSNS];
+} t4_fast_block_t;
+
+static t4_fast_block_t fast_blocks[T4_FAST_BLOCK_SIZE];
+
+static INLINE int t4_fast_block_op(uint32_t op)
+{
+        switch (op) {
+        case 0x10: /* ldlp */
+        case 0x30: /* ldnl */
+        case 0x40: /* ldc */
+        case 0x50: /* ldnlp */
+        case 0x70: /* ldl */
+        case 0x80: /* adc */
+        case 0xb0: /* ajw */
+        case 0xc0: /* eqc */
+        case 0xd0: /* stl */
+        case 0xe0: /* stnl */
+                return 1;
+        default:
+                return 0;
+        }
+}
+
+#endif
+
+/* Global timer bridge — connects timer thread to p.c globals */
+static timer_bridge_t g_timer_bridge;
+static int g_timer_threaded = 0;  /* 1 = timer thread running */
+
+/* Forward declaration — defined later in p.c */
+static void schedule_timerq(int priority);
+static INLINE u_char code_byte(uint32_t ptr);
 #include <math.h>
+#include <inttypes.h>
 #ifdef T4NANOMSG
 #define NN_STATIC_LIB   ON
 #include <nanomsg/nn.h>
@@ -89,9 +167,16 @@ int shlink_free (void){return EINVAL;}
 #endif
 
 #include "processor.h"
+#include "display_backend.h"
 #include "arithmetic.h"
 #include "server.h"
 #include "opcodes.h"
+#include "tvx.h"
+#include "tvx_vec.h"
+#include "tvx_gfx.h"
+#include "t9000_group.h"
+#include "t9000_protect.h"
+#include "t9000_pmi.h"
 #ifdef __MWERKS__
 #include "mac_input.h"
 #endif
@@ -112,12 +197,1372 @@ uint32_t ExtMemStart = 0x80000800;
 
 u_char   *mem;
 uint32_t MemSize     = 1 << 21;
+/* Upper bound of the plain-RAM fast path.  Distinct from the framebuffer
+ * base: once the display windows move below MemStart, RAM runs all the way
+ * to the top of the address space and the fast path must not be derived
+ * from fb_legacy_base (that would wrap and swallow the UART at 0x10000000). */
+t9k_state t9k;
+uint32_t ram_fast_limit = FB_LEGACY_DEFAULT;
+uint32_t fb_base        = FB_BASE_DEFAULT;
+uint32_t fb_legacy_base = FB_LEGACY_DEFAULT;
+uint32_t vga_ctrl_base  = VGA_CTRL_DEFAULT;
+
+/* Move the VGA framebuffer and control window out of the RAM range when the
+ * requested memory would swallow them.  RAM starts at MemStart (0x80000000)
+ * and grows up; the legacy FB at 0x90000000 therefore limits RAM to 256 MB.
+ * Above that we relocate both windows into the unused low half of the address
+ * space, which lets RAM run all the way to 2 GB. */
+void t4_relocate_mmio_for_ram (uint32_t mem_size)
+{
+        uint64_t ram_end = (uint64_t)0x80000000u + (uint64_t)mem_size;
+
+        if (ram_end <= (uint64_t)FB_LEGACY_DEFAULT) {
+                fb_base         = FB_BASE_DEFAULT;
+                fb_legacy_base  = FB_LEGACY_DEFAULT;
+                vga_ctrl_base   = VGA_CTRL_DEFAULT;
+                ram_fast_limit  = FB_LEGACY_DEFAULT;
+                return;
+        }
+        /* Move every display window into the unused low half of the address
+         * space so RAM can run contiguously from MemStart to 2 GB with no
+         * holes.  Inference runs are headless; the kernel and fbwm never use
+         * these sizes. */
+        fb_base        = 0x60000000u;
+        fb_legacy_base = 0x40000000u;
+        vga_ctrl_base  = 0x50000000u;
+        vga_ctrl_fb_base = fb_base;
+        ram_fast_limit   = 0xFFFFFFFFu;   /* RAM to the top of the map */
+        printf ("-I-EMU: RAM %uMB exceeds the legacy display map; relocated "
+                "FB carveout to 0x%08X, legacy FB to 0x%08X, VGA ctrl to 0x%08X\n",
+                mem_size / (1024u*1024u), fb_base, fb_legacy_base, vga_ctrl_base);
+}
+
 uint32_t MemWordMask = ((uint32_t)0x001ffffc);
 uint32_t MemByteMask = ((uint32_t)0x001fffff);
 uint32_t CLineTagsSize;
 
 #define InvalidInstr_p  ((uint32_t)0x2ffa2ffa)
+
+static const uint32_t boot_call_start = 0x80000120;
+static const uint32_t boot_call_end = 0x80000130;
+int bootdbg_stop_after_call_enabled = 0;
+int bootdbg_enabled = 0;
+int bootwin_enabled = 0;
+int uart_trace_enabled = 0;
+int sk_byte_trace_enabled = 0;
+int sk_areg_trace_enabled = 0;
+int sk_addr_trace_enabled = 0;
+int wptr_trace_enabled = 0;
+int sk_store_trace_enabled = 0;
+int text_write_trace_enabled = 0;
+static uint32_t text_write_trace_start = 0x80880000;
+static uint32_t text_write_trace_end = 0x80890000;
+int cache_debug_trace_enabled = 0;
+static uint32_t cache_debug_trace_start = 0;
+static uint32_t cache_debug_trace_end = 0;
+uint32_t sk_entry_iptr = 0;
+int sk_entry_dump_enabled = 0;
+static int prolog_map_loaded = 0;
+static uint32_t prolog_text_base = 0x80000070;
+typedef struct {
+	uint32_t text_off;
+	char name[96];
+} prolog_sym;
+static prolog_sym *prolog_syms = NULL;
+static size_t prolog_sym_count = 0;
+typedef struct {
+	uint32_t sym_off;
+	char name[96];
+} link_sym;
+static link_sym *link_syms = NULL;
+static size_t link_sym_count = 0;
+static uint32_t link_text_base = 0;
+static int link_map_loaded = 0;
+static int outbyte_trace_enabled = 0;
+static int outbyte_entry_logged = 0;
+static int sym_dump_logged = 0;
+static int sym_trace_active = 0;
+static int sym_trace_remaining = 0;
+static int sym_trace_skip = 0;
+static uint32_t sym_trace_entry = 0;
+static char sym_trace_name[96];
+static int iptr_trace_enabled = 0;
+static uint32_t iptr_trace_start = 0;
+static uint32_t iptr_trace_end = 0;
+static int boot_dump_start_enabled = 0;
+static int boot_dump_start_done = 0;
+static int uart_console_enabled = 1;
+static int link0_trace_enabled = 1;
+static int mmio_trace_enabled = 0;
+static int early_printk_trace_enabled = 0;
+static int nearest_sym_enabled = 0;
+static int iptr_dump_logged = 0;
+static int prolog_text_base_autodone = 0;
+static int sk_entry_dumped = 0;
+static int stop_after_boot_call = 0;
+static int last_boot_call_is_gcall = 0;
+static uint32_t last_boot_call_site = 0;
+static uint32_t last_boot_call_target = 0;
+static uint32_t last_boot_call_return = 0;
+static uint32_t last_boot_call_wptr = 0;
 #define Undefined_p     ((uint32_t)0xdeadbeef)
+
+#define FAULT_HISTORY_LEN 16384
+typedef struct {
+	uint32_t iptr, wptr, areg, breg, creg, oreg;
+	u_char icode;
+} fault_history_entry;
+static fault_history_entry fault_history[FAULT_HISTORY_LEN];
+static unsigned int fault_history_pos;
+static int fault_history_enabled = -1;
+static int fault_history_dumped;
+
+static void fault_history_record(uint32_t iptr, uint32_t wptr,
+				 uint32_t areg, uint32_t breg, uint32_t creg,
+				 uint32_t oreg, u_char icode)
+{
+	fault_history_entry *entry;
+
+	if (fault_history_enabled < 0) {
+		const char *env = getenv("T4_HISTORY_ON_FAULT");
+		fault_history_enabled = env && *env && atoi(env) != 0;
+	}
+	if (!fault_history_enabled)
+		return;
+
+	entry = &fault_history[fault_history_pos++ % FAULT_HISTORY_LEN];
+	entry->iptr = iptr;
+	entry->wptr = wptr;
+	entry->areg = areg;
+	entry->breg = breg;
+	entry->creg = creg;
+	entry->oreg = oreg;
+	entry->icode = icode;
+}
+
+static void fault_history_dump(const char *reason)
+{
+	unsigned int available, start, i;
+
+	if (!fault_history_enabled || fault_history_dumped)
+		return;
+	fault_history_dumped = 1;
+	available = fault_history_pos < FAULT_HISTORY_LEN ?
+		fault_history_pos : FAULT_HISTORY_LEN;
+	start = fault_history_pos - available;
+	fprintf(stderr, "[FAULT_HISTORY] %s: last %u instructions\n",
+		reason, available);
+	for (i = 0; i < available; i++) {
+		fault_history_entry *entry =
+			&fault_history[(start + i) % FAULT_HISTORY_LEN];
+		fprintf(stderr,
+			"[FAULT_HISTORY] IPtr=0x%08X WPtr=0x%08X Icode=0x%02X "
+			"OReg=0x%08X A=0x%08X B=0x%08X C=0x%08X\n",
+			entry->iptr, entry->wptr, entry->icode, entry->oreg,
+			entry->areg, entry->breg, entry->creg);
+	}
+	fflush(stderr);
+}
+
+static void load_prolog_map(void) {
+	const char *path;
+	FILE *fp;
+	char line[256];
+	if (prolog_map_loaded)
+		return;
+	prolog_map_loaded = 1;
+	path = getenv("T4_PROLOG_MAP");
+	if (!path || !*path)
+		return;
+	{
+		const char *base_env = getenv("T4_TEXT_BASE");
+		if (base_env && *base_env)
+			prolog_text_base = (uint32_t)strtoul(base_env, NULL, 0);
+	}
+	fp = fopen(path, "r");
+	if (!fp) {
+		fprintf(stderr, "T4_PROLOG: failed to open %s\n", path);
+		return;
+	}
+	while (fgets(line, sizeof(line), fp)) {
+		char func[96];
+		unsigned int off;
+		if (sscanf(line, "PROLOG: func=%95s text_off=0x%x", func, &off) == 2) {
+			prolog_sym *tmp = realloc(prolog_syms, (prolog_sym_count + 1) * sizeof(*prolog_syms));
+			if (!tmp)
+				break;
+			prolog_syms = tmp;
+			prolog_syms[prolog_sym_count].text_off = off;
+			strncpy(prolog_syms[prolog_sym_count].name, func,
+			        sizeof(prolog_syms[prolog_sym_count].name) - 1);
+			prolog_syms[prolog_sym_count].name[sizeof(prolog_syms[prolog_sym_count].name) - 1] = '\0';
+			prolog_sym_count++;
+		}
+	}
+	fclose(fp);
+	if (prolog_sym_count) {
+		size_t i;
+		for (i = 1; i < prolog_sym_count; i++) {
+			size_t j = i;
+			while (j > 0 && prolog_syms[j - 1].text_off > prolog_syms[j].text_off) {
+				prolog_sym tmp = prolog_syms[j - 1];
+				prolog_syms[j - 1] = prolog_syms[j];
+				prolog_syms[j] = tmp;
+				j--;
+			}
+		}
+		fprintf(stderr, "T4_PROLOG: loaded %zu symbols (text_base=0x%08x)\n",
+		        prolog_sym_count, prolog_text_base);
+	}
+}
+
+static void load_link_map(void) {
+	const char *path;
+	FILE *fp;
+	char line[512];
+	if (link_map_loaded)
+		return;
+	link_map_loaded = 1;
+	path = getenv("T4_SYM_MAP");
+	if (!path || !*path)
+		return;
+	{
+		const char *base_env = getenv("T4_SYM_BASE");
+		if (base_env && *base_env)
+			link_text_base = (uint32_t)strtoul(base_env, NULL, 0);
+	}
+	fp = fopen(path, "r");
+	if (!fp) {
+		fprintf(stderr, "T4_SYM_MAP: failed to open %s\n", path);
+		return;
+	}
+	while (fgets(line, sizeof(line), fp)) {
+		char *p = line;
+		char *end = NULL;
+		unsigned long off;
+		char name[128];
+		char type = '\0';
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!*p || *p == '\n')
+			continue;
+		off = strtoul(p, &end, 16);
+		if (end == p)
+			continue;
+		while (*end == ' ' || *end == '\t')
+			end++;
+		if (!*end || *end == '\n')
+			continue;
+		type = *end;
+		end++;
+		while (*end == ' ' || *end == '\t')
+			end++;
+		if (!*end || *end == '\n')
+			continue;
+		if (sscanf(end, "%127s", name) != 1)
+			continue;
+		(void)type;
+		{
+			link_sym *tmp = realloc(link_syms, (link_sym_count + 1) * sizeof(*link_syms));
+			if (!tmp)
+				break;
+			link_syms = tmp;
+			link_syms[link_sym_count].sym_off = (uint32_t)off;
+			strncpy(link_syms[link_sym_count].name, name,
+			        sizeof(link_syms[link_sym_count].name) - 1);
+			link_syms[link_sym_count].name[sizeof(link_syms[link_sym_count].name) - 1] = '\0';
+			link_sym_count++;
+		}
+	}
+	fclose(fp);
+	if (link_sym_count) {
+		size_t i;
+		for (i = 1; i < link_sym_count; i++) {
+			size_t j = i;
+			while (j > 0 && link_syms[j - 1].sym_off > link_syms[j].sym_off) {
+				link_sym tmp = link_syms[j - 1];
+				link_syms[j - 1] = link_syms[j];
+				link_syms[j] = tmp;
+				j--;
+			}
+		}
+		fprintf(stderr, "T4_SYM_MAP: loaded %zu symbols (text_base=0x%08x)\n",
+		        link_sym_count, link_text_base);
+	}
+}
+
+static const prolog_sym *find_prolog_sym(uint32_t iptr, uint32_t *delta_out) {
+	const prolog_sym *best = NULL;
+	uint32_t off;
+	size_t i;
+	if (!prolog_map_loaded)
+		load_prolog_map();
+	if (!prolog_syms || !prolog_sym_count)
+		return NULL;
+	if (iptr < prolog_text_base)
+		return NULL;
+	off = iptr - prolog_text_base;
+	for (i = 0; i < prolog_sym_count; i++) {
+		if (prolog_syms[i].text_off <= off)
+			best = &prolog_syms[i];
+		else
+			break;
+	}
+	if (best && delta_out)
+		*delta_out = off - best->text_off;
+	return best;
+}
+
+static const prolog_sym *find_prolog_sym_by_name(const char *name) {
+	size_t i;
+	if (!prolog_map_loaded)
+		load_prolog_map();
+	if (!prolog_syms || !prolog_sym_count || !name)
+		return NULL;
+	for (i = 0; i < prolog_sym_count; i++) {
+		if (strcmp(prolog_syms[i].name, name) == 0)
+			return &prolog_syms[i];
+	}
+	return NULL;
+}
+
+static const link_sym *find_link_sym(uint32_t iptr, uint32_t *delta_out) {
+	const link_sym *best = NULL;
+	uint32_t off;
+	size_t i;
+	if (!link_map_loaded)
+		load_link_map();
+	if (!link_syms || !link_sym_count)
+		return NULL;
+	if (!link_text_base)
+		return NULL;
+	if (iptr < link_text_base)
+		return NULL;
+	off = iptr - link_text_base;
+	for (i = 0; i < link_sym_count; i++) {
+		if (link_syms[i].sym_off <= off)
+			best = &link_syms[i];
+		else
+			break;
+	}
+	if (best && delta_out)
+		*delta_out = off - best->sym_off;
+	return best;
+}
+
+static const link_sym *find_link_sym_by_name(const char *name) {
+	size_t i;
+	if (!link_map_loaded)
+		load_link_map();
+	if (!link_syms || !link_sym_count || !name)
+		return NULL;
+	for (i = 0; i < link_sym_count; i++) {
+		if (strcmp(link_syms[i].name, name) == 0)
+			return &link_syms[i];
+	}
+	return NULL;
+}
+
+static void maybe_log_nearest_sym(uint32_t iptr, const char *reason) {
+	uint32_t delta = 0;
+	const link_sym *lsym;
+	const prolog_sym *psym;
+	if (!nearest_sym_enabled)
+		return;
+	lsym = find_link_sym(iptr, &delta);
+	if (lsym) {
+		fprintf(stderr,
+		        "[NEAR_SYM] %s IPtr=0x%08X sym=%s off=0x%X+0x%X\n",
+		        reason ? reason : "iptr", iptr,
+		        lsym->name, lsym->sym_off, delta);
+		return;
+	}
+	psym = find_prolog_sym(iptr, &delta);
+	if (psym) {
+		fprintf(stderr,
+		        "[NEAR_PROLOG] %s IPtr=0x%08X sym=%s text_off=0x%X+0x%X\n",
+		        reason ? reason : "iptr", iptr,
+		        psym->name, psym->text_off, delta);
+	}
+}
+
+static void dump_sym_bytes_once(const char *sym_name) {
+	const prolog_sym *sym;
+	const link_sym *lsym;
+	uint32_t entry_iptr;
+	uint32_t len = 32;
+	uint32_t i;
+	const char *len_env;
+	const char *auto_env;
+	if (sym_dump_logged || !sym_name || !*sym_name)
+		return;
+	auto_env = getenv("T4_TEXT_BASE_AUTO");
+	if (auto_env && *auto_env && !prolog_text_base_autodone)
+		return;
+	lsym = find_link_sym_by_name(sym_name);
+	if (lsym && link_text_base) {
+		entry_iptr = link_text_base + lsym->sym_off;
+	} else {
+		sym = find_prolog_sym_by_name(sym_name);
+		if (!sym)
+			return;
+		entry_iptr = prolog_text_base + sym->text_off;
+	}
+	len_env = getenv("T4_DUMP_SYM_LEN");
+	if (len_env && *len_env)
+		len = (uint32_t)strtoul(len_env, NULL, 0);
+	fprintf(stderr, "[SYM_DUMP] func=%s entry=0x%08X len=%u\n",
+	        sym_name, entry_iptr, len);
+	fprintf(stderr, "[SYM_BYTES] ");
+	for (i = 0; i < len; i++) {
+		fprintf(stderr, "%02X%s", byte_int(entry_iptr + i),
+		        (i + 1 == len) ? "\n" : " ");
+	}
+	sym_dump_logged = 1;
+}
+
+static void dump_iptr_bytes_once(void) {
+	static int setup_done;
+	const char *iptr_env;
+	const char *len_env;
+	uint32_t entry_iptr;
+	uint32_t len = 32;
+	uint32_t i;
+	if (setup_done || iptr_dump_logged)
+		return;
+	setup_done = 1;
+	iptr_env = getenv("T4_DUMP_IPTR");
+	if (!iptr_env || !*iptr_env)
+		return;
+	entry_iptr = (uint32_t)strtoul(iptr_env, NULL, 0);
+	if (!entry_iptr)
+		return;
+	len_env = getenv("T4_DUMP_IPTR_LEN");
+	if (len_env && *len_env)
+		len = (uint32_t)strtoul(len_env, NULL, 0);
+	if (len > 256)
+		len = 256;
+	fprintf(stderr, "[IPTR_DUMP] addr=0x%08X len=%u\n", entry_iptr, len);
+	fprintf(stderr, "[IPTR_BYTES] ");
+	for (i = 0; i < len; i++) {
+		fprintf(stderr, "%02X%s", byte_int(entry_iptr + i),
+		        (i + 1 == len) ? "\n" : " ");
+	}
+	iptr_dump_logged = 1;
+}
+
+static void setup_sym_trace_once(void) {
+	static int env_checked;
+	static const char *configured_name;
+	static int auto_text_base;
+	const char *sym_name;
+	const char *count_env;
+	const prolog_sym *sym;
+	const link_sym *lsym;
+	const char *auto_env;
+	if (sym_trace_entry || sym_trace_active)
+		return;
+	if (!env_checked) {
+		configured_name = getenv("T4_TRACE_SYM");
+		auto_env = getenv("T4_TEXT_BASE_AUTO");
+		auto_text_base = auto_env && *auto_env;
+		env_checked = 1;
+	}
+	sym_name = configured_name;
+	if (!sym_name || !*sym_name)
+		return;
+	if (auto_text_base && !prolog_text_base_autodone)
+		return;
+	lsym = find_link_sym_by_name(sym_name);
+	if (lsym && link_text_base) {
+		sym_trace_entry = link_text_base + lsym->sym_off;
+		strncpy(sym_trace_name, lsym->name, sizeof(sym_trace_name) - 1);
+	} else {
+		sym = find_prolog_sym_by_name(sym_name);
+		if (!sym)
+			return;
+		sym_trace_entry = prolog_text_base + sym->text_off;
+		strncpy(sym_trace_name, sym->name, sizeof(sym_trace_name) - 1);
+	}
+	sym_trace_name[sizeof(sym_trace_name) - 1] = '\0';
+	count_env = getenv("T4_TRACE_SYM_COUNT");
+	sym_trace_remaining = count_env && *count_env ? atoi(count_env) : 64;
+	if (sym_trace_remaining <= 0)
+		sym_trace_remaining = 64;
+	count_env = getenv("T4_TRACE_SYM_SKIP");
+	sym_trace_skip = count_env && *count_env ? atoi(count_env) : 0;
+	if (sym_trace_skip < 0)
+		sym_trace_skip = 0;
+	fprintf(stderr,
+	        "[SYM_TRACE] armed func=%s entry=0x%08X count=%d skip=%d\n",
+	        sym_trace_name, sym_trace_entry, sym_trace_remaining,
+	        sym_trace_skip);
+}
+
+static void setup_iptr_trace_once(void) {
+	static int setup_done;
+	const char *start_env;
+	const char *len_env;
+	uint32_t len = 0;
+	if (iptr_trace_enabled)
+		return;
+	if (setup_done)
+		return;
+	setup_done = 1;
+	start_env = getenv("T4_TRACE_IPTR");
+	if (!start_env || !*start_env)
+		return;
+	iptr_trace_start = (uint32_t)strtoul(start_env, NULL, 0);
+	if (!iptr_trace_start)
+		return;
+	len_env = getenv("T4_TRACE_IPTR_LEN");
+	if (len_env && *len_env)
+		len = (uint32_t)strtoul(len_env, NULL, 0);
+	if (!len)
+		len = 64;
+	iptr_trace_end = iptr_trace_start + len;
+	iptr_trace_enabled = 1;
+	fprintf(stderr, "[IPTR_TRACE] armed start=0x%08X len=%u\n",
+	        iptr_trace_start, len);
+}
+
+static void setup_text_write_trace_once(void) {
+	static int setup_done = 0;
+	const char *start_env;
+	const char *end_env;
+	const char *len_env;
+	uint32_t start;
+	uint32_t end;
+	uint32_t len;
+
+	if (setup_done)
+		return;
+	setup_done = 1;
+
+	start_env = getenv("T4_TEXT_WRITE_START");
+	end_env = getenv("T4_TEXT_WRITE_END");
+	len_env = getenv("T4_TEXT_WRITE_LEN");
+
+	if (!start_env || !*start_env)
+		return;
+	start = (uint32_t)strtoul(start_env, NULL, 0);
+	if (!start)
+		return;
+
+	if (end_env && *end_env) {
+		end = (uint32_t)strtoul(end_env, NULL, 0);
+	} else if (len_env && *len_env) {
+		len = (uint32_t)strtoul(len_env, NULL, 0);
+		end = start + (len ? len : 0x100);
+	} else {
+		end = start + 0x100;
+	}
+
+	if (end > start) {
+		text_write_trace_start = start;
+		text_write_trace_end = end;
+		fprintf(stderr,
+		        "[TEXT_WRITE] range start=0x%08X end=0x%08X\n",
+		        text_write_trace_start, text_write_trace_end);
+	}
+}
+
+static void setup_cache_debug_trace_once(void) {
+	static int setup_done = 0;
+	const char *start_env;
+	const char *end_env;
+	const char *len_env;
+	uint32_t start;
+	uint32_t end;
+	uint32_t len;
+
+	if (setup_done)
+		return;
+	setup_done = 1;
+
+	start_env = getenv("T4_CACHE_DEBUG_START");
+	end_env = getenv("T4_CACHE_DEBUG_END");
+	len_env = getenv("T4_CACHE_DEBUG_LEN");
+
+	if (!start_env || !*start_env)
+		return;
+	start = (uint32_t)strtoul(start_env, NULL, 0);
+	if (!start)
+		return;
+
+	if (end_env && *end_env) {
+		end = (uint32_t)strtoul(end_env, NULL, 0);
+	} else if (len_env && *len_env) {
+		len = (uint32_t)strtoul(len_env, NULL, 0);
+		end = start + (len ? len : 0x100);
+	} else {
+		end = start + 0x100;
+	}
+
+	if (end > start) {
+		cache_debug_trace_start = start;
+		cache_debug_trace_end = end;
+		cache_debug_trace_enabled = 1;
+		fprintf(stderr,
+		        "[CACHE_DEBUG] range start=0x%08X end=0x%08X\n",
+		        cache_debug_trace_start, cache_debug_trace_end);
+	}
+}
+
+static void maybe_auto_text_base(void) {
+	static int env_checked;
+	static int auto_enabled;
+	const char *auto_env;
+	const prolog_sym *sym;
+	const link_sym *lsym;
+	if (prolog_text_base_autodone)
+		return;
+	if (!env_checked) {
+		auto_env = getenv("T4_TEXT_BASE_AUTO");
+		auto_enabled = auto_env && *auto_env;
+		env_checked = 1;
+	}
+	if (!auto_enabled)
+		return;
+	if (!last_boot_call_target)
+		return;
+	lsym = find_link_sym_by_name("start_kernel");
+	if (lsym) {
+		link_text_base = last_boot_call_target - lsym->sym_off;
+		prolog_text_base_autodone = 1;
+		fprintf(stderr,
+		        "T4_SYM_MAP: auto text_base=0x%08X (start_kernel iptr=0x%08X off=0x%X)\n",
+		        link_text_base, last_boot_call_target, lsym->sym_off);
+		return;
+	}
+	sym = find_prolog_sym_by_name("start_kernel");
+	if (!sym)
+		return;
+	prolog_text_base = last_boot_call_target - sym->text_off;
+	prolog_text_base_autodone = 1;
+	fprintf(stderr,
+	        "T4_PROLOG: auto text_base=0x%08X (start_kernel iptr=0x%08X off=0x%X)\n",
+	        prolog_text_base, last_boot_call_target, sym->text_off);
+}
+
+/* Simple memory-mapped UART */
+#define UART_BASE       ((uint32_t)0x10000000)
+#define UART_DATA       (UART_BASE + 0x00)  /* Data register (R/W) */
+#define UART_STATUS     (UART_BASE + 0x04)  /* Status register (R) */
+
+#define SD_BASE         ((uint32_t)0x20000000)  /* SD card base address */
+#define SD_SIZE         (128 * 1024 * 1024)     /* 128MB SD card */
+#define SD_LIMIT        (SD_BASE + SD_SIZE)     /* End of SD card */
+
+/* T9000-style boot bank (TIS 10.5): 16MB below top-of-store, byte-wide,
+ * aliasing the FIRST 16MB of the SD card.  After power-up with
+ * T4_SD_BOOT=1 the control unit peeks BootWptr then BootIptr from the
+ * top two words and the CPU executes in place from the bank.  The full
+ * card stays visible at SD_BASE (the spec lets boot space be
+ * remapped/reclaimed), so the t4_sd driver is unaffected. */
+#define BOOTBANK_BASE   ((uint32_t)0x7F000000)
+#define BOOTBANK_SIZE   (16 * 1024 * 1024)
+#define BOOT_IPTR_ADDR  ((uint32_t)0x7FFFFFF8)
+#define BOOT_WPTR_ADDR  ((uint32_t)0x7FFFFFFC)
+
+int t4_sd_boot_enabled(void);
+
+#define VIRTIO_NET_BASE ((uint32_t)0x30000000)  /* T4Net NIC base address */
+#define UART_STATUS_TXRDY  0x01  /* Transmit ready */
+#define UART_STATUS_RXAVAIL 0x02  /* Receive data available */
+
+/* Memory-mapped Link 0 (IServer) */
+#define LINK0_OUT      ((uint32_t)0x80000000)
+#define LINK0_IN       ((uint32_t)0x80000010)
+
+/* MMIO IServer state */
+enum {
+	MMIO_IDLE = 0,
+	MMIO_LEN_LO,
+	MMIO_LEN_HI,
+	MMIO_PAYLOAD,
+	MMIO_PUTS_STREAM,
+	MMIO_PUTS_LEN_LO,
+	MMIO_PUTS_LEN_HI,
+	MMIO_PUTS_DATA
+};
+
+static struct {
+	int state;
+	uint16_t payload_len;
+	uint16_t payload_left;
+	uint16_t payload_index;
+	uint16_t data_len;
+	uint16_t data_left;
+	u_char cmd;
+	u_char stream;
+} mmio_iserver;
+
+static u_char mmio_resp_buf[256];
+static int mmio_resp_head;
+static int mmio_resp_tail;
+
+static void uart_write_byte(u_char ch);
+void mmio_early_printk_report(void);
+static void uart_direct_track(u_char ch);
+
+/* SD Card functions */
+u_char sd_read_byte(uint32_t offset);
+void sd_write_byte(uint32_t offset, u_char value);
+u_char *t4_sd_buffer(void);
+
+/* Virtio-Net functions */
+u_char virtio_net_read_byte(uint32_t addr);
+void virtio_net_write_byte(uint32_t addr, u_char value);
+void t4net_poll_rx(void);
+
+/* PNG export functions */
+void save_framebuffer_png(const char *filename);
+extern char *png_save_filename;
+
+int early_printk_seen = 0;
+uint64_t early_printk_bytes = 0;
+uint64_t iserver_stream1_bytes = 0;
+uint64_t iserver_stream1_msgs = 0;
+static int iserver_stream1_active = 0;
+int early_printk_seen_uart = 0;
+uint64_t uart_mmio_bytes = 0;
+static FILE *uart_log_file = NULL;
+
+static void mmio_resp_push(u_char b)
+{
+	int next = (mmio_resp_head + 1) % (int)sizeof(mmio_resp_buf);
+	if (next == mmio_resp_tail)
+		return;
+	mmio_resp_buf[mmio_resp_head] = b;
+	mmio_resp_head = next;
+}
+
+static u_char mmio_resp_pop(void)
+{
+	u_char b = 0;
+	if (mmio_resp_head == mmio_resp_tail)
+		return 0;
+	b = mmio_resp_buf[mmio_resp_tail];
+	mmio_resp_tail = (mmio_resp_tail + 1) % (int)sizeof(mmio_resp_buf);
+	return b;
+}
+
+static void mmio_iserver_reset(void)
+{
+	mmio_iserver.state = MMIO_IDLE;
+	mmio_iserver.payload_len = 0;
+	mmio_iserver.payload_left = 0;
+	mmio_iserver.payload_index = 0;
+	mmio_iserver.data_len = 0;
+	mmio_iserver.data_left = 0;
+	mmio_iserver.cmd = 0;
+	mmio_iserver.stream = 0;
+	iserver_stream1_active = 0;
+}
+
+static void mmio_iserver_finish_payload(void)
+{
+	if (iserver_stream1_active) {
+		iserver_stream1_msgs++;
+	}
+	if (mmio_iserver.cmd == SP_WRITE) {
+		mmio_resp_push(0);
+		mmio_resp_push(0);
+	}
+	mmio_iserver_reset();
+}
+
+static void mmio_iserver_write_byte(u_char value)
+{
+	static int mmio_log_count = 0;
+	if (mmio_trace_enabled && mmio_log_count < 4) {
+		fprintf(stderr, "[MMIO_OUT: 0x%02X]\n", value);
+		mmio_log_count++;
+	}
+	switch (mmio_iserver.state) {
+	case MMIO_IDLE:
+		if (value == SP_PUTS) {
+			mmio_iserver.state = MMIO_PUTS_STREAM;
+			break;
+		}
+		mmio_iserver.payload_len = value;
+		mmio_iserver.state = MMIO_LEN_HI;
+		break;
+	case MMIO_LEN_HI:
+		mmio_iserver.payload_len |= ((uint16_t)value << 8);
+		mmio_iserver.payload_left = mmio_iserver.payload_len;
+		mmio_iserver.payload_index = 0;
+		mmio_iserver.data_len = 0;
+		mmio_iserver.data_left = 0;
+		mmio_iserver.cmd = 0;
+		mmio_iserver.state = MMIO_PAYLOAD;
+		break;
+	case MMIO_PAYLOAD:
+		if (mmio_iserver.payload_left == 0) {
+			mmio_iserver_finish_payload();
+			break;
+		}
+		if (mmio_iserver.payload_index == 0) {
+			mmio_iserver.cmd = value;
+		} else if (mmio_iserver.payload_index == 1) {
+			mmio_iserver.stream = value;
+			iserver_stream1_active = (value == 1);
+		} else if (mmio_iserver.payload_index == 5) {
+			mmio_iserver.data_len = value;
+		} else if (mmio_iserver.payload_index == 6) {
+			mmio_iserver.data_len |= ((uint16_t)value << 8);
+			mmio_iserver.data_left = mmio_iserver.data_len;
+		} else if (mmio_iserver.payload_index >= 7 &&
+			   mmio_iserver.data_left > 0) {
+			if (mmio_iserver.cmd == SP_WRITE)
+				uart_write_byte(value);
+			if (iserver_stream1_active)
+				iserver_stream1_bytes++;
+			mmio_iserver.data_left--;
+		}
+		mmio_iserver.payload_index++;
+		mmio_iserver.payload_left--;
+		if (mmio_iserver.payload_left == 0)
+			mmio_iserver_finish_payload();
+		break;
+	case MMIO_PUTS_STREAM:
+		mmio_iserver.stream = value;
+		iserver_stream1_active = (value == 1);
+		mmio_iserver.state = MMIO_PUTS_LEN_LO;
+		break;
+	case MMIO_PUTS_LEN_LO:
+		mmio_iserver.data_len = value;
+		mmio_iserver.state = MMIO_PUTS_LEN_HI;
+		break;
+	case MMIO_PUTS_LEN_HI:
+		mmio_iserver.data_len |= ((uint16_t)value << 8);
+		mmio_iserver.data_left = mmio_iserver.data_len;
+		mmio_iserver.state = MMIO_PUTS_DATA;
+		break;
+	case MMIO_PUTS_DATA:
+		if (mmio_iserver.data_left > 0) {
+			uart_write_byte(value);
+			if (iserver_stream1_active)
+				iserver_stream1_bytes++;
+			mmio_iserver.data_left--;
+		}
+		if (mmio_iserver.data_left == 0)
+			mmio_iserver_reset();
+		break;
+	default:
+		mmio_iserver_reset();
+		break;
+	}
+}
+
+static u_char mmio_iserver_read_byte(void)
+{
+	return mmio_resp_pop();
+}
+
+/* VGA framebuffer and MMIO state */
+#ifdef T4_SDL_FB
+/* Fixed simplefb hardware is scanning from reset; no guest enable write. */
+uint32_t vga_ctrl_control = VGA_CTRL_ENABLE;
+uint32_t vga_ctrl_fb_base = FB_BASE_DEFAULT;
+uint32_t vga_ctrl_width = FB_WIDTH;
+uint32_t vga_ctrl_height = FB_HEIGHT;
+uint32_t vga_ctrl_stride = FB_WIDTH * FB_BPP;
+unsigned char vga_framebuffer[FB_TOTAL];  /* front + back buffer */
+int vga_dirty = 0;
+uint32_t vga_front_offset = 0;   /* P2: present from this offset */
+int vga_dirty_y0 = -1;
+int vga_dirty_y1 = -1;
+static int fb_console_enabled = 0;
+static int fb_console_row = 0;
+static int fb_console_col = 0;
+
+/* 8x8 font for ASCII 0x20..0x7f (font8x8_basic) */
+static const unsigned char fb_font8x8[128][8] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* 0x00 */
+    {0x7e,0x81,0xa5,0x81,0xbd,0x99,0x81,0x7e}, /* 0x01 */
+    {0x7e,0xff,0xdb,0xff,0xc3,0xe7,0xff,0x7e}, /* 0x02 */
+    {0x6c,0xfe,0xfe,0xfe,0x7c,0x38,0x10,0x00}, /* 0x03 */
+    {0x10,0x38,0x7c,0xfe,0x7c,0x38,0x10,0x00}, /* 0x04 */
+    {0x38,0x7c,0x38,0xfe,0xfe,0xd6,0x10,0x38}, /* 0x05 */
+    {0x10,0x38,0x7c,0xfe,0xfe,0x7c,0x10,0x38}, /* 0x06 */
+    {0x00,0x00,0x18,0x3c,0x3c,0x18,0x00,0x00}, /* 0x07 */
+    {0xff,0xff,0xe7,0xc3,0xc3,0xe7,0xff,0xff}, /* 0x08 */
+    {0x00,0x3c,0x66,0x42,0x42,0x66,0x3c,0x00}, /* 0x09 */
+    {0xff,0xc3,0x99,0xbd,0xbd,0x99,0xc3,0xff}, /* 0x0a */
+    {0x0f,0x07,0x0f,0x7d,0xcc,0xcc,0xcc,0x78}, /* 0x0b */
+    {0x3c,0x66,0x66,0x66,0x3c,0x18,0x7e,0x18}, /* 0x0c */
+    {0x3f,0x33,0x3f,0x30,0x30,0x70,0xf0,0xe0}, /* 0x0d */
+    {0x7f,0x63,0x7f,0x63,0x63,0x67,0xe6,0xc0}, /* 0x0e */
+    {0x99,0x5a,0x3c,0xe7,0xe7,0x3c,0x5a,0x99}, /* 0x0f */
+    {0x80,0xe0,0xf8,0xfe,0xf8,0xe0,0x80,0x00}, /* 0x10 */
+    {0x02,0x0e,0x3e,0xfe,0x3e,0x0e,0x02,0x00}, /* 0x11 */
+    {0x18,0x3c,0x7e,0x18,0x18,0x7e,0x3c,0x18}, /* 0x12 */
+    {0x66,0x66,0x66,0x66,0x66,0x00,0x66,0x00}, /* 0x13 */
+    {0x7f,0xdb,0xdb,0x7b,0x1b,0x1b,0x1b,0x00}, /* 0x14 */
+    {0x3e,0x63,0x38,0x6c,0x6c,0x38,0xcc,0x78}, /* 0x15 */
+    {0x00,0x00,0x00,0x00,0x7e,0x7e,0x7e,0x00}, /* 0x16 */
+    {0x18,0x3c,0x7e,0x18,0x7e,0x3c,0x18,0xff}, /* 0x17 */
+    {0x18,0x3c,0x7e,0x18,0x18,0x18,0x18,0x00}, /* 0x18 */
+    {0x18,0x18,0x18,0x18,0x7e,0x3c,0x18,0x00}, /* 0x19 */
+    {0x00,0x18,0x0c,0xfe,0x0c,0x18,0x00,0x00}, /* 0x1a */
+    {0x00,0x30,0x60,0xfe,0x60,0x30,0x00,0x00}, /* 0x1b */
+    {0x00,0x00,0xc0,0xc0,0xc0,0xfe,0x00,0x00}, /* 0x1c */
+    {0x00,0x24,0x66,0xff,0x66,0x24,0x00,0x00}, /* 0x1d */
+    {0x00,0x18,0x3c,0x7e,0xff,0xff,0x00,0x00}, /* 0x1e */
+    {0x00,0xff,0xff,0x7e,0x3c,0x18,0x00,0x00}, /* 0x1f */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* 0x20 */
+    {0x18,0x3c,0x3c,0x18,0x18,0x00,0x18,0x00}, /* 0x21 */
+    {0x36,0x36,0x12,0x00,0x00,0x00,0x00,0x00}, /* 0x22 */
+    {0x36,0x36,0x7f,0x36,0x7f,0x36,0x36,0x00}, /* 0x23 */
+    {0x0c,0x3e,0x03,0x1e,0x30,0x1f,0x0c,0x00}, /* 0x24 */
+    {0x00,0x63,0x33,0x18,0x0c,0x66,0x63,0x00}, /* 0x25 */
+    {0x1c,0x36,0x1c,0x6e,0x3b,0x33,0x6e,0x00}, /* 0x26 */
+    {0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00}, /* 0x27 */
+    {0x18,0x0c,0x06,0x06,0x06,0x0c,0x18,0x00}, /* 0x28 */
+    {0x06,0x0c,0x18,0x18,0x18,0x0c,0x06,0x00}, /* 0x29 */
+    {0x00,0x66,0x3c,0xff,0x3c,0x66,0x00,0x00}, /* 0x2a */
+    {0x00,0x0c,0x0c,0x3f,0x0c,0x0c,0x00,0x00}, /* 0x2b */
+    {0x00,0x00,0x00,0x00,0x00,0x0c,0x0c,0x06}, /* 0x2c */
+    {0x00,0x00,0x00,0x3f,0x00,0x00,0x00,0x00}, /* 0x2d */
+    {0x00,0x00,0x00,0x00,0x00,0x0c,0x0c,0x00}, /* 0x2e */
+    {0x60,0x30,0x18,0x0c,0x06,0x03,0x01,0x00}, /* 0x2f */
+    {0x3e,0x63,0x73,0x7b,0x6f,0x67,0x3e,0x00}, /* 0x30 */
+    {0x0c,0x0e,0x0c,0x0c,0x0c,0x0c,0x3f,0x00}, /* 0x31 */
+    {0x1e,0x33,0x30,0x1c,0x06,0x33,0x3f,0x00}, /* 0x32 */
+    {0x1e,0x33,0x30,0x1c,0x30,0x33,0x1e,0x00}, /* 0x33 */
+    {0x38,0x3c,0x36,0x33,0x7f,0x30,0x78,0x00}, /* 0x34 */
+    {0x3f,0x03,0x1f,0x30,0x30,0x33,0x1e,0x00}, /* 0x35 */
+    {0x1c,0x06,0x03,0x1f,0x33,0x33,0x1e,0x00}, /* 0x36 */
+    {0x3f,0x33,0x30,0x18,0x0c,0x0c,0x0c,0x00}, /* 0x37 */
+    {0x1e,0x33,0x33,0x1e,0x33,0x33,0x1e,0x00}, /* 0x38 */
+    {0x1e,0x33,0x33,0x3e,0x30,0x18,0x0e,0x00}, /* 0x39 */
+    {0x00,0x0c,0x0c,0x00,0x00,0x0c,0x0c,0x00}, /* 0x3a */
+    {0x00,0x0c,0x0c,0x00,0x00,0x0c,0x0c,0x06}, /* 0x3b */
+    {0x18,0x0c,0x06,0x03,0x06,0x0c,0x18,0x00}, /* 0x3c */
+    {0x00,0x00,0x3f,0x00,0x00,0x3f,0x00,0x00}, /* 0x3d */
+    {0x06,0x0c,0x18,0x30,0x18,0x0c,0x06,0x00}, /* 0x3e */
+    {0x1e,0x33,0x30,0x18,0x0c,0x00,0x0c,0x00}, /* 0x3f */
+    {0x3e,0x63,0x7b,0x7b,0x7b,0x03,0x1e,0x00}, /* 0x40 */
+    {0x0c,0x1e,0x33,0x33,0x3f,0x33,0x33,0x00}, /* 0x41 */
+    {0x3f,0x66,0x66,0x3e,0x66,0x66,0x3f,0x00}, /* 0x42 */
+    {0x3c,0x66,0x03,0x03,0x03,0x66,0x3c,0x00}, /* 0x43 */
+    {0x1f,0x36,0x66,0x66,0x66,0x36,0x1f,0x00}, /* 0x44 */
+    {0x7f,0x46,0x16,0x1e,0x16,0x46,0x7f,0x00}, /* 0x45 */
+    {0x7f,0x46,0x16,0x1e,0x16,0x06,0x0f,0x00}, /* 0x46 */
+    {0x3c,0x66,0x03,0x03,0x73,0x66,0x7c,0x00}, /* 0x47 */
+    {0x33,0x33,0x33,0x3f,0x33,0x33,0x33,0x00}, /* 0x48 */
+    {0x1e,0x0c,0x0c,0x0c,0x0c,0x0c,0x1e,0x00}, /* 0x49 */
+    {0x78,0x30,0x30,0x30,0x33,0x33,0x1e,0x00}, /* 0x4a */
+    {0x67,0x66,0x36,0x1e,0x36,0x66,0x67,0x00}, /* 0x4b */
+    {0x0f,0x06,0x06,0x06,0x46,0x66,0x7f,0x00}, /* 0x4c */
+    {0x63,0x77,0x7f,0x7f,0x6b,0x63,0x63,0x00}, /* 0x4d */
+    {0x63,0x67,0x6f,0x7b,0x73,0x63,0x63,0x00}, /* 0x4e */
+    {0x1c,0x36,0x63,0x63,0x63,0x36,0x1c,0x00}, /* 0x4f */
+    {0x3f,0x66,0x66,0x3e,0x06,0x06,0x0f,0x00}, /* 0x50 */
+    {0x1e,0x33,0x33,0x33,0x3b,0x1e,0x38,0x00}, /* 0x51 */
+    {0x3f,0x66,0x66,0x3e,0x36,0x66,0x67,0x00}, /* 0x52 */
+    {0x1e,0x33,0x07,0x0e,0x38,0x33,0x1e,0x00}, /* 0x53 */
+    {0x3f,0x2d,0x0c,0x0c,0x0c,0x0c,0x1e,0x00}, /* 0x54 */
+    {0x33,0x33,0x33,0x33,0x33,0x33,0x3f,0x00}, /* 0x55 */
+    {0x33,0x33,0x33,0x33,0x33,0x1e,0x0c,0x00}, /* 0x56 */
+    {0x63,0x63,0x63,0x6b,0x7f,0x77,0x63,0x00}, /* 0x57 */
+    {0x63,0x63,0x36,0x1c,0x1c,0x36,0x63,0x00}, /* 0x58 */
+    {0x33,0x33,0x33,0x1e,0x0c,0x0c,0x1e,0x00}, /* 0x59 */
+    {0x7f,0x63,0x31,0x18,0x4c,0x66,0x7f,0x00}, /* 0x5a */
+    {0x1e,0x06,0x06,0x06,0x06,0x06,0x1e,0x00}, /* 0x5b */
+    {0x03,0x06,0x0c,0x18,0x30,0x60,0x40,0x00}, /* 0x5c */
+    {0x1e,0x18,0x18,0x18,0x18,0x18,0x1e,0x00}, /* 0x5d */
+    {0x08,0x1c,0x36,0x63,0x00,0x00,0x00,0x00}, /* 0x5e */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff}, /* 0x5f */
+    {0x0c,0x0c,0x18,0x00,0x00,0x00,0x00,0x00}, /* 0x60 */
+    {0x00,0x00,0x1e,0x30,0x3e,0x33,0x6e,0x00}, /* 0x61 */
+    {0x07,0x06,0x06,0x3e,0x66,0x66,0x3b,0x00}, /* 0x62 */
+    {0x00,0x00,0x1e,0x33,0x03,0x33,0x1e,0x00}, /* 0x63 */
+    {0x38,0x30,0x30,0x3e,0x33,0x33,0x6e,0x00}, /* 0x64 */
+    {0x00,0x00,0x1e,0x33,0x3f,0x03,0x1e,0x00}, /* 0x65 */
+    {0x1c,0x36,0x06,0x0f,0x06,0x06,0x0f,0x00}, /* 0x66 */
+    {0x00,0x00,0x6e,0x33,0x33,0x3e,0x30,0x1f}, /* 0x67 */
+    {0x07,0x06,0x36,0x6e,0x66,0x66,0x67,0x00}, /* 0x68 */
+    {0x0c,0x00,0x0e,0x0c,0x0c,0x0c,0x1e,0x00}, /* 0x69 */
+    {0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1e}, /* 0x6a */
+    {0x07,0x06,0x66,0x36,0x1e,0x36,0x67,0x00}, /* 0x6b */
+    {0x0e,0x0c,0x0c,0x0c,0x0c,0x0c,0x1e,0x00}, /* 0x6c */
+    {0x00,0x00,0x33,0x7f,0x7f,0x6b,0x63,0x00}, /* 0x6d */
+    {0x00,0x00,0x1b,0x37,0x33,0x33,0x33,0x00}, /* 0x6e */
+    {0x00,0x00,0x1e,0x33,0x33,0x33,0x1e,0x00}, /* 0x6f */
+    {0x00,0x00,0x3b,0x66,0x66,0x3e,0x06,0x0f}, /* 0x70 */
+    {0x00,0x00,0x6e,0x33,0x33,0x3e,0x30,0x78}, /* 0x71 */
+    {0x00,0x00,0x1b,0x36,0x36,0x0e,0x06,0x0f}, /* 0x72 */
+    {0x00,0x00,0x3e,0x03,0x1e,0x30,0x1f,0x00}, /* 0x73 */
+    {0x08,0x0c,0x3e,0x0c,0x0c,0x2c,0x18,0x00}, /* 0x74 */
+    {0x00,0x00,0x33,0x33,0x33,0x33,0x6e,0x00}, /* 0x75 */
+    {0x00,0x00,0x33,0x33,0x33,0x1e,0x0c,0x00}, /* 0x76 */
+    {0x00,0x00,0x63,0x6b,0x7f,0x7f,0x36,0x00}, /* 0x77 */
+    {0x00,0x00,0x63,0x36,0x1c,0x36,0x63,0x00}, /* 0x78 */
+    {0x00,0x00,0x33,0x33,0x33,0x3e,0x30,0x1f}, /* 0x79 */
+    {0x00,0x00,0x3f,0x19,0x0c,0x26,0x3f,0x00}, /* 0x7a */
+    {0x38,0x0c,0x0c,0x07,0x0c,0x0c,0x38,0x00}, /* 0x7b */
+    {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00}, /* 0x7c */
+    {0x07,0x0c,0x0c,0x38,0x0c,0x0c,0x07,0x00}, /* 0x7d */
+    {0x6e,0x3b,0x00,0x00,0x00,0x00,0x00,0x00}, /* 0x7e */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}  /* 0x7f */
+};
+
+extern int32_t quit;
+
+/* Map guest FB address to offset in host vga_framebuffer[].
+ * Primary: 0x81E00000 carveout. Legacy alias: 0x90000000. */
+static inline int fb_addr_to_offset(uint32_t addr, uint32_t *off_out)
+{
+    if (addr >= FB_BASE && addr < FB_LIMIT) {
+        *off_out = addr - FB_BASE;
+        return 1;
+    }
+    if (addr >= FB_LEGACY_BASE && addr < FB_LEGACY_LIMIT) {
+        *off_out = addr - FB_LEGACY_BASE;
+        return 1;
+    }
+    return 0;
+}
+
+static inline int fb_addr_in_range(uint32_t addr)
+{
+    uint32_t off;
+    return fb_addr_to_offset(addr, &off);
+}
+
+static inline int fb_range_intersects(uint32_t addr, uint32_t len)
+{
+    uint64_t start = addr;
+    uint64_t end = start + (uint64_t)len;
+
+    if (len == 0)
+        return 0;
+    /* Primary carveout */
+    if (!(end <= FB_BASE || start >= FB_LIMIT))
+        return 1;
+    /* Legacy alias */
+    if (!(end <= FB_LEGACY_BASE || start >= FB_LEGACY_LIMIT))
+        return 1;
+    return 0;
+}
+
+static void fb_console_scroll(void)
+{
+    /* 32bpp: each row is FB_WIDTH * 4 bytes, scroll 8 rows at a time */
+    size_t row_bytes = FB_WIDTH * FB_BPP;
+    size_t scroll_bytes = row_bytes * 8;  /* 8 pixel rows per text row */
+    memmove(vga_framebuffer, vga_framebuffer + scroll_bytes,
+            row_bytes * (FB_HEIGHT - 8));
+    memset(vga_framebuffer + row_bytes * (FB_HEIGHT - 8), 0, scroll_bytes);
+    vga_dirty = 1;
+    vga_dirty_y0 = 0;
+    vga_dirty_y1 = FB_HEIGHT - 1;
+    fb_console_row = FB_CONSOLE_ROWS - 1;
+    fb_console_col = 0;
+}
+
+static void fb_console_putc(u_char ch)
+{
+    int row, col, x, y;
+    unsigned char glyph;
+    int i, j;
+
+    if (!fb_console_enabled)
+        return;
+
+    if (ch == '\n') {
+        fb_console_row++;
+        fb_console_col = 0;
+        if (fb_console_row >= FB_CONSOLE_ROWS)
+            fb_console_scroll();
+        return;
+    }
+    if (ch == '\r') {
+        fb_console_col = 0;
+        return;
+    }
+    if (ch < 0x20 || ch >= 0x80)
+        ch = '.';
+
+    row = fb_console_row;
+    col = fb_console_col;
+    x = col * 8;
+    y = row * 8;
+
+    /* 32bpp: write full 32-bit pixels for text rendering */
+    uint32_t *fb32 = (uint32_t *)vga_framebuffer;
+    for (i = 0; i < 8; i++) {
+        glyph = fb_font8x8[(unsigned char)ch][i];
+        for (j = 0; j < 8; j++) {
+            int px = x + j;
+            int py = y + i;
+            if (px < 0 || px >= FB_WIDTH || py < 0 || py >= FB_HEIGHT)
+                continue;
+            /* White (0xFFFFFFFF) or black (0x00000000) */
+            fb32[py * FB_WIDTH + px] = (glyph & (1 << j)) ? 0xFFFFFFFF : 0x00000000;
+        }
+    }
+    vga_dirty = 1;
+
+    fb_console_col++;
+    if (fb_console_col >= FB_CONSOLE_COLS) {
+        fb_console_col = 0;
+        fb_console_row++;
+        if (fb_console_row >= FB_CONSOLE_ROWS)
+            fb_console_scroll();
+    }
+}
+
+static inline void fb_write_byte(uint32_t addr, unsigned char value)
+{
+    uint32_t off;
+    if (!fb_addr_to_offset(addr, &off))
+        return;
+    vga_framebuffer[off] = value;
+    vga_mark_dirty_offset(off);
+}
+
+static inline unsigned char fb_read_byte(uint32_t addr)
+{
+    uint32_t off;
+    if (!fb_addr_to_offset(addr, &off))
+        return 0;
+    return vga_framebuffer[off];
+}
+
+static inline void fb_write_bytes(uint32_t addr, const unsigned char *src, size_t len)
+{
+    size_t i;
+    if (!len)
+        return;
+    /* Byte-wise so both primary and legacy windows map correctly. */
+    for (i = 0; i < len; i++)
+        fb_write_byte(addr + (uint32_t)i, src[i]);
+}
+
+/* BMP file header structure */
+#pragma pack(push, 1)
+typedef struct {
+    unsigned short bfType;
+    unsigned int bfSize;
+    unsigned short bfReserved1;
+    unsigned short bfReserved2;
+    unsigned int bfOffBits;
+} BITMAPFILEHEADER;
+
+typedef struct {
+    unsigned int biSize;
+    int biWidth;
+    int biHeight;
+    unsigned short biPlanes;
+    unsigned short biBitCount;
+    unsigned int biCompression;
+    unsigned int biSizeImage;
+    int biXPelsPerMeter;
+    int biYPelsPerMeter;
+    unsigned int biClrUsed;
+    unsigned int biClrImportant;
+} BITMAPINFOHEADER;
+#pragma pack(pop)
+
+/* Save framebuffer to BMP file for debugging */
+void vga_dump_framebuffer_bmp(const char *filename, int frame_number)
+{
+    FILE *fb_dump = fopen(filename, "wb");
+    if (!fb_dump) {
+        fprintf(stderr, "[VGA] Failed to save framebuffer to %s\n", filename);
+        return;
+    }
+
+    // BMP header for 24-bit RGB image
+    BITMAPFILEHEADER bmfh;
+    BITMAPINFOHEADER bmih;
+
+    int width = vga_ctrl_width ? vga_ctrl_width : FB_WIDTH;
+    int height = vga_ctrl_height ? vga_ctrl_height : FB_HEIGHT;
+    int bytes_per_pixel = 3; // 24-bit RGB
+    int row_size = ((width * bytes_per_pixel + 3) & ~3); // DWORD aligned
+    int image_size = row_size * height;
+
+    // Fill BMP file header
+    bmfh.bfType = 0x4D42; // 'BM'
+    bmfh.bfSize = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + image_size;
+    bmfh.bfReserved1 = 0;
+    bmfh.bfReserved2 = 0;
+    bmfh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+
+    // Fill BMP info header
+    bmih.biSize = sizeof(BITMAPINFOHEADER);
+    bmih.biWidth = width;
+    bmih.biHeight = -height; // Negative for top-down
+    bmih.biPlanes = 1;
+    bmih.biBitCount = 24;
+    bmih.biCompression = 0; // BI_RGB
+    bmih.biSizeImage = image_size;
+    bmih.biXPelsPerMeter = 2835; // 72 DPI
+    bmih.biYPelsPerMeter = 2835; // 72 DPI
+    bmih.biClrUsed = 0;
+    bmih.biClrImportant = 0;
+
+    // Write headers
+    fwrite(&bmfh, sizeof(BITMAPFILEHEADER), 1, fb_dump);
+    fwrite(&bmih, sizeof(BITMAPINFOHEADER), 1, fb_dump);
+
+    /* Present from current front buffer (P2 flip offset). */
+    uint32_t *fb32 = (uint32_t *)(vga_framebuffer + vga_front_offset);
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            uint32_t pixel = fb32[y * width + x];
+
+            /* Transputer writes ARGB as 0xAARRGGBB to memory.
+             * Little-endian x86 reads the same uint32_t as 0xAARRGGBB.
+             * BMP pixel order is B, G, R. */
+            fputc((pixel >> 0) & 0xFF, fb_dump);   /* B */
+            fputc((pixel >> 8) & 0xFF, fb_dump);   /* G */
+            fputc((pixel >> 16) & 0xFF, fb_dump);  /* R */
+        }
+
+        // Pad row to DWORD boundary
+        int padding = (4 - (width * 3) % 4) % 4;
+        for (int p = 0; p < padding; p++) {
+            fputc(0, fb_dump);
+        }
+    }
+
+    fclose(fb_dump);
+    fprintf(stderr, "[VGA] Framebuffer saved to %s (frame %d)\n", filename, frame_number);
+}
+
+/* Write-watch ring (see writeword_int) */
+uint32_t watch_ring[128][3];
+uint32_t watch_ring_n = 0;
+
+/* T4_IPTR_SAMPLE ring (see main loop); dumped by t4_iptr_sample_dump(). */
+uint32_t iptr_samples[8192];
+uint32_t wptr_samples[8192];
+uint32_t iptr_sample_n = 0;
+void t4_iptr_sample_dump(void)
+{
+	uint32_t n = iptr_sample_n > 8192u ? 8192u : iptr_sample_n;
+	uint32_t i, last;
+	if (!n)
+		return;
+	fprintf(stderr, "[IPTR-SAMPLES] %u samples:\n", n);
+	for (i = 0; i < n; i++)
+		fprintf(stderr, "S 0x%08X\n", iptr_samples[i]);
+	/* workspace of the most recent sample, for post-mortem frame reads */
+	last = (iptr_sample_n - 1) & 8191u;
+	fprintf(stderr, "[LAST-FRAME] IPtr=0x%08X WPtr=0x%08X\n",
+	        iptr_samples[last], wptr_samples[last]);
+	for (i = 0; i < 32; i++)
+		fprintf(stderr, "W%-2u 0x%08X\n", i,
+		        word_int(wptr_samples[last] + 4u * i));
+}
+
+/* Frame recorder.  T4_FB_RECORD=N samples changing full-screen frames every
+ * N guest instructions (useful before the desktop/application is alive).
+ * T4_FB_RECORD_ON_FLIP=1 additionally records completed-screen boundaries
+ * and stops periodic sampling after the first one, so a row-by-row game blit
+ * can never be captured halfway through.  T4_FB_RECORD_FLIP_LIMIT=N requests
+ * a clean emulator exit after N completed application frames. */
+static uint32_t t4_fb_record_last_hash = 1;
+static int t4_fb_record_count = 0;
+static int t4_fb_record_present_seen = 0;
+static int t4_fb_record_flip_seen = 0;
+static uint64_t t4_fb_record_flip_count = 0;
+
+static int t4_env_truthy(const char *name)
+{
+	const char *e = getenv(name);
+	return e && *e && strcmp(e, "0") != 0;
+}
+
+static void t4_fb_record_capture(int force)
+{
+	uint32_t w = vga_ctrl_width ? vga_ctrl_width : FB_WIDTH;
+	uint32_t h = vga_ctrl_height ? vga_ctrl_height : FB_HEIGHT;
+	uint32_t n = w * h, i;
+	const uint32_t *fb = (const uint32_t *)(vga_framebuffer
+	                                        + vga_front_offset);
+	uint32_t hash = 2166136261u;
+
+	/* A sparse hash misses thin console glyphs.  Boot polling is infrequent,
+	 * so hashing the complete 800x600 surface is cheap and reliable. */
+	for (i = 0; i < n; i++)
+		hash = (hash ^ fb[i]) * 16777619u;
+	if (!force && hash == t4_fb_record_last_hash)
+		return;
+	t4_fb_record_last_hash = hash;
+	{
+		char name[64];
+		snprintf(name, sizeof(name), "fbrec_%05d.bmp",
+		         t4_fb_record_count);
+		vga_dump_framebuffer_bmp(name, t4_fb_record_count);
+		t4_fb_record_count++;
+	}
+}
+
+static void t4_fb_record_poll(void)
+{
+	if (t4_fb_record_present_seen &&
+	    t4_env_truthy("T4_FB_RECORD_ON_FLIP"))
+		return;
+	t4_fb_record_capture(0);
+}
+
+static void t4_fb_record_flip(int application_frame)
+{
+	static uint64_t limit = ~0ULL;
+
+	if (!t4_env_truthy("T4_FB_RECORD_ON_FLIP"))
+		return;
+	t4_fb_record_present_seen = 1;
+	/* A zero-valued FLIP is fbwm's completed-screen marker.  Record changed
+	 * splash/login/desktop screens but do not start the timed DOOM section. */
+	if (!application_frame) {
+		t4_fb_record_capture(0);
+		return;
+	}
+	if (!t4_fb_record_flip_seen) {
+		const char *e = getenv("T4_FB_RECORD_FLIP_LIMIT");
+		limit = (e && *e) ? strtoull(e, NULL, 0) : 0;
+		t4_fb_record_flip_seen = 1;
+		fprintf(stderr, "[VGA] Completed-frame recording starts at frame %d\n",
+		        t4_fb_record_count);
+	}
+	t4_fb_record_capture(1);
+	t4_fb_record_flip_count++;
+	if (limit && t4_fb_record_flip_count >= limit) {
+		fprintf(stderr,
+		        "[VGA] Completed-frame limit reached: %llu frames\n",
+		        (unsigned long long)t4_fb_record_flip_count);
+		quit = TRUE;
+	}
+}
+
+/* Save framebuffer to file for debugging */
+void vga_dump_framebuffer(const char *filename)
+{
+    FILE *fb_dump = fopen(filename, "wb");
+    if (fb_dump) {
+        fwrite(vga_framebuffer, 1, FB_SIZE, fb_dump);
+        fclose(fb_dump);
+        fprintf(stderr, "[VGA] Framebuffer saved to %s\n", filename);
+    } else {
+        fprintf(stderr, "[VGA] Failed to save framebuffer to %s\n", filename);
+    }
+}
+
+void vga_update(void)
+{
+    display_present_force();
+}
+
+#endif /* T4_SDL_FB */
 
 uint32_t word_int (uint32_t);
 
@@ -162,12 +1607,21 @@ int   FP_Error;                 /* not preserved over descheduling */
 int   RoundingMode;             /* current rounding mode */
 int   ResetRounding;            /* reset rounding mode ? */
 
+uint32_t vec_len;               /* TVX vector length (VSETLEN) */
+uint32_t quant_fmt;             /* TVX GGUF type id (QSETFMT)  */
+tvx_viewport tvx_vp = {1.0f, 1.0f, 0.0f, 0.0f, 1.0f}; /* FTSETVP */
+uint32_t elem_stride;           /* TVX-GFX stride latch (VSETSTRIDE)  */
+uint32_t stride_mask;           /* bit0 = A stream, bit1 = B      */
+uint32_t tvx_src_fmt;           /* VSETFMT: 0=f32, 1=bf16, 2=f16  */
+tvx_light tvx_lit = {{0.0f, 0.0f, 1.0f}, 0.0f, 1.0f}; /* FTSETLIT */
+#define TVX_STEP(bit, dense) \
+        (((stride_mask & (bit)) && elem_stride) ? elem_stride : (dense))
 uint32_t m2dSourceStride;       /* move2d source stride */
 uint32_t m2dDestStride;         /* move2d destination stride */
 uint32_t m2dLength;             /* move2d length (no. of rows) */
 
 /* Other registers. */
-uint32_t ClockReg[2];
+_Atomic uint32_t ClockReg[2];
 uint32_t TNextReg[2];
 uint32_t TPtrLoc[2];            /* XXX 0x80000024 0x80000028 */
 
@@ -225,24 +1679,114 @@ uint32_t STATUSReg;             /* Processor flags: GotoSNPBit, HaltOnError, Err
 #define word(a)         word_int(a)
 #endif
 
+/* TVX-GFX position fetch: component j of an xyz vertex at base, in the
+ * format latched by VSETFMT.  The narrow formats run the TVX stream
+ * converters in front of the geometry datapath. */
+static float tvx_fetch_pos (uint32_t base, uint32_t j)
+{
+        uint32_t h;
+
+        switch (tvx_src_fmt) {
+        case 1:                                 /* bf16 */
+                h = (uint32_t)byte (base + 2*j)
+                  | ((uint32_t)byte (base + 2*j + 1) << 8);
+                return tvx_bits_to_float (tvx_bf16_to_f32 (h));
+        case 2:                                 /* IEEE f16 */
+                h = (uint32_t)byte (base + 2*j)
+                  | ((uint32_t)byte (base + 2*j + 1) << 8);
+                return tvx_bits_to_float (tvx_f16_to_f32 (h));
+        default:                                /* f32 */
+                return real32 (base + 4*j).fp;
+        }
+}
+#define TVX_POS_DENSE() (tvx_src_fmt ? 6u : 12u)
+
 /* Internal variables. */
 u_char Instruction;
 u_char Icode;
 u_char Idata;
-int  Timers;
+_Atomic int Timers;
+int  TimerEnableHi = 1;
+int  TimerEnableLo = 1;
 uint32_t t4_overflow;
 uint32_t t4_carry;
 uint32_t t4_normlen;
 uint32_t t4_carry64;            /* shl64 shifted out bit */
 uint32_t ProcPriority;
+volatile uint64_t heartbeat_counter = 0;
+
+static int noisy_boot_trace_enabled(void)
+{
+	static int init = 0;
+	static int enabled = 0;
+	const char *env;
+
+	if (!init) {
+		env = getenv("T4_NOISY_BOOT_TRACE");
+		enabled = (env && *env && strcmp(env, "0") != 0);
+		init = 1;
+	}
+
+	return enabled;
+}
+
+/*
+ * The release emulator used to pass every guest instruction through the
+ * complete boot-debug framework even when no trace was requested.  Linux
+ * executes enough instructions in scheduler and initcall paths for those
+ * helper calls and lazy environment probes to dominate runtime.
+ *
+ * Keep the original decoder/cache as the correctness reference, but let an
+ * ordinary run bypass diagnostic-only work.  Mentioning any diagnostic
+ * option retains the full path, including its one-shot setup logic.
+ */
+static int runtime_diagnostics_requested(void)
+{
+	static const char *const names[] = {
+		"T4_BOOTDBG", "T4_BOOTWIN", "T4_STOP_AFTER_GCALL",
+		"T4_STOP_IPTR", "T4_STOP_RETURN", "T4_STOP_AREG",
+		"T4_STOP_B_NON_SIGNEXT", "T4_STOP_B_RANGE", "T4_STOP_W3_MIN",
+		"T4_NOISY_BOOT_TRACE", "T4_HISTORY_ON_FAULT",
+		"T4_WPTR_RANGE", "T4_WPTR_TRACE", "T4_WATCH_ADDR",
+		"T4_ENTRY_TRACE", "T4_ENTRY_START", "T4_ENTRY_END",
+		"T4_ENTRY_IPTR", "T4_SK_ENTRY_IPTR", "T4_SK_BYTE_TRACE",
+		"T4_SK_AREG_TRACE", "T4_SK_ADDR_TRACE", "T4_SK_STORE_TRACE",
+		"T4_TRACE_SYM", "T4_TRACE_IPTR", "T4_TRACE_FB_LDC",
+		"T4_TEXT_WRITE_START", "T4_CACHE_DEBUG_START",
+		"T4_DUMP_IPTR", "T4_DUMP_SYM", "T4_DUMP_BOOT_START",
+		"T4_OUTBYTE_TRACE", "T4_NEAREST_SYM", NULL
+	};
+	unsigned int i;
+
+	if (bootdbg_enabled || bootwin_enabled ||
+	    bootdbg_stop_after_call_enabled || outbyte_trace_enabled ||
+	    sk_byte_trace_enabled || sk_areg_trace_enabled ||
+	    sk_addr_trace_enabled || sk_store_trace_enabled ||
+	    text_write_trace_enabled || cache_debug_trace_enabled ||
+	    wptr_trace_enabled || nearest_sym_enabled)
+		return 1;
+
+	for (i = 0; names[i]; i++) {
+		const char *value = getenv(names[i]);
+		if (value && *value && strcmp(value, "0") != 0)
+			return 1;
+	}
+	return 0;
+}
+int EnableJ0BreakFlag = 0;
+/* Product identity for LDDEVID instruction.
+ * Real hardware: T414=0, T800-20=5, T805=6.
+ * T806 is our custom 200MHz variant. Use ID 0x806 (distinguishable). */
+static uint32_t ProductIdentity = 0x00000000;
 #define TimersGo   1
 #define TimersStop 0
 int loop;
 int count1;
 int count2;
 int count3;
-int timeslice;
+_Atomic int timeslice;
 int delayCount1 = 5;
+int speed_multiplier = 1;  /* T800=1, T806=10 (200MHz/20MHz) */
 int32_t quit = FALSE;
 int32_t quitstatus;
 
@@ -259,6 +1803,17 @@ void UpdateWdescReg (uint32_t wdesc)
         WdescReg     = wdesc;
         WPtr         = GetDescWPtr(wdesc);
         ProcPriority = GetDescPriority(wdesc);
+}
+
+static void handle_j0_break(void)
+{
+        uint32_t offset = (ProcPriority == HiPriority) ? 0 : 2;
+        uint32_t base = MemStart + (offset * BytesPerWord);
+        writeword_int(base, WPtr);
+        writeword_int(base + BytesPerWord, IPtr);
+        WPtr = word_int(base);
+        IPtr = word_int(base + BytesPerWord);
+        UpdateWdescReg(WPtr | ProcPriority);
 }
 
 #define Wdesc           WdescReg
@@ -371,6 +1926,11 @@ static uint32_t InvalidateAddr (uint32_t a)
 static void InvalidateRange (uint32_t a, uint32_t n)
 {
         uint32_t ha;
+#ifdef T4_SDL_FB
+        /* FB/MMIO memory never contains code — skip icache invalidation */
+        if (a >= FB_BASE && (a + n) <= FB_LIMIT)
+                return;
+#endif
 
         ha = a + n;
         while (a < ha)
@@ -1479,7 +3039,7 @@ void print_fpreg (char *ident, char name, REAL *fpreg, int printempty)
                 else
                         sprintf (tmp, "%.15le", r64.fp);
 */
-                printf ("%sF%cReg          #%016llX   (%s)\n", ident, name, r64.bits, tmp);
+                printf ("%sF%cReg          #%016" PRIx64 "   (%s)\n", ident, name, r64.bits, tmp);
         }
         else if (fpreg->length == FP_REAL32)
         {
@@ -1497,7 +3057,7 @@ void print_fpreg (char *ident, char name, REAL *fpreg, int printempty)
         else if (printempty)
         {
                 r64 = fpreg->u.db;
-                printf ("%sF%cReg          #%016llX   (Empty)\n", ident, name, r64.bits);
+                printf ("%sF%cReg          #%016" PRIx64 "   (Empty)\n", ident, name, r64.bits);
         }
 
         fp_clrexcept ();
@@ -1589,6 +3149,8 @@ char *mnemonic(u_char icode, uint32_t oreg, uint32_t fpuentry, int onlymnemo)
                         mnemo = Secondaries[oreg];
                 else if (MIN_COMBINATIONS <= oreg && oreg <= MAX_COMBINATIONS)
                         mnemo = Combinations[oreg - MIN_COMBINATIONS];
+                else if (MIN_TVX <= oreg && oreg <= MAX_TVX)
+                        mnemo = TvxOps[oreg - MIN_TVX];
 
                 if (mnemo == NULL)
                 {
@@ -1745,7 +3307,18 @@ void mainloop (void)
         fpreal64_t dbtemp1, dbtemp2;
         REAL       fptemp;
         unsigned int islot, pslot;
-        int i;
+	int i;
+	int trace_fb_ldc_enabled;
+	uint32_t stop_iptr;
+	uint32_t stop_return;
+	uint32_t stop_areg;
+	int stop_areg_set;
+	int stop_b_non_signext;
+	uint32_t stop_b_lo;
+	uint32_t stop_b_hi;
+	int stop_b_range_set;
+	uint32_t stop_w3_min;
+	int production_quiet;
 
 #ifdef EMUDEBUG
         fpreal32_t r32temp;
@@ -1759,7 +3332,76 @@ void mainloop (void)
         instrBytes  = 0;
         asmLines    = 0;
 #endif
-        m2dSourceStride = m2dDestStride = m2dLength = Undefined_p;
+	m2dSourceStride = m2dDestStride = m2dLength = Undefined_p;
+	{
+		const char *env = getenv("T4_TRACE_FB_LDC");
+		trace_fb_ldc_enabled = env && *env && strcmp(env, "0") != 0;
+	}
+	{
+		const char *env = getenv("T4_STOP_IPTR");
+		stop_iptr = env && *env ? (uint32_t)strtoul(env, NULL, 0) : 0;
+		env = getenv("T4_STOP_RETURN");
+		stop_return = env && *env ? (uint32_t)strtoul(env, NULL, 0) : 0;
+		env = getenv("T4_STOP_AREG");
+		stop_areg_set = env && *env;
+		stop_areg = stop_areg_set ? (uint32_t)strtoul(env, NULL, 0) : 0;
+		env = getenv("T4_STOP_B_NON_SIGNEXT");
+		stop_b_non_signext = env && *env && strcmp(env, "0") != 0;
+		env = getenv("T4_STOP_B_RANGE");
+		stop_b_range_set = env && *env &&
+			sscanf(env, "%x,%x", &stop_b_lo, &stop_b_hi) == 2;
+		env = getenv("T4_STOP_W3_MIN");
+		stop_w3_min = env && *env ? (uint32_t)strtoul(env, NULL, 0) : 0;
+	}
+
+	fprintf(stderr, "[DEBUG: Entering mainloop, IPtr=0x%08X Wptr=0x%08X]\n", IPtr, WPtr);
+
+	/* T9000 protection / PMI (once per mainloop entry). */
+	t9k_protect_init();
+	t9k_pmi_init();
+
+	/* Decode cache: opt-in (T4_DCACHE=1). Default off — correctness first. */
+	{
+		const char *de = getenv("T4_DCACHE");
+		dcache_enabled = (de && *de && strtoul(de, NULL, 0) != 0) ? 1 : 0;
+		dcache_init(&g_dcache);
+		if (dcache_enabled)
+			fprintf(stderr, "[DCACHE] Enabled (%d entries, %zuKB)\n",
+				DCACHE_SIZE, sizeof(dcache_t) / 1024);
+		else
+			fprintf(stderr, "[DCACHE] Disabled (set T4_DCACHE=1 to enable)\n");
+	}
+
+	/* Pin hot loop to one CPU for stable L1/L2 residency (optional). */
+	{
+		const char *pin = getenv("T4_CPU_PIN");
+		if (pin && *pin) {
+#if defined(__linux__)
+			cpu_set_t set;
+			int cpu = (int)strtol(pin, NULL, 0);
+			CPU_ZERO(&set);
+			CPU_SET(cpu, &set);
+			if (sched_setaffinity(0, sizeof(set), &set) == 0)
+				fprintf(stderr, "[CPU] Pinned hot loop to CPU %d\n", cpu);
+			else
+				perror("[CPU] sched_setaffinity");
+#endif
+		}
+	}
+	/* Verify memory at watched address after BTL loading */
+	{
+	    const char *wa_env = getenv("T4_WATCH_ADDR");
+	    if (wa_env) {
+	        uint32_t wa = (uint32_t)strtoul(wa_env, NULL, 16);
+	        fprintf(stderr, "[VERIFY_MEM] addr=0x%08X bytes: %02X %02X %02X %02X (mem idx 0x%X)\n",
+	                wa, byte_int(wa), byte_int(wa+1), byte_int(wa+2), byte_int(wa+3),
+	                wa & MemByteMask);
+	        /* Also check raw mem array */
+	        uint32_t idx = wa & MemByteMask;
+	        fprintf(stderr, "[VERIFY_RAW] mem[0x%X]: %02X %02X %02X %02X\n",
+	                idx, mem[idx], mem[idx+1], mem[idx+2], mem[idx+3]);
+	    }
+	}
 
 	count1 = 0;
 	count2 = 0;
@@ -1767,11 +3409,427 @@ void mainloop (void)
 	timeslice = 0;
 	Timers = TimersStop;
 
+	/* Set product identity for LDDEVID instruction */
+	if (Txxx == 414)      ProductIdentity = 0x00000000;  /* T414 */
+	else if (Txxx == 800) ProductIdentity = 0x00000005;  /* T800-20 */
+	else if (Txxx == 806) ProductIdentity = 0x00000806;  /* T806 (custom 200MHz) */
+	else                  ProductIdentity = 0x00000000;
+
+	/* T806: Custom 200MHz T800 variant. */
+	speed_multiplier = 1;
+	if (IsT806)
+		fprintf(stderr, "[T806] T800-compatible @ 200MHz (LDDEVID=0x%03x)\n", ProductIdentity);
+
+	/* Start timer thread — updates ClockReg asynchronously */
+	g_timer_bridge.ClockReg = ClockReg;
+	g_timer_bridge.timeslice = &timeslice;
+	g_timer_bridge.Timers = &Timers;
+	g_timer_bridge.TimersGo_val = TimersGo;
+	g_timer_threaded = timer_bridge_start(&g_timer_bridge);
+	TimerEnableHi = 1;
+	TimerEnableLo = 1;
+
+	/* Initialize debug config from environment variables.
+	 * Only override p.c defaults if env var is explicitly set.
+	 * debug_config.c collects all env var reads in one place. */
+	{
+		static debug_config_t dbg;
+		debug_init(&dbg);
+
+		/* These default to 0 in p.c — safe to set from dbg */
+		if (dbg.outbyte_trace_enabled)   outbyte_trace_enabled = 1;
+		if (dbg.mmio_trace_enabled)      mmio_trace_enabled = 1;
+		if (dbg.early_printk_trace_enabled) early_printk_trace_enabled = 1;
+		if (dbg.nearest_sym_enabled)     nearest_sym_enabled = 1;
+		if (dbg.bootdbg_enabled)         bootdbg_enabled = 1;
+
+		/* uart_console: default is 1 in p.c, only change if env var set */
+		{
+			const char *uc = getenv("T4_UART_CONSOLE");
+			if (uc && *uc) uart_console_enabled = (int)strtoul(uc, NULL, 0) != 0;
+		}
+		/* uart_console_force overrides */
+		{
+			const char *ucf = getenv("T4_UART_CONSOLE_FORCE");
+			if (ucf && *ucf && (int)strtoul(ucf, NULL, 0) != 0) {
+				uart_console_enabled = 1;
+				uart_trace_enabled = 0;
+			}
+		}
+
+		/* link0: default is 1 in p.c */
+		if (dbg.link0_trace_enabled) link0_trace_enabled = 1;
+
+#ifdef T4_SDL_FB
+		if (dbg.fb_console_enabled) fb_console_enabled = 1;
+#endif
+		{
+			const char *bd = getenv("T4_BOOT_DUMP_START");
+			if (bd && *bd) boot_dump_start_enabled = 1;
+		}
+	}
+
+	/* Open UART log file — use timestamped name to avoid conflicts
+	 * with concurrent T4 instances (e.g., test runners). */
+	{
+		const char *uart_log_env = getenv("T4_UART_LOG");
+		char uart_log_auto[64];
+		const char *uart_log_path;
+
+		if (uart_log_env && *uart_log_env) {
+			uart_log_path = uart_log_env;
+		} else {
+			/* Generate timestamped filename: boot-{pid}.uart */
+			snprintf(uart_log_auto, sizeof(uart_log_auto),
+				 "boot-%d.uart", (int)getpid());
+			uart_log_path = uart_log_auto;
+			/* Also create/overwrite "boot.uart" symlink for convenience */
+			unlink("boot.uart");
+			symlink(uart_log_auto, "boot.uart");
+		}
+		uart_log_file = fopen(uart_log_path, "w");
+		if (uart_log_file) {
+			fprintf(stderr, "[UART] Logging to %s\n", uart_log_path);
+			setbuf(uart_log_file, NULL);  /* Unbuffered for real-time logging */
+		}
+	}
 
         islot = MAX_ICACHE;
-        PROFILE(update_tod (&StartTOD));
+	PROFILE(update_tod (&StartTOD));
+	production_quiet = !runtime_diagnostics_requested();
+	if (production_quiet)
+		fprintf(stderr, "[FAST] Quiet production decoder path enabled\n");
+
+	/*
+	 * T9000 P-trap return: longjmp resumes here (after one-time init)
+	 * with L IPtr/WPtr restored.  Clear OReg so prefix state is clean.
+	 */
+	if (setjmp(t9k_prot.jmp_env) != 0) {
+		OReg = 0;
+		if (t9k_prot.debug)
+			fprintf(stderr,
+				"[T9K-PROT] resume L after trap IPtr=0x%08X cause=%u\n",
+				IPtr, t9k_prot.last_trap);
+	} else {
+		t9k_prot.jmp_valid = 1;
+	}
+
 	while (1)
 	{
+                /* Fast-path: minimal overhead per instruction. */
+                PrevError = ReadError;
+		if (unlikely(stop_iptr && IPtr == stop_iptr &&
+		    (!stop_return || word_int(WPtr) == stop_return) &&
+		    (!stop_areg_set || AReg == stop_areg) &&
+		    (!stop_b_non_signext || (BReg != 0 && BReg != 0xFFFFFFFFu)) &&
+		    (!stop_b_range_set || (BReg >= stop_b_lo && BReg <= stop_b_hi)) &&
+		    (!stop_w3_min || word_int(index(WPtr, 3)) >= stop_w3_min))) {
+			fprintf(stderr,
+			        "[STOP_IPTR] IPtr=0x%08X WPtr=0x%08X "
+			        "A=0x%08X B=0x%08X C=0x%08X O=0x%08X "
+			        "W0=0x%08X W1=0x%08X W2=0x%08X W3=0x%08X "
+			        "W25=0x%08X W26=0x%08X W27=0x%08X W28=0x%08X "
+			        "W29=0x%08X W33=0x%08X W34=0x%08X W35=0x%08X "
+			        "W36=0x%08X W37=0x%08X W38=0x%08X W53=0x%08X\n",
+			        IPtr, WPtr, AReg, BReg, CReg, OReg,
+			        word_int(index(WPtr, 0)), word_int(index(WPtr, 1)),
+			        word_int(index(WPtr, 2)), word_int(index(WPtr, 3)),
+			        word_int(index(WPtr, 25)), word_int(index(WPtr, 26)),
+			        word_int(index(WPtr, 27)), word_int(index(WPtr, 28)),
+			        word_int(index(WPtr, 29)), word_int(index(WPtr, 33)),
+			        word_int(index(WPtr, 34)), word_int(index(WPtr, 35)),
+			        word_int(index(WPtr, 36)), word_int(index(WPtr, 37)),
+			        word_int(index(WPtr, 38)), word_int(index(WPtr, 53)));
+			{
+				uint32_t dump_base;
+				int dump_i;
+
+				dump_base = word_int(index(WPtr, 38));
+				fprintf(stderr, "  M[W38]:");
+				for (dump_i = 0; dump_i < 18; dump_i++)
+					fprintf(stderr, " %08X", word_int(index(dump_base, dump_i)));
+				fprintf(stderr, "\n");
+				dump_base = word_int(index(WPtr, 35));
+				fprintf(stderr, "  M[W35]:");
+				for (dump_i = 0; dump_i < 32; dump_i++)
+					fprintf(stderr, " %08X", word_int(index(dump_base, dump_i)));
+				fprintf(stderr, "\n");
+			}
+			break;
+		}
+
+                /* Timer and periodic checks.
+                 * With threaded timer, only queue schedule + rare I/O.
+                 * Headless: skip SDL entirely (present is already no-op). */
+                if (__builtin_expect(++count1 > delayCount1, 0))
+                {
+                        count1 = 0;
+                        if (g_timer_threaded) {
+                                if (TimerEnableHi) schedule_timerq(HiPriority);
+                                if (TimerEnableLo) schedule_timerq(LoPriority);
+                        } else {
+                                update_time();
+                        }
+
+                        {
+                                static uint32_t slow_counter = 0;
+                                /* Every 1024 timer ticks ≈ rare host I/O */
+                                if (__builtin_expect((++slow_counter & 0x3FF) == 0, 0)) {
+#ifdef T4_SDL_FB
+                                        if (!display_headless) {
+                                                display_pump();
+                                                display_present();
+                                        }
+#endif
+                                        t4net_poll_rx();
+                                        if (quit) break;
+                                }
+                        }
+                }
+
+#ifndef EMUDEBUG
+                if (fast_primary_enabled < 0) {
+                        const char *env = getenv("T4_FAST_PRIMARY");
+			/* The accelerated decoder is opt-in until the Linux boot
+			 * differential suite proves full scheduler equivalence. */
+                        fast_primary_enabled = env && *env &&
+				strtoul(env, NULL, 0) != 0;
+                }
+                if (fast_block_enabled < 0) {
+                        const char *env = getenv("T4_FAST_BLOCK");
+			/* Basic-block fusion is likewise opt-in: incorrect context
+			 * state is worse than a slower, reproducible emulator. */
+                        fast_block_enabled = env && *env &&
+				strtoul(env, NULL, 0) != 0;
+                }
+
+                /* Release block path for straight-line runs of simple one-byte
+                 * primary ops. It avoids the legacy icache and giant switch for
+                 * stack/local arithmetic code, while branches, prefixes, OPR,
+                 * calls, scheduler/channel ops, and debug tracing stay on the
+                 * full path. Cached bytes are rechecked before execution, so
+                 * self-modifying writes naturally fall back and rebuild. */
+                if (__builtin_expect(fast_block_enabled && OReg == 0 &&
+                    !bootdbg_enabled && !cache_debug_trace_enabled &&
+                    !iptr_trace_enabled && !sym_trace_active &&
+                    !text_write_trace_enabled && !sk_areg_trace_enabled &&
+                    !sk_addr_trace_enabled && !sk_store_trace_enabled &&
+                    !wptr_trace_enabled, 1)) {
+                        t4_fast_block_t *fb = &fast_blocks[IPtr & T4_FAST_BLOCK_MASK];
+                        int valid = (fb->tag == IPtr && fb->len != 0);
+
+                        if (valid) {
+                                for (i = 0; i < fb->len; i++) {
+                                        if (unlikely(code_byte(IPtr + (uint32_t)i) != fb->bytes[i])) {
+                                                valid = 0;
+                                                break;
+                                        }
+                                }
+                        }
+                        if (!valid) {
+                                uint32_t scan_ip = IPtr;
+                                fb->tag = IPtr;
+                                fb->len = 0;
+                                for (i = 0; i < T4_FAST_BLOCK_MAX_INSNS; i++) {
+                                        uint8_t insn = code_byte(scan_ip);
+                                        uint32_t op = insn & 0xf0;
+                                        if (!t4_fast_block_op(op))
+                                                break;
+                                        fb->bytes[i] = insn;
+                                        fb->ops[i].op = (u_char)op;
+                                        fb->ops[i].imm = (u_char)(insn & 0x0f);
+                                        fb->len++;
+                                        scan_ip++;
+                                }
+                                valid = fb->len >= 2;
+                        }
+                        if (valid) {
+                                for (i = 0; i < fb->len; i++) {
+                                        uint32_t imm = fb->ops[i].imm;
+                                        switch (fb->ops[i].op) {
+                                        case 0x10: /* ldlp */
+                                                CReg = BReg;
+                                                BReg = AReg;
+                                                AReg = index(WPtr, imm);
+                                                break;
+                                        case 0x30: /* ldnl */
+                                                AReg = word(index(AReg, imm));
+                                                break;
+                                        case 0x40: /* ldc */
+                                                CReg = BReg;
+                                                BReg = AReg;
+                                                AReg = imm;
+                                                break;
+                                        case 0x50: /* ldnlp */
+                                                AReg = index(AReg, imm);
+                                                break;
+                                        case 0x70: /* ldl */
+                                                CReg = BReg;
+                                                BReg = AReg;
+                                                AReg = word(index(WPtr, imm));
+                                                break;
+                                        case 0x80: /* adc */
+                                                t4_overflow = FALSE;
+                                                t4_carry = 0;
+                                                AReg = t4_eadd32(AReg, imm);
+                                                if (t4_overflow == TRUE)
+                                                        SetError;
+                                                break;
+                                        case 0xb0: /* ajw */
+                                                UpdateWdescReg(index(WPtr, (int32_t)imm) | ProcPriority);
+                                                break;
+                                        case 0xc0: /* eqc */
+                                                AReg = (AReg == imm) ? true_t : false_t;
+                                                break;
+                                        case 0xd0: /* stl */
+                                                writeword(index(WPtr, imm), AReg);
+                                                AReg = BReg;
+                                                BReg = CReg;
+                                                break;
+                                        case 0xe0: /* stnl */
+                                                writeword(index(AReg, imm), BReg);
+                                                AReg = CReg;
+                                                break;
+                                        }
+                                }
+                                IPtr += fb->len;
+                                if (__builtin_expect((!PrevError && ReadError) &&
+                                    (exitonerror || ReadHaltOnError), 0))
+                                        goto FastPrimaryError;
+                                continue;
+                        }
+                }
+
+                /* Single-instruction fallback for common primary ops when a
+                 * block is too short to cache.  Decode the complete PFIX/NFIX
+                 * chain here: compiler-generated kernel code rarely fits its
+                 * frame offsets and constants in a single nibble, and making
+                 * only one-byte primaries fast leaves nearly all C code on the
+                 * diagnostic-heavy legacy path. */
+                if (__builtin_expect(fast_primary_enabled && OReg == 0 &&
+                    !bootdbg_enabled && !cache_debug_trace_enabled &&
+                    !iptr_trace_enabled && !sym_trace_active &&
+                    !text_write_trace_enabled && !sk_areg_trace_enabled &&
+                    !sk_addr_trace_enabled && !sk_store_trace_enabled &&
+                    !wptr_trace_enabled && !trace_fb_ldc_enabled, 1)) {
+	                        dcache_entry_t *decoded;
+	                        uint32_t fast_ip;
+	                        uint32_t fast_oreg;
+                        uint32_t op;
+
+	                        /* Share the same prefix decoder as T4_DCACHE.
+	                         * This makes PFIX/NFIX operand construction a
+	                         * single, testable implementation instead of a
+	                         * second hand-written decoder. */
+	                        decoded = dcache_lookup(&g_dcache, IPtr);
+	                        if (!decoded)
+	                                decoded = dcache_fill(&g_dcache, IPtr,
+	                                                      mem, MemByteMask);
+	                        fast_ip = decoded->next_ip - 1;
+	                        fast_oreg = (uint32_t)decoded->operand;
+	                        op = (uint32_t)decoded->opcode << 4;
+
+                        switch (op) {
+                        case 0x10: /* ldlp */
+                                CReg = BReg;
+                                BReg = AReg;
+                                AReg = index(WPtr, fast_oreg);
+                                IPtr = fast_ip + 1;
+                                continue;
+                        case 0x30: /* ldnl */
+                                AReg = word(index(AReg, fast_oreg));
+                                IPtr = fast_ip + 1;
+                                continue;
+                        case 0x40: /* ldc */
+                                CReg = BReg;
+                                BReg = AReg;
+                                AReg = fast_oreg;
+                                IPtr = fast_ip + 1;
+                                continue;
+                        case 0x50: /* ldnlp */
+                                AReg = index(AReg, fast_oreg);
+                                IPtr = fast_ip + 1;
+                                continue;
+                        case 0x70: /* ldl */
+                                CReg = BReg;
+                                BReg = AReg;
+                                AReg = word(index(WPtr, fast_oreg));
+                                IPtr = fast_ip + 1;
+                                continue;
+                        case 0x80: /* adc */
+                                t4_overflow = FALSE;
+                                t4_carry = 0;
+                                AReg = t4_eadd32(AReg, fast_oreg);
+                                if (t4_overflow == TRUE)
+                                        SetError;
+                                IPtr = fast_ip + 1;
+                                if (__builtin_expect((!PrevError && ReadError) &&
+                                    (exitonerror || ReadHaltOnError), 0))
+                                        goto FastPrimaryError;
+                                continue;
+                        case 0xb0: /* ajw */
+                                UpdateWdescReg(index(WPtr, fast_oreg) | ProcPriority);
+                                IPtr = fast_ip + 1;
+                                continue;
+                        case 0xc0: /* eqc */
+                                AReg = (AReg == fast_oreg) ? true_t : false_t;
+                                IPtr = fast_ip + 1;
+                                continue;
+                        case 0xd0: /* stl */
+                                writeword(index(WPtr, fast_oreg), AReg);
+                                AReg = BReg;
+                                BReg = CReg;
+                                IPtr = fast_ip + 1;
+                                continue;
+                        case 0xe0: /* stnl */
+                                writeword(index(AReg, fast_oreg), BReg);
+                                AReg = CReg;
+                                IPtr = fast_ip + 1;
+                                continue;
+                        default:
+                                break;
+                        }
+                }
+#endif
+
+                /* Fast path disabled — caused FPU rounding regression.
+                 * TODO: ensure fast path updates icache and handles T4COMBINATIONS. */
+#if 0 /* defined(NDEBUG) && !defined(EMUDEBUG) */
+                Instruction = byte_int(IPtr);
+                Icode = Instruction & 0xf0;
+                Idata = Instruction & 0x0f;
+                OReg = OReg + Idata;
+                /* Inline prefix loop (PFIX/NFIX) — most common instructions */
+                while (Icode == 0x20) {         /* PFIX */
+                        OReg = OReg << 4;
+                        IPtr++;
+                        Instruction = byte_int(IPtr);
+                        Icode = Instruction & 0xf0;
+                        Idata = Instruction & 0x0f;
+                        OReg = OReg + Idata;
+                }
+                if (Icode == 0x60) {            /* NFIX */
+                        OReg = (~OReg) << 4;
+                        IPtr++;
+                        Instruction = byte_int(IPtr);
+                        Icode = Instruction & 0xf0;
+                        Idata = Instruction & 0x0f;
+                        OReg = OReg + Idata;
+                        /* Handle PFIX after NFIX */
+                        while (Icode == 0x20) {
+                                OReg = OReg << 4;
+                                IPtr++;
+                                Instruction = byte_int(IPtr);
+                                Icode = Instruction & 0xf0;
+                                Idata = Instruction & 0x0f;
+                                OReg = OReg + Idata;
+                        }
+                }
+                goto FastDispatch;
+#endif
+		if (__builtin_expect(production_quiet, 1))
+			goto ProductionFetch;
+
 #ifndef NDEBUG
                 temp = temp2 = Undefined_p;
                 otherWdesc = otherWPtr = otherPtr = altState = Undefined_p;
@@ -1781,22 +3839,252 @@ void mainloop (void)
 #ifdef EMUDEBUG
                 r32temp = RUndefined;
 #endif
-                /* Save current value of Error flag */
-                PrevError = ReadError;
 
-		/* Move timers on if necessary, and increment timeslice counter. */
-                if (++count1 > delayCount1)
-                {
-                        if (SharedEvents && (nodeid >= 0))
-                        {
-                                if (SharedEvents[nodeid])
-                                        return;
-                        }
-		        update_time ();
+                if (bootdbg_enabled && bootdbg_stop_after_call_enabled && stop_after_boot_call) {
+                        fprintf(stderr,
+                                "[BOOTDBG] stopping after %s @ 0x%08X target=0x%08X return=0x%08X WPtr=0x%08X\n",
+                                last_boot_call_is_gcall ? "GCALL" : "CALL",
+                                last_boot_call_site, last_boot_call_target,
+                                last_boot_call_return, last_boot_call_wptr);
+                        return;
                 }
+
+                /* Periodic IPtr heartbeat for early-boot hangs */
+                if (bootdbg_enabled) {
+                        static uint32_t iptr_heartbeat = 0;
+                        if ((iptr_heartbeat++ % 1000000) == 0) {
+                                fprintf(stderr, "[BOOTDBG] heartbeat IPtr=0x%08X WPtr=0x%08X\n",
+                                        IPtr, WPtr);
+                        }
+                }
+
+		if (outbyte_trace_enabled && !outbyte_entry_logged) {
+			const link_sym *lsym = NULL;
+			const prolog_sym *sym = NULL;
+			uint32_t entry_iptr = 0;
+			lsym = find_link_sym_by_name("__outbyte");
+			if (!lsym)
+				lsym = find_link_sym_by_name("transputer_outbyte");
+			if (lsym && link_text_base) {
+				entry_iptr = link_text_base + lsym->sym_off;
+				fprintf(stderr,
+				        "[OUTBYTE_DUMP] func=%s entry=0x%08X\n",
+				        lsym->name, entry_iptr);
+			} else {
+				sym = find_prolog_sym_by_name("__outbyte");
+				if (!sym)
+					sym = find_prolog_sym_by_name("transputer_outbyte");
+				if (sym)
+					entry_iptr = prolog_text_base + sym->text_off;
+				if (sym) {
+					fprintf(stderr,
+					        "[OUTBYTE_DUMP] func=%s entry=0x%08X\n",
+					        sym->name, entry_iptr);
+				}
+			}
+			if (entry_iptr) {
+				fprintf(stderr, "[OUTBYTE_BYTES] ");
+				for (i = 0; i < 32; i++) {
+					fprintf(stderr, "%02X%s", byte_int(entry_iptr + i),
+					        (i == 31) ? "\n" : " ");
+				}
+				outbyte_entry_logged = 1;
+			}
+		}
+		if (!sym_dump_logged) {
+			static int dump_sym_env_checked;
+			static const char *dump_sym_name;
+			if (!dump_sym_env_checked) {
+				dump_sym_name = getenv("T4_DUMP_SYM");
+				dump_sym_env_checked = 1;
+			}
+			if (dump_sym_name && *dump_sym_name)
+				dump_sym_bytes_once(dump_sym_name);
+			else
+				sym_dump_logged = 1;
+		}
+		if (boot_dump_start_enabled && !boot_dump_start_done && IPtr == MemStart) {
+			uint32_t w0 = word(index(WPtr, 0));
+			uint32_t w1 = word(index(WPtr, 1));
+			fprintf(stderr,
+			        "[BOOTSTART] IPtr=0x%08X WPtr=0x%08X WPtr[0]=0x%08X WPtr[1]=0x%08X\n",
+			        IPtr, WPtr, w0, w1);
+			boot_dump_start_done = 1;
+		}
+		if (!iptr_dump_logged)
+			dump_iptr_bytes_once();
+		setup_sym_trace_once();
+		setup_iptr_trace_once();
+		setup_text_write_trace_once();
+		setup_cache_debug_trace_once();
+
+                /* Short-range trace around head.S BSS loop */
+                if (bootdbg_enabled && IPtr >= 0x80000090 && IPtr <= 0x800000B0) {
+                        static int iptr_trace_count = 0;
+                        if (iptr_trace_count < 32) {
+                                fprintf(stderr, "[BOOTDBG] IPtr=0x%08X\n", IPtr);
+                                iptr_trace_count++;
+                        }
+                }
+                /* Short-range trace around bare-metal bootstrap entry. */
+                if (bootdbg_enabled && IPtr >= 0x80000070 && IPtr <= 0x80000090) {
+                        static int iptr_trace0_count = 0;
+                        if (iptr_trace0_count < 64) {
+                                uint8_t op0 = byte_int(IPtr);
+                                uint8_t op1 = byte_int(IPtr + 1);
+                                const char *mnemo = mnemonic(Icode, OReg, AReg, 0);
+                                fprintf(stderr,
+                                        "[BOOTDBG] entry IPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X O=0x%08X op=%02X %02X err=%d ho=%d icode=0x%02X ins=0x%02X idata=0x%X mnemo=%s\n",
+                                        IPtr, AReg, BReg, CReg, OReg, op0, op1,
+                                        ReadError ? 1 : 0, ReadHaltOnError ? 1 : 0,
+                                        Icode, Instruction, Idata, mnemo);
+                                iptr_trace0_count++;
+                        }
+                }
+                if (bootdbg_enabled && IPtr >= 0x800000B5 && IPtr <= 0x80000110) {
+                        static int iptr_trace2_count = 0;
+                        if (iptr_trace2_count < 64) {
+                                fprintf(stderr, "[BOOTDBG] post-bss IPtr=0x%08X\n", IPtr);
+                                iptr_trace2_count++;
+                        }
+                }
+                if (bootdbg_enabled && IPtr >= 0x80000180 && IPtr <= 0x800001B0) {
+                        static int iptr_trace3_count = 0;
+                        if (iptr_trace3_count < 128) {
+                                uint8_t op0 = byte_int(IPtr);
+                                uint8_t op1 = byte_int(IPtr + 1);
+                                fprintf(stderr,
+                                        "[BOOTDBG] boot2 IPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X O=0x%08X op=%02X %02X icode=0x%02X ins=0x%02X idata=0x%X mnemo=%s\n",
+                                        IPtr, AReg, BReg, CReg, OReg, op0, op1,
+                                        Icode, Instruction, Idata,
+                                        mnemonic(Icode, OReg, AReg, 0));
+                                iptr_trace3_count++;
+                        }
+                }
+                /* Bare-metal entry trace: first hit into .text or an explicit range. */
+                {
+                        static int entry_trace_init = 0;
+                        static int entry_trace_enabled = 0;
+                        static int entry_trace_done = 0;
+                        static unsigned int entry_trace_hits = 0;
+                        static unsigned int entry_trace_target_hit = 1;
+                        static unsigned int entry_trace_max_hits = 1;
+                        static int entry_trace_deref = 0;
+                        static uint32_t entry_start = 0;
+                        static uint32_t entry_end = 0;
+                        if (!entry_trace_init) {
+                                const char *env = getenv("T4_ENTRY_TRACE");
+                                const char *env_start = getenv("T4_ENTRY_START");
+                                const char *env_end = getenv("T4_ENTRY_END");
+                                const char *env_iptr = getenv("T4_ENTRY_IPTR");
+                                const char *env_hit = getenv("T4_ENTRY_HIT");
+                                const char *env_hits = getenv("T4_ENTRY_HITS");
+                                const char *env_deref = getenv("T4_ENTRY_DEREF");
+                                entry_trace_enabled = (env && *env);
+                                if (env_hit && *env_hit) {
+                                        entry_trace_target_hit = (unsigned int)strtoul(env_hit, NULL, 0);
+                                        if (!entry_trace_target_hit)
+                                                entry_trace_target_hit = 1;
+                                }
+                                if (env_hits && *env_hits) {
+                                        entry_trace_max_hits = (unsigned int)strtoul(env_hits, NULL, 0);
+                                        if (!entry_trace_max_hits)
+                                                entry_trace_max_hits = 1;
+                                }
+                                entry_trace_deref = env_deref && *env_deref;
+                                if (env_iptr && *env_iptr) {
+                                        entry_start = (uint32_t)strtoul(env_iptr, NULL, 0);
+                                        entry_end = entry_start;
+                                } else {
+                                        entry_start = env_start && *env_start ? (uint32_t)strtoul(env_start, NULL, 0) : 0x80000120;
+                                        entry_end = env_end && *env_end ? (uint32_t)strtoul(env_end, NULL, 0) : 0x80002000;
+                                }
+                                entry_trace_init = 1;
+                        }
+                        if (entry_trace_enabled && !entry_trace_done) {
+                                if ((entry_start == entry_end && IPtr == entry_start) ||
+                                    (entry_start != entry_end && IPtr >= entry_start && IPtr <= entry_end)) {
+                                        entry_trace_hits++;
+                                        if (entry_trace_hits >= entry_trace_target_hit &&
+                                            entry_trace_hits < entry_trace_target_hit + entry_trace_max_hits) {
+                                                int off;
+                                                fprintf(stderr,
+                                                        "[ENTRY] hit=%u IPtr=0x%08X WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X O=0x%08X\n",
+                                                        entry_trace_hits, IPtr, WPtr, AReg, BReg, CReg, OReg);
+                                                for (off = 0; off <= 32; off += 4)
+                                                        fprintf(stderr, "[ENTRY] WPtr+%02d 0x%08X\n",
+                                                                off, word_int(WPtr + off));
+                                                if (entry_trace_deref) {
+                                                        uint32_t arg0 = word_int(WPtr + 4);
+                                                        for (off = 0; off <= 32; off += 4)
+                                                                fprintf(stderr, "[ENTRY] arg0+%02d 0x%08X\n",
+                                                                        off, word_int(arg0 + off));
+                                                }
+                                                if (entry_trace_hits + 1 >=
+                                                    entry_trace_target_hit + entry_trace_max_hits)
+                                                        entry_trace_done = 1;
+                                        }
+                                }
+                        }
+                }
+                if (bootdbg_enabled && IPtr == 0x800000B5) {
+                        static int bss_done_logged = 0;
+                        if (!bss_done_logged) {
+                                fprintf(stderr, "[BOOTDBG] Reached bss_clear_done\n");
+                                bss_done_logged = 1;
+                        }
+                }
+                if (bootdbg_enabled && IPtr >= 0x80883780 && IPtr <= 0x80883840) {
+                        static int start_kernel_seen = 0;
+                        if (!start_kernel_seen) {
+                                fprintf(stderr,
+                                        "[BOOTDBG] entered start_kernel IPtr=0x%08X WPtr=0x%08X\n",
+                                        IPtr, WPtr);
+                                start_kernel_seen = 1;
+                        }
+                }
+                if (bootdbg_enabled && last_boot_call_target != 0 && IPtr == last_boot_call_target) {
+                        static int post_gcall_seen = 0;
+                        if (!post_gcall_seen) {
+                                fprintf(stderr,
+                                        "[BOOTDBG] post-GCALL IPtr=0x%08X return=0x%08X WPtr=0x%08X\n",
+                                        IPtr, last_boot_call_return, WPtr);
+                                post_gcall_seen = 1;
+                        }
+                }
+
+                /* One-shot snapshot at bss_clear_loop in head.S */
+                if (bootdbg_enabled && IPtr == 0x800000A3) {
+                        static int bss_logged = 0;
+                        static uint32_t bss_loop_count = 0;
+                        uint32_t bss_start = word_int(index(WPtr, 3));
+                        uint32_t bss_stop = word_int(index(WPtr, 4));
+                        if (!bss_logged) {
+                                fprintf(stderr,
+                                        "[BOOTDBG] IPtr=0x%08X WPtr=0x%08X bss_start=0x%08X bss_stop=0x%08X\n",
+                                        IPtr, WPtr, bss_start, bss_stop);
+                                bss_logged = 1;
+                        }
+                        if ((bss_loop_count++ % 100000) == 0) {
+                                fprintf(stderr,
+                                        "[BOOTDBG] bss_loop=%u current_ptr=0x%08X end_ptr=0x%08X\n",
+                                        bss_loop_count, bss_start, bss_stop);
+                        }
+                }
+
+
+ProductionFetch:
+		/* Shared-events check only (timer already handled at loop top). */
+                if (SharedEvents && (nodeid >= 0) && SharedEvents[nodeid])
+                        return;
 
                 if (ReadGotoSNP)
                 {
+                        if (noisy_boot_trace_enabled()) {
+                                fprintf(stderr, "[SNP] GotoSNP set! IPtr=0x%08X WPtr=0x%08X heartbeat=%llu\n",
+                                        IPtr, WPtr, (unsigned long long)heartbeat_counter);
+                                fflush(stderr);
+                        }
                         if (start_process ())
                                 return;
                 }
@@ -1805,21 +4093,96 @@ void mainloop (void)
         ResetRounding = FALSE;
 
         pslot = islot;
-        if (IPtr != Icache[islot = IHASH(IPtr)].IPtr)
+        islot = IHASH(IPtr);
+        if (unlikely(IPtr != Icache[islot].IPtr))
         {
                 PROFILE(profile[PRO_ICMISS]++);
                 Icache[islot].IPtr = IPtr;
                 SetCached(IPtr);
-                OReg = 0;
+                /* OReg is preserved across icache misses; do not reset here. */
+                /* Cache debug tracing for miss */
+                if (cache_debug_trace_enabled &&
+                    IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
+                        uint8_t mem_op0 = byte_int(IPtr);
+                        uint8_t mem_op1 = byte_int(IPtr + 1);
+                        uint8_t mem_op2 = byte_int(IPtr + 2);
+                        uint8_t mem_op3 = byte_int(IPtr + 3);
+                        fprintf(stderr,
+                                "[CACHE_MISS] slot=0x%X IPtr=0x%08X mem=%02X%02X%02X%02X OReg=0x%08X WPtr=0x%08X\n",
+                                islot, IPtr, mem_op0, mem_op1, mem_op2, mem_op3, OReg, WPtr);
+                }
 #ifdef EMUDEBUG
                 if (cachedebug)
                         printf ("-I-EMU414: Icache miss @ #%08X\n", IPtr);
 #endif
 
-FetchNext:      Instruction = byte_int (IPtr);
+FetchNext:
+                /*
+                 * Decode cache: OFF by default.
+                 * A previous attempt jumped to FastDispatch without writing
+                 * Icache[islot].{NextIPtr,OReg,Icode}, so the next direct-mapped
+                 * Icache hit loaded garbage and hung early boot at "SLG".
+                 * Re-enable only with T4_DCACHE=1 after filling Icache properly.
+                 */
+                if (dcache_enabled > 0 && __builtin_expect(OReg == 0, 1)) {
+                        dcache_entry_t *dc = dcache_lookup(&g_dcache, IPtr);
+                        if (!dc)
+                                dc = dcache_fill(&g_dcache, IPtr, mem, MemByteMask);
+                        if (dc && dc->next_ip > IPtr + 1) {
+                                OReg = (uint32_t)dc->operand;
+                                Icode = (u_char)(dc->opcode << 4);
+                                Instruction = (u_char)(Icode | (OReg & 0xF));
+                                IPtr = dc->next_ip - 1;
+                                /* Must populate Icache before execute — hit path
+                                 * reloads NextIPtr/OReg/Icode from this slot. */
+                                Icache[islot].NextIPtr = IPtr;
+                                Icache[islot].OReg     = OReg;
+                                Icache[islot].Icode    = Icode;
+#ifdef T4COMBINATIONS
+                                Icache[islot].Pcode = ProfileCode(Icode, OReg);
+#endif
+                                goto ExecuteInstr;
+                        }
+                }
+                /* Slow path: original decode */
+                Instruction = code_byte (IPtr);
 	        Icode = Instruction & 0xf0;
-	        Idata = Instruction & 0x0f;
-	        OReg  = OReg | Idata;
+                if (sk_entry_dump_enabled && !sk_entry_dumped && IPtr == sk_entry_iptr) {
+                        int off;
+                        fprintf(stderr, "[SKWPT] IPtr=0x%08X WPtr=0x%08X\n", IPtr, WPtr);
+                        for (off = -16; off <= 16; off += 4) {
+                                uint32_t addr = WPtr + off;
+                                uint32_t val = word_int(addr);
+                                fprintf(stderr,
+                                        "[SKWPT] 0x%08X: 0x%08X\n",
+                                        addr, val);
+                        }
+                        sk_entry_dumped = 1;
+                }
+                Idata = Instruction & 0x0f;
+                OReg = OReg + Idata;
+
+		if (sym_trace_entry && !sym_trace_active && IPtr == sym_trace_entry) {
+			if (sym_trace_skip > 0)
+				sym_trace_skip--;
+			else
+				sym_trace_active = 1;
+		}
+                if (sym_trace_active && sym_trace_remaining > 0) {
+                        fprintf(stderr,
+                                "[SYM_TRACE] func=%s IPtr=0x%08X Instruction=0x%02X Icode=0x%02X OReg=0x%08X Mnemo=%s AReg=0x%08X BReg=0x%08X CReg=0x%08X\n",
+                                sym_trace_name, IPtr, Instruction, Icode, OReg,
+                                mnemonic(Icode, OReg, AReg, 0), AReg, BReg, CReg);
+                        sym_trace_remaining--;
+                        if (sym_trace_remaining == 0)
+                                sym_trace_active = 0;
+                }
+                if (iptr_trace_enabled && IPtr >= iptr_trace_start && IPtr < iptr_trace_end) {
+                        fprintf(stderr,
+                                "[IPTR_TRACE] IPtr=0x%08X Instruction=0x%02X Icode=0x%02X OReg=0x%08X Mnemo=%s AReg=0x%08X BReg=0x%08X CReg=0x%08X\n",
+                                IPtr, Instruction, Icode, OReg,
+                                mnemonic(Icode, OReg, AReg, 0), AReg, BReg, CReg);
+                }
 
 #ifdef EMUDEBUG
                 if (cachedebug)
@@ -1831,6 +4194,13 @@ FetchNext:      Instruction = byte_int (IPtr);
                 {
 		        OReg = OReg << 4;
 			IPtr++;
+			/* Batch skip consecutive PFIX 0 bytes (NOP padding).
+			 * Each PFIX 0 just shifts OReg left by 4 with no data.
+			 * Skip them all in one tight loop. */
+			while (code_byte(IPtr) == 0x20) {
+			        OReg <<= 4;
+			        IPtr++;
+			}
                         goto FetchNext;
                 }
                 else if (0x60 == Icode)
@@ -1839,9 +4209,22 @@ FetchNext:      Instruction = byte_int (IPtr);
 			IPtr++;
                         goto FetchNext;
                 }
+                if (bootdbg_enabled && IPtr >= 0x80000190 && IPtr <= 0x80000198) {
+                        fprintf(stderr,
+                                "[BOOTDBG2] OReg new=0x%08X IPtr=0x%08X Icode=0x%02X Idata=0x%X\n",
+                                OReg, IPtr, Icode, Idata);
+                }
                 Icache[islot].NextIPtr = IPtr;
                 Icache[islot].OReg     = OReg;
                 Icache[islot].Icode    = Icode;
+                /* Cache debug tracing for store */
+                if (cache_debug_trace_enabled &&
+                    Icache[islot].IPtr >= cache_debug_trace_start &&
+                    Icache[islot].IPtr < cache_debug_trace_end) {
+                        fprintf(stderr,
+                                "[CACHE_STORE] slot=0x%X origIPtr=0x%08X NextIPtr=0x%08X OReg=0x%08X Icode=0x%02X WPtr=0x%08X\n",
+                                islot, Icache[islot].IPtr, IPtr, OReg, Icode, WPtr);
+                }
 
 #ifdef EMUDEBUG
                 Icache[islot].Instruction = Instruction;
@@ -1868,7 +4251,6 @@ FetchNext:      Instruction = byte_int (IPtr);
                                 Icache[pslot].OReg  = combined[i].ccode;
                                 Icache[pslot].Icode = 0xF0;
                                 Icache[pslot].Pcode = ProfileCode (Icache[pslot].Icode, Icache[pslot].OReg);
-
                                 EMUDBG4 ("-I-EMU414: OReg=#%X Arg0=#%X Arg1=#%X\n", Icache[pslot].OReg, Acache[pslot]._Arg0, Acache[pslot]._Arg1);
                         }
                 }
@@ -1882,8 +4264,178 @@ FetchNext:      Instruction = byte_int (IPtr);
         IPtr  = Icache[islot].NextIPtr;
         OReg  = Icache[islot].OReg;
         Icode = Icache[islot].Icode;
+        /* Cache debug tracing */
+        if (cache_debug_trace_enabled &&
+            IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
+                uint8_t mem_op0 = byte_int(Icache[islot].IPtr);
+                uint8_t mem_op1 = byte_int(Icache[islot].IPtr + 1);
+                uint8_t mem_op2 = byte_int(Icache[islot].IPtr + 2);
+                uint8_t mem_op3 = byte_int(Icache[islot].IPtr + 3);
+                fprintf(stderr,
+                        "[CACHE_HIT] slot=0x%X origIPtr=0x%08X NextIPtr=0x%08X OReg=0x%08X Icode=0x%02X mem=%02X%02X%02X%02X WPtr=0x%08X\n",
+                        islot, Icache[islot].IPtr, IPtr, OReg, Icode,
+                        mem_op0, mem_op1, mem_op2, mem_op3, WPtr);
+        }
 
 ExecuteInstr:
+	/* Feed the T9000 grouper model (T4_T9000=1); no cost when disabled. */
+	if (__builtin_expect(t9k.enabled, 0)) {
+		/* Icache[islot].IPtr is the start of the whole prefixed
+		 * instruction (the slot is hashed once, before the pfix/nfix
+		 * loop), so this is the encoded length the fetcher must pull. */
+		int t9k_bytes = (int)(IPtr - Icache[islot].IPtr);
+		if (Icode == 0xf0) {
+			int lat, kind = t9k_class_opr((int)OReg, CReg,
+						      vec_len, &lat);
+			t9k_issue(kind, lat, t9k_bytes);
+		} else {
+			t9k_issue(t9k_class_primary(Icode >> 4, OReg), 1,
+				  t9k_bytes);
+		}
+	}
+	if (IPtr < MemStart &&
+	    !(t4_sd_boot_enabled() &&
+	      (IPtr - BOOTBANK_BASE < BOOTBANK_SIZE ||
+	       (IPtr >= SD_BASE && IPtr < SD_LIMIT)))) {
+		fault_history_dump("execution left configured RAM");
+		/* Fatal: continuing would fetch from a negative mem[] index
+		 * (host SIGSEGV) or spin in garbage until timeout.  Stop with
+		 * a diagnostic instead — both prior failure faces become
+		 * this one message. */
+		fprintf(stderr,
+			"[WILDEXEC] IPtr=0x%08X left RAM (MemStart=0x%08X) "
+			"WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X — halting\n",
+			IPtr, MemStart, WPtr, AReg, BReg, CReg);
+		fflush(NULL);
+		exit(2);
+	}
+	heartbeat_counter++;
+	/* T4_IPTR_SAMPLE=N: every N instructions, record IPtr into a ring;
+	 * dumped at exit as a sorted histogram (hot-loop profiler). */
+	{
+		static uint64_t smp_every = 0, smp_next = 0;
+		if (__builtin_expect(smp_every == 0, 0)) {
+			extern void t4_iptr_sample_dump(void);
+			const char *e = getenv("T4_IPTR_SAMPLE");
+			smp_every = (e && *e) ? strtoull(e, NULL, 0) : ~0ULL;
+			if (smp_every == 0)
+				smp_every = ~0ULL;
+			if (smp_every != ~0ULL)
+				atexit(t4_iptr_sample_dump);
+			smp_next = smp_every;
+		}
+		if (__builtin_expect(heartbeat_counter >= smp_next, 0)
+		    && smp_every != ~0ULL) {
+			extern uint32_t iptr_samples[8192];
+			extern uint32_t iptr_sample_n;
+			smp_next = heartbeat_counter + smp_every;
+			iptr_samples[iptr_sample_n & 8191u] = IPtr;
+			wptr_samples[iptr_sample_n & 8191u] = WPtr;
+			iptr_sample_n++;
+			if (iptr_sample_n == 0)
+				iptr_sample_n = 8192; /* saturate wrap flag */
+			if ((iptr_sample_n & 2047u) == 0) {
+				uint32_t k;
+				const char *dw;
+				fprintf(stderr,
+					"[LIVE-FRAME] IPtr=0x%08X WPtr=0x%08X\n",
+					IPtr, WPtr);
+				for (k = 0; k < 32; k++)
+					fprintf(stderr, "W%-2u 0x%08X\n", k,
+						word_int(WPtr + 4u * k));
+				/* last write-watch hits (see writeword_int) */
+				{
+					extern uint32_t watch_ring[128][3];
+					extern uint32_t watch_ring_n;
+					uint32_t nback = watch_ring_n < 16u
+					    ? watch_ring_n : 16u;
+					for (k = 0; k < nback; k++) {
+						uint32_t idx =
+						    (watch_ring_n - nback + k)
+						    & 127u;
+						fprintf(stderr,
+							"WW val=0x%08X "
+							"IPtr=0x%08X hb=%u\n",
+							watch_ring[idx][0],
+							watch_ring[idx][1],
+							watch_ring[idx][2]);
+					}
+				}
+				/* T4_DUMP_WORDS=a[:n],b[:m],...: print n words
+				 * starting at each address (default 1) */
+				dw = getenv("T4_DUMP_WORDS");
+				while (dw && *dw) {
+					char *end;
+					uint32_t a = (uint32_t)
+					    strtoul(dw, &end, 0);
+					uint32_t cnt = 1, j;
+					if (end && *end == ':')
+						cnt = (uint32_t)
+						    strtoul(end + 1, NULL, 0);
+					if (cnt > 256)
+						cnt = 256;
+					for (j = 0; j < cnt; j++)
+						fprintf(stderr,
+							"M 0x%08X 0x%08X\n",
+							a + 4*j,
+							word_int(a + 4*j));
+					dw = strchr(dw, ',');
+					if (dw)
+						dw++;
+				}
+				fflush(stderr);
+			}
+		}
+	}
+	/* headless framebuffer video capture (see t4_fb_record_poll) */
+	{
+		static uint64_t rec_every = 0;   /* 0 = unresolved, ~0 = off */
+		static uint64_t rec_next = 0;
+		if (__builtin_expect(rec_every == 0, 0)) {
+			const char *e = getenv("T4_FB_RECORD");
+			rec_every = (e && *e) ? strtoull(e, NULL, 0) : ~0ULL;
+			if (rec_every == 0)
+				rec_every = ~0ULL;
+			rec_next = rec_every;
+		}
+		if (__builtin_expect(heartbeat_counter >= rec_next, 0)
+		    && rec_every != ~0ULL) {
+			rec_next = heartbeat_counter + rec_every;
+			t4_fb_record_poll();
+		}
+	}
+	if (__builtin_expect(production_quiet, 1))
+		goto FastDispatch;
+	fault_history_record(IPtr, WPtr, AReg, BReg, CReg, OReg, Icode);
+	/* TEMP: T4_WPTR_RANGE=lo,hi dumps up to 20 times when IPtr in [lo,hi]. */
+	{
+		static uint32_t wlo = 0, whi = 0;
+		static int wrange_left = -1;
+		if (wrange_left < 0) {
+			const char *e = getenv("T4_WPTR_RANGE");
+			if (e && *e) {
+				unsigned long a = 0, b = 0;
+				if (sscanf(e, "%li,%li", &a, &b) == 2) {
+					wlo = (uint32_t)a;
+					whi = (uint32_t)b;
+					wrange_left = 20;
+				} else
+					wrange_left = 0;
+			} else
+				wrange_left = 0;
+		}
+		if (wrange_left > 0 && IPtr >= wlo && IPtr <= whi) {
+			fprintf(stderr,
+				"[WPTR_RANGE] IPtr=0x%08X WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X O=0x%08X Icode=0x%02X\n",
+				IPtr, WPtr, AReg, BReg, CReg, OReg, Icode);
+			fprintf(stderr, "  W[7]=0x%08X W[9]=0x%08X W[10]=0x%08X W[23]=0x%08X W[24]=0x%08X\n",
+				word_int(index(WPtr, 7)), word_int(index(WPtr, 9)),
+				word_int(index(WPtr, 10)), word_int(index(WPtr, 23)),
+				word_int(index(WPtr, 24)));
+			fflush(stderr);
+			wrange_left--;
+		}
+	}
 #ifdef EMUDEBUG
         Instruction = Icache[islot].Instruction;
         if (cachedebug)
@@ -1969,60 +4521,211 @@ ExecuteInstr:
 		add_profile (Icode);
 #endif
 
+	/* Periodic memory integrity check */
+	{
+	    static uint32_t watch_idx = 0xFFFFFFFF;
+	    static u_char watch_expected = 0;
+	    static int watch_init = 0;
+	    if (!watch_init) {
+	        const char *wa = getenv("T4_WATCH_ADDR");
+	        if (wa) {
+	            uint32_t addr = (uint32_t)strtoul(wa, NULL, 16);
+	            watch_idx = addr & MemByteMask;
+	            /* Check offset +2 since that's where the corruption happens */
+	            watch_idx += 2;
+	            watch_expected = mem[watch_idx];
+	            fprintf(stderr, "[WATCH_INIT] monitoring mem[0x%X] = 0x%02X\n", watch_idx, watch_expected);
+	        }
+	        watch_init = 1;
+	    }
+	    if (watch_idx != 0xFFFFFFFF && (heartbeat_counter % 1000) == 0) {
+	        u_char cur = mem[watch_idx];
+	        if (cur != watch_expected) {
+	            fprintf(stderr, "[WATCH_CORRUPT] mem[0x%X] changed 0x%02X->0x%02X at hb=%llu IPtr=0x%08X WPtr=0x%08X\n",
+	                    watch_idx, watch_expected, cur, (unsigned long long)heartbeat_counter, IPtr, WPtr);
+	            watch_expected = cur;  /* Only report once */
+	        }
+	    }
+	}
+	if (noisy_boot_trace_enabled() && (heartbeat_counter % 100) == 0) {
+		fprintf(stderr, "[HB] %llu IPtr=0x%08X WPtr=0x%08X AReg=0x%08X Icode=0x%02X\n",
+			(unsigned long long)heartbeat_counter, IPtr, WPtr, AReg, Icode);
+		fflush(stderr);
+	}
+
+FastDispatch:
 	switch (Icode)
 	{
 		case 0x00: /* j     */
 			   IPtr++;
-			   IPtr = IPtr + OReg;
-			   D_check();
+			   if (OReg == 0 && EnableJ0BreakFlag) {
+			           handle_j0_break();
+			   } else {
+			           IPtr = IPtr + OReg;
+			           D_check();
+			   }
 			   break;
 		case 0x10: /* ldlp  */
-			   CReg = BReg;
-			   BReg = AReg;
-			   AReg = index (WPtr, OReg);
+			   {
+			       uint32_t oldA = AReg;
+			       CReg = BReg;
+			       BReg = AReg;
+			       AReg = index (WPtr, OReg);
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] LDLP IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X WPtr=0x%08X\n",
+			                   IPtr, OReg, oldA, AReg, WPtr);
+			       }
+			       if (sk_addr_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKADDR] LDLP IPtr=0x%08X OReg=0x%X WPtr=0x%08X addr=0x%08X\n",
+			                   IPtr, OReg, WPtr, AReg);
+			       }
+			   }
 			   IPtr++;
 			   break;
 		case 0x20: /* pfix  */
-			   OReg = OReg << 4;
 			   IPtr++;
 			   break;
 		case 0x30: /* ldnl  */
                            T4DEBUG(checkWordAligned ("LDNL", AReg));
-			   AReg = word (index (AReg, OReg));
+			   {
+			       uint32_t oldA = AReg;
+			       uint32_t addr = index(AReg, OReg);
+			       uint32_t value = word(addr);
+			       /* Debug: Show critical ldnl operations in bootstrap range */
+			       if (IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			           printf("[LDNL] IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X value=0x%08X\n",
+			                  IPtr, AReg, OReg, addr, value);
+			       }
+			       AReg = value;
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] LDNL IPtr=0x%08X OReg=0x%X addr=0x%08X AReg:0x%08X->0x%08X\n",
+			                   IPtr, OReg, addr, oldA, AReg);
+			       }
+			       if (sk_addr_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKADDR] LDNL IPtr=0x%08X OReg=0x%X addr=0x%08X value=0x%08X\n",
+			                   IPtr, OReg, addr, value);
+			       }
+			   }
 			   IPtr++;
 			   break;
 		case 0x40: /* ldc   */
-			   CReg = BReg;
-			   BReg = AReg;
-			   AReg = OReg;
+			   {
+			       uint32_t oldA = AReg;
+			       CReg = BReg;
+			       BReg = AReg;
+			       AReg = OReg;
+			       /* Optional trace for framebuffer-address LDC spam during kernel boot.
+			        * Leave this off by default so boot logs stay readable. */
+			       if (trace_fb_ldc_enabled && fb_addr_in_range(AReg)) {
+			           fprintf(stderr, "[FB_LDC] IPtr=0x%08X loaded=0x%08X\n", IPtr, AReg);
+			       }
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] LDC IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X\n",
+			                   IPtr, OReg, oldA, AReg);
+			       }
+			   }
 			   IPtr++;
 			   break;
 		case 0x50: /* ldnlp */
                            /* NB. Minix demo uses unaligned AReg! */
                            T4DEBUG(checkWordAligned ("LDNLP", AReg));
-			   AReg = index (AReg, OReg);
+			   {
+			       uint32_t oldA = AReg;
+			       AReg = index (AReg, OReg);
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] LDNLP IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X\n",
+			                   IPtr, OReg, oldA, AReg);
+			       }
+			   }
 			   IPtr++;
 			   break;
 		case 0x60: /* nfix  */
-			   OReg = (~OReg) << 4;
 			   IPtr++;
 			   break;
 		case 0x70: /* ldl   */
-			   CReg = BReg;
-			   BReg = AReg;
-			   AReg = word (index (WPtr, OReg));
+			   {
+			       uint32_t oldA = AReg;
+			       uint32_t addr = index(WPtr, OReg);
+			       CReg = BReg;
+			       BReg = AReg;
+			       AReg = word(addr);
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] LDL IPtr=0x%08X OReg=0x%X addr=0x%08X AReg:0x%08X->0x%08X\n",
+			                   IPtr, OReg, addr, oldA, AReg);
+			       }
+			       if (sk_addr_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKADDR] LDL IPtr=0x%08X OReg=0x%X WPtr=0x%08X addr=0x%08X value=0x%08X\n",
+			                   IPtr, OReg, WPtr, addr, AReg);
+			       }
+			   }
+			   /* Debug: Trace ldl in bootstrap range */
+			   if (noisy_boot_trace_enabled() &&
+			       IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			       printf("[LDL] IPtr=0x%08X local=%d addr=0x%08X value=0x%08X → AReg\n",
+			              IPtr, OReg, index(WPtr, OReg), AReg);
+			   }
 			   IPtr++;
 			   break;
 		case 0x80: /* adc   */
 			   t4_overflow = FALSE;
 			   t4_carry = 0;
-			   AReg = t4_eadd32 (AReg, OReg);
+			   {
+			       uint32_t oldA = AReg;
+			       AReg = t4_eadd32 (AReg, OReg);
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] ADC IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X\n",
+			                   IPtr, OReg, oldA, AReg);
+			       }
+			   }
 			   if (t4_overflow == TRUE)
 				SetError;
 			   IPtr++;
 			   break;
 		case 0x90: /* call  */
 			   IPtr++;
+			   /* Log kernel function calls */
+			   if (noisy_boot_trace_enabled() &&
+			       IPtr >= 0x80000000 && IPtr < 0x81000000) {
+			       printf("[CALL] from=0x%08X to=0x%08X WPtr=0x%08X→0x%08X\n",
+			              IPtr - 1, IPtr + OReg, WPtr, index(WPtr, -4));
+			   }
+			   maybe_log_nearest_sym(IPtr - 1, "CALL");
+			   if (wptr_trace_enabled) {
+			       printf("[WPtr] CALL IPtr=0x%08X target=0x%08X WPtr=0x%08X→0x%08X\n",
+			              IPtr - 1, IPtr + OReg, WPtr, index(WPtr, -4));
+			   }
+			   if (bootdbg_stop_after_call_enabled &&
+			       (IPtr - 1) >= boot_call_start && (IPtr - 1) <= boot_call_end) {
+			       last_boot_call_is_gcall = 0;
+			       last_boot_call_site = IPtr - 1;
+			       last_boot_call_target = IPtr + OReg;
+			       last_boot_call_return = IPtr;
+			       last_boot_call_wptr = WPtr;
+			       maybe_auto_text_base();
+			       stop_after_boot_call = 1;
+			       if (bootdbg_enabled)
+			               fprintf(stderr,
+			                       "[BOOTDBG] armed stop after CALL @ 0x%08X target=0x%08X return=0x%08X\n",
+			                       last_boot_call_site, last_boot_call_target, last_boot_call_return);
+			   }
 			   writeword (index (WPtr, -1), CReg);
 			   writeword (index (WPtr, -2), BReg);
 			   writeword (index (WPtr, -3), AReg);
@@ -2033,22 +4736,91 @@ ExecuteInstr:
                            /* Pop BReg. */
                            BReg = CReg;
 			   IPtr = IPtr + OReg;
+			   /* TEMP: dump CALL frame when T4_CALL_DUMP=1 (first 40 only). */
+			   {
+				   static int call_dump_left = -1;
+				   if (call_dump_left < 0) {
+					   const char *e = getenv("T4_CALL_DUMP");
+					   call_dump_left = (e && *e) ? 40 : 0;
+				   }
+				   if (call_dump_left > 0) {
+					   call_dump_left--;
+					   fprintf(stderr,
+						   "[CALLFRAME] ret=0x%08X A=0x%08X B=0x%08X C=0x%08X "
+						   "W[0]=0x%08X W[1]=0x%08X W[2]=0x%08X W[3]=0x%08X "
+						   "target=0x%08X\n",
+						   AReg,
+						   word_int(index(WPtr, 1)),
+						   word_int(index(WPtr, 2)),
+						   word_int(index(WPtr, 3)),
+						   word_int(index(WPtr, 0)),
+						   word_int(index(WPtr, 1)),
+						   word_int(index(WPtr, 2)),
+						   word_int(index(WPtr, 3)),
+						   IPtr);
+				   }
+			   }
+			   /* Cache debug tracing for CALL target */
+			   if (cache_debug_trace_enabled &&
+			       IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
+			       uint8_t t0 = byte_int(IPtr);
+			       uint8_t t1 = byte_int(IPtr + 1);
+			       uint8_t t2 = byte_int(IPtr + 2);
+			       uint8_t t3 = byte_int(IPtr + 3);
+			       uint8_t t4 = byte_int(IPtr + 4);
+			       uint8_t t5 = byte_int(IPtr + 5);
+			       uint8_t t6 = byte_int(IPtr + 6);
+			       uint8_t t7 = byte_int(IPtr + 7);
+			       fprintf(stderr,
+			               "[CALL_TARGET] IPtr=0x%08X bytes=%02X%02X%02X%02X%02X%02X%02X%02X WPtr=0x%08X ret=0x%08X\n",
+			               IPtr, t0, t1, t2, t3, t4, t5, t6, t7, WPtr, AReg);
+			   }
 			   break;
 		case 0xa0: /* cj    */
-			   IPtr++;
 			   if (AReg != 0)
 			   {
 				AReg = BReg;
 				BReg = CReg;
+				IPtr++;
 			   }
 			   else
 			   {
+				IPtr++;
 				IPtr = IPtr + OReg;
 			   }
 			   break;
 		case 0xb0: /* ajw   */
-                           UpdateWdescReg (index (WPtr, OReg) | ProcPriority);
-                           T4DEBUG(checkWPtr ("AJW", WPtr));
+			   {
+			       /* OReg is already correctly set by prefix instructions (PFIX/NFIX).
+			        * NFIX complements OReg for negative values.
+			        * No sign-extension needed here - bare 4-bit values 0-15 are positive. */
+			       int32_t delta = (int32_t)OReg;
+			       uint32_t new_wptr = index(WPtr, delta);
+			       /* Cache debug tracing for AJW */
+			       if (cache_debug_trace_enabled &&
+			           IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
+			           fprintf(stderr,
+			                   "[AJW_DEBUG] IPtr=0x%08X OReg=0x%08X delta=%d WPtr=0x%08X→0x%08X\n",
+			                   IPtr, OReg, delta, WPtr, new_wptr);
+			       }
+			       /* Log ALL workspace changes in bootstrap range, or significant changes in kernel */
+			       if (noisy_boot_trace_enabled() &&
+			           ((IPtr >= 0x80000070 && IPtr <= 0x80000200) ||
+			            (IPtr >= 0x80000000 && IPtr < 0x81000000 && (delta > 10 || delta < -10)))) {
+			           printf("[AJW] IPtr=0x%08X delta=%d WPtr=0x%08X→0x%08X\n",
+			                  IPtr, delta, WPtr, new_wptr);
+			       }
+			       /* Validate workspace pointer - use actual configured memory size */
+			       if (new_wptr == 0x2FFA2FFA || new_wptr < MemStart ||
+			           (uint64_t)new_wptr >= (uint64_t)MemStart + (uint64_t)MemSize) {
+			           printf("[ERROR] Invalid WPtr after ajw: 0x%08X at IPtr=0x%08X (valid range: 0x%08X-0x%08X)\n",
+			                  new_wptr, IPtr, MemStart,
+			                  (uint32_t)((uint64_t)MemStart + (uint64_t)MemSize - 1));
+			           fault_history_dump("invalid AJW workspace");
+			       }
+                               UpdateWdescReg (new_wptr | ProcPriority);
+                               T4DEBUG(checkWPtr ("AJW", WPtr));
+			   }
 			   IPtr++;
 			   break;
 		case 0xc0: /* eqc   */
@@ -2063,26 +4835,147 @@ ExecuteInstr:
 			   IPtr++;
 			   break;
 		case 0xd0: /* stl   */
-			   writeword (index (WPtr, OReg), AReg);
+			   {
+			       uint32_t addr = index(WPtr, OReg);
+			       if (text_write_trace_enabled &&
+			           addr >= text_write_trace_start &&
+			           addr < text_write_trace_end) {
+			           uint32_t delta = 0;
+			           const link_sym *lsym = find_link_sym(IPtr, &delta);
+			           const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+			           fprintf(stderr,
+			                   "[TEXT_STL] IPtr=0x%08X WPtr=0x%08X OReg=0x%X addr=0x%08X AReg=0x%08X%s%s\n",
+			                   IPtr, WPtr, OReg, addr, AReg,
+			                   (lsym || sym) ? " sym=" : "",
+			                   lsym ? lsym->name : (sym ? sym->name : ""));
+			           if (lsym) {
+			               fprintf(stderr, "            sym_off=0x%X+0x%X\n",
+			                       lsym->sym_off, delta);
+			           } else if (sym) {
+			               fprintf(stderr, "            sym_off=0x%X+0x%X\n",
+			                       sym->text_off, delta);
+			           }
+			       }
+			       writeword(addr, AReg);
+			   }
+			   /* Debug: Trace stl in bootstrap range */
+			   if (noisy_boot_trace_enabled() &&
+			       IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			       printf("[STL] IPtr=0x%08X local=%d addr=0x%08X AReg=0x%08X stored\n",
+			              IPtr, OReg, index(WPtr, OReg), AReg);
+			   }
+			   if (sk_store_trace_enabled && sk_entry_iptr &&
+			       IPtr >= sk_entry_iptr && IPtr <= (sk_entry_iptr + 0x200)) {
+			       printf("[SKSTL] IPtr=0x%08X local=%d addr=0x%08X AReg=0x%08X\n",
+			              IPtr, OReg, index(WPtr, OReg), AReg);
+			   }
+			   if (sk_areg_trace_enabled &&
+			       IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			       fprintf(stderr,
+			               "[SKA] STL IPtr=0x%08X AReg:0x%08X->0x%08X\n",
+			               IPtr, AReg, BReg);
+			   }
 			   AReg = BReg;
 			   BReg = CReg;
 			   IPtr++;
 			   break;
 		case 0xe0: /* stnl  */
                            T4DEBUG(checkWordAligned ("STNL", AReg));
+			   /* Debug: catch any STNL to framebuffer/VGA area */
+			   {
+			       uint32_t stnl_addr = index(AReg, OReg);
+			       /* Trace VGA register writes (0xA0000000 range) */
+			       if ((stnl_addr & 0xFFFFF000) == 0xA0000000) {
+			           fprintf(stderr, "[VGA_STNL] IPtr=0x%08X addr=0x%08X val=0x%08X\n",
+			                   IPtr, stnl_addr, BReg);
+			       }
+			       /* VGA screenshot trigger: write 0x5356 ("SV") to VGA control saves framebuffer */
+			       if (stnl_addr == 0xA0000000 && BReg == 0x5356) {
+			           static int screenshot_count = 0;
+			           char sname[64];
+			           snprintf(sname, sizeof(sname), "screenshot_%d.bmp", screenshot_count++);
+			           vga_dump_framebuffer_bmp(sname, screenshot_count - 1);
+			       }
+			       /* Debug: trace ALL STNLs in setup_arch to find FB writes */
+			       if (IPtr >= 0x8053c57b && IPtr < 0x8053d57b) {
+			           static int setup_stnl_count = 0;
+			           if (setup_stnl_count < 200) {
+			               fprintf(stderr, "[SETUP_STNL#%d] IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X val=0x%08X\n",
+			                       setup_stnl_count, IPtr, AReg, OReg, stnl_addr, BReg);
+			               setup_stnl_count++;
+			           }
+			       }
+			       if (fb_addr_in_range(stnl_addr)) {
+			           static int fb_stnl_count = 0;
+			           if (fb_stnl_count < 50) {
+			               fprintf(stderr, "[FB_STNL#%d] IPtr=0x%08X addr=0x%08X val=0x%08X\n",
+			                       fb_stnl_count, IPtr, stnl_addr, BReg);
+			               fb_stnl_count++;
+			           }
+			       }
+			   }
+			   if (bootdbg_enabled && IPtr >= 0x80883FE0 && IPtr <= 0x80884020) {
+			       uint32_t addr = index(AReg, OReg);
+			       fprintf(stderr, "[BOOTDBG] STNL IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X BReg=0x%08X\n",
+			               IPtr, AReg, OReg, addr, BReg);
+			   }
+			   if (sk_store_trace_enabled && sk_entry_iptr &&
+			       IPtr >= sk_entry_iptr && IPtr <= (sk_entry_iptr + 0x200)) {
+			       uint32_t addr = index(AReg, OReg);
+			       printf("[SKSTNL] IPtr=0x%08X addr=0x%08X BReg=0x%08X\n",
+			              IPtr, addr, BReg);
+			   }
+			   {
+			       uint32_t addr = index(AReg, OReg);
+			       if (text_write_trace_enabled &&
+			           addr >= 0x80880000 && addr < 0x80890000) {
+			           uint32_t delta = 0;
+			           const link_sym *lsym = find_link_sym(IPtr, &delta);
+			           const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+			           fprintf(stderr,
+			                   "[TEXT_STNL] IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X BReg=0x%08X WPtr=0x%08X%s%s\n",
+			                   IPtr, AReg, OReg, addr, BReg, WPtr,
+			                   (lsym || sym) ? " sym=" : "",
+			                   lsym ? lsym->name : (sym ? sym->name : ""));
+			           if (lsym) {
+			               fprintf(stderr, "             sym_off=0x%X+0x%X\n",
+			                       lsym->sym_off, delta);
+			           } else if (sym) {
+			               fprintf(stderr, "             sym_off=0x%X+0x%X\n",
+			                       sym->text_off, delta);
+			           }
+			       }
+			   }
 			   writeword (index (AReg, OReg), BReg);
+			   if (sk_areg_trace_enabled &&
+			       IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			       fprintf(stderr,
+			               "[SKA] STNL IPtr=0x%08X AReg:0x%08X->0x%08X\n",
+			               IPtr, AReg, CReg);
+			   }
 			   AReg = CReg;
 			   IPtr++;
 			   break;
 		case 0xf0: /* opr   */
 
 	PROFILEINSTR(add_profile (0x100 + OReg));
+	/* T9000: privileged secondaries trap when running as P-process. */
+	t9k_check_priv_op(OReg);
 	switch (OReg)
 	{
 		case 0x00: /* rev         */
-			   temp = AReg;
-			   AReg = BReg;
-			   BReg = temp;
+			   {
+			       uint32_t oldA = AReg;
+			       temp = AReg;
+			       AReg = BReg;
+			       BReg = temp;
+			       if (sk_areg_trace_enabled &&
+			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			           fprintf(stderr,
+			                   "[SKA] REV IPtr=0x%08X AReg:0x%08X->0x%08X BReg=0x%08X\n",
+			                   IPtr, oldA, AReg, BReg);
+			       }
+			   }
 			   IPtr++;
 			   break;
 		case 0x01: /* lb          */
@@ -2131,10 +5024,60 @@ ExecuteInstr:
 			   IPtr++;
 			   break;
 		case 0x06: /* gcall       */
+			   {
+			       uint32_t call_site = IPtr;
+			   /* Debug: Show gcall in bootstrap range */
+			   if (IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			       printf("[GCALL] IPtr=0x%08X AReg=0x%08X (target) WPtr=0x%08X BReg=0x%08X CReg=0x%08X\n",
+			              IPtr, AReg, WPtr, BReg, CReg);
+			   }
+			   maybe_log_nearest_sym(IPtr, "GCALL");
+			   if (wptr_trace_enabled) {
+			       printf("[WPtr] GCALL IPtr=0x%08X target=0x%08X WPtr=0x%08X\n",
+			              IPtr, AReg, WPtr);
+			   }
 			   IPtr++;
 			   temp = AReg;
 			   AReg = IPtr;
 			   IPtr = temp;
+			   /* Wild-jump detector: indirect call through a bad function
+			    * pointer (e.g. an un-relocated bFLT pointer) lands below
+			    * MemStart. Report the call site + eval stack once. */
+			   if (temp < MemStart &&
+			       !(t4_sd_boot_enabled() &&
+			         temp - BOOTBANK_BASE < BOOTBANK_SIZE)) {
+			       static int wj_gcall = 0;
+			       if (wj_gcall < 20) {
+			           printf("[WILDJUMP] GCALL from=0x%08X to=0x%08X (target<MemStart) "
+			                  "ret=0x%08X WPtr=0x%08X BReg=0x%08X CReg=0x%08X\n",
+			                  call_site, temp, AReg, WPtr, BReg, CReg);
+			           wj_gcall++;
+			       }
+			   }
+			   if (bootdbg_enabled && temp >= 0x804BAC00 && temp <= 0x804BB000) {
+			       fprintf(stderr,
+			               "[BOOTDBG] gcall target IPtr=0x%08X return_addr=0x%08X WPtr=0x%08X\n",
+			               IPtr, AReg, WPtr);
+			   }
+			   /* Show where we're jumping to */
+			   if (IPtr >= 0x80000070 && IPtr <= 0x80000200 || temp >= 0x80000070 && temp <= 0x80000200) {
+			       printf("[GCALL] Jumping to IPtr=0x%08X return_addr=0x%08X\n", IPtr, AReg);
+			   }
+			   last_boot_call_is_gcall = 1;
+			   last_boot_call_site = call_site;
+			   last_boot_call_target = IPtr;
+			   last_boot_call_return = AReg;
+			   last_boot_call_wptr = WPtr;
+			   maybe_auto_text_base();
+			   if (bootdbg_stop_after_call_enabled &&
+			       call_site >= boot_call_start && call_site <= boot_call_end) {
+			       stop_after_boot_call = 1;
+			       if (bootdbg_enabled)
+			               fprintf(stderr,
+			                       "[BOOTDBG] armed stop after GCALL @ 0x%08X target=0x%08X return=0x%08X\n",
+			                       last_boot_call_site, last_boot_call_target, last_boot_call_return);
+			   }
+			   }
 			   break;
 		case 0x07: /* in          */
 OprIn:                     if (IsLinkOut(BReg)) /* M.Bruestle 22.1.2012 */
@@ -2607,9 +5550,45 @@ DescheduleOutWord:
 			   IPtr++;
 			   break;
 		case 0x20: /* ret         */
-			   IPtr = word (WPtr);
-			   UpdateWdescReg (index (WPtr, 4) | ProcPriority);
-                           T4DEBUG(checkWPtr ("RET", WPtr));
+			   {
+			       uint32_t return_addr = word(WPtr);
+			       uint32_t new_wptr = index(WPtr, 4);
+			       uint32_t old_iptr = IPtr;
+			       /* Log kernel function returns */
+			       if (noisy_boot_trace_enabled() &&
+			           IPtr >= 0x80000000 && IPtr < 0x81000000) {
+			           printf("[RET] from=0x%08X to=0x%08X WPtr=0x%08X→0x%08X\n",
+			                  IPtr, return_addr, WPtr, new_wptr);
+			       }
+			       /* Validate return address */
+			       if (return_addr == 0x2FFA2FFA || return_addr == 0x80000000) {
+			           printf("[ERROR] Invalid return address 0x%08X at IPtr=0x%08X WPtr=0x%08X\n",
+			                  return_addr, IPtr, WPtr);
+			       }
+			       /* TCWG spec: "The ret instruction restores the Iptr and adjusts the
+			        * workspace pointer to deallocate the four locations." */
+			   if (return_addr < MemStart &&
+			       !(t4_sd_boot_enabled() &&
+			         return_addr - BOOTBANK_BASE < BOOTBANK_SIZE)) {
+			       fault_history_dump("wild RET target");
+			       static int wj_ret = 0;
+			           if (wj_ret < 20) {
+			               printf("[WILDJUMP] RET from=0x%08X to=0x%08X (ret<MemStart) WPtr=0x%08X\n",
+			                      old_iptr, return_addr, WPtr);
+			               wj_ret++;
+			           }
+			       }
+			       IPtr = return_addr;
+			       UpdateWdescReg (new_wptr | ProcPriority);
+                               T4DEBUG(checkWPtr ("RET", WPtr));
+			       /* Cache debug tracing for RET */
+			       if (cache_debug_trace_enabled &&
+			           (old_iptr >= cache_debug_trace_start && old_iptr < cache_debug_trace_end)) {
+			           fprintf(stderr,
+			                   "[RET_DEBUG] from=0x%08X to=0x%08X WPtr=0x%08X\n",
+			                   old_iptr, IPtr, WPtr);
+			       }
+			   }
 			   break;
 		case 0x21: /* lend        */ /****/
 			   temp = word (index (BReg, 1));
@@ -2885,6 +5864,22 @@ DescheduleOutWord:
 			   IPtr++;
 			   break;
 		case 0x3b: /* XXX sb          */
+			   if (sk_areg_trace_enabled &&
+			       IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
+			       fprintf(stderr,
+			               "[SKA] SB IPtr=0x%08X AReg=0x%08X BReg=0x%08X\n",
+			               IPtr, AReg, BReg);
+                               if (AReg == 0x10000000) {
+                                       fprintf(stderr,
+                                               "[SKA] SB_UART_HIT IPtr=0x%08X BReg=0x%08X\n",
+                                               IPtr, BReg);
+                               }
+			   }
+			   if (sk_store_trace_enabled && sk_entry_iptr &&
+			       IPtr >= sk_entry_iptr && IPtr <= (sk_entry_iptr + 0x200)) {
+			       printf("[SKSB] IPtr=0x%08X addr=0x%08X BReg=0x%08X\n",
+			              IPtr, AReg, BReg);
+			   }
 			   writebyte (AReg, BReg);
 			   AReg = CReg;
                            CReg = 0;
@@ -2894,6 +5889,10 @@ DescheduleOutWord:
                            /* XXX: proc prio toggle trick of AReg lsb=1       */
                            T4DEBUG(checkWordAligned ("GAJW", AReg));
 			   temp = AReg;
+                           if (wptr_trace_enabled) {
+                                   printf("[WPtr] GAJW IPtr=0x%08X WPtr=0x%08X→0x%08X\n",
+                                          IPtr, WPtr, temp);
+                           }
 			   AReg = WPtr;
 			   UpdateWdescReg (temp | ProcPriority);
                            T4DEBUG(checkWPtr ("GAJW", WPtr));
@@ -3253,15 +6252,46 @@ DescheduleOutWord:
 
 		case 0x5c: /* XXX move2dall    */
 		           BADCODE(IsT414);
+                           {
+                               int is_fb_flip = 0; /* screenshot via VGA register now */
                            if (INT32(m2dWidth) >= 0 && INT32(m2dLength) >= 0)
                            {
+#ifdef T4_SDL_FB
+                                /* Fast path: both src and dst entirely in FB */
+                                if (m2dWidth > 0 && m2dLength > 0 &&
+                                    fb_addr_in_range(m2dSourceAddress) &&
+                                    fb_addr_in_range(m2dSourceAddress + (m2dLength-1) * m2dSourceStride + m2dWidth - 1) &&
+                                    fb_addr_in_range(m2dDestAddress) &&
+                                    fb_addr_in_range(m2dDestAddress + (m2dLength-1) * m2dDestStride + m2dWidth - 1))
+                                {
+                                    u_char *fb = vga_framebuffer;
+                                    for (temp = 0; temp < m2dLength; temp++)
+                                    {
+                                        uint32_t doff, soff;
+                                        if (!fb_addr_to_offset(m2dDestAddress, &doff) ||
+                                            !fb_addr_to_offset(m2dSourceAddress, &soff))
+                                            break;
+                                        memmove(fb + doff, fb + soff, m2dWidth);
+                                        m2dSourceAddress += m2dSourceStride;
+                                        m2dDestAddress   += m2dDestStride;
+                                    }
+                                    vga_dirty = 1;
+                                }
+                                else
+#endif
+                                {
+                                if (is_fb_flip)
+                                    fprintf(stderr, "[MOVE2D_SLOW] fb_flip: dst=0x%08X src=0x%08X w=%d len=%d\n",
+                                            m2dDestAddress, m2dSourceAddress, m2dWidth, m2dLength);
                                 for (temp = 0; temp < m2dLength; temp++)
                                 {
                                         movebytes_int (m2dDestAddress, m2dSourceAddress, m2dWidth);
                                         m2dSourceAddress += m2dSourceStride;
                                         m2dDestAddress   += m2dDestStride;
                                 }
+                                } /* close else block */
                            }
+                           } /* end scope */
 #ifndef NDEBUG
                            m2dSourceStride = m2dDestStride = m2dLength = Undefined_p;
 #endif
@@ -3271,6 +6301,32 @@ DescheduleOutWord:
 		           BADCODE(IsT414);
                            if (INT32(m2dWidth) >= 0 && INT32(m2dLength) >= 0)
                            {
+#ifdef T4_SDL_FB
+                                /* Fast path: both src and dst entirely in FB */
+                                if (m2dWidth > 0 && m2dLength > 0 &&
+                                    fb_addr_in_range(m2dSourceAddress) &&
+                                    fb_addr_in_range(m2dSourceAddress + (m2dLength-1) * m2dSourceStride + m2dWidth - 1) &&
+                                    fb_addr_in_range(m2dDestAddress) &&
+                                    fb_addr_in_range(m2dDestAddress + (m2dLength-1) * m2dDestStride + m2dWidth - 1))
+                                {
+                                    u_char *fb = vga_framebuffer;
+                                    for (temp = 0; temp < m2dLength; temp++)
+                                    {
+                                        uint32_t doff, soff;
+                                        if (!fb_addr_to_offset(m2dDestAddress, &doff) ||
+                                            !fb_addr_to_offset(m2dSourceAddress, &soff))
+                                            break;
+                                        u_char *sp = fb + soff;
+                                        u_char *dp = fb + doff;
+                                        for (temp2 = 0; temp2 < m2dWidth; temp2++)
+                                            if (sp[temp2]) dp[temp2] = sp[temp2];
+                                        m2dSourceAddress += m2dSourceStride;
+                                        m2dDestAddress   += m2dDestStride;
+                                    }
+                                    vga_dirty = 1;
+                                }
+                                else
+#endif
                                 for (temp = 0; temp < m2dLength; temp++)
                                 {
                                         for (temp2 = 0; temp2 < m2dWidth; temp2++)
@@ -3292,6 +6348,32 @@ DescheduleOutWord:
 		           BADCODE(IsT414);
                            if (INT32(m2dWidth) >= 0 && INT32(m2dLength) >= 0)
                            {
+#ifdef T4_SDL_FB
+                                /* Fast path: both src and dst entirely in FB */
+                                if (m2dWidth > 0 && m2dLength > 0 &&
+                                    fb_addr_in_range(m2dSourceAddress) &&
+                                    fb_addr_in_range(m2dSourceAddress + (m2dLength-1) * m2dSourceStride + m2dWidth - 1) &&
+                                    fb_addr_in_range(m2dDestAddress) &&
+                                    fb_addr_in_range(m2dDestAddress + (m2dLength-1) * m2dDestStride + m2dWidth - 1))
+                                {
+                                    u_char *fb = vga_framebuffer;
+                                    for (temp = 0; temp < m2dLength; temp++)
+                                    {
+                                        uint32_t doff, soff;
+                                        if (!fb_addr_to_offset(m2dDestAddress, &doff) ||
+                                            !fb_addr_to_offset(m2dSourceAddress, &soff))
+                                            break;
+                                        u_char *sp = fb + soff;
+                                        u_char *dp = fb + doff;
+                                        for (temp2 = 0; temp2 < m2dWidth; temp2++)
+                                            if (sp[temp2] == 0) dp[temp2] = 0;
+                                        m2dSourceAddress += m2dSourceStride;
+                                        m2dDestAddress   += m2dDestStride;
+                                    }
+                                    vga_dirty = 1;
+                                }
+                                else
+#endif
                                 for (temp = 0; temp < m2dLength; temp++)
                                 {
                                         for (temp2 = 0; temp2 < m2dWidth; temp2++)
@@ -3313,6 +6395,60 @@ DescheduleOutWord:
 #undef m2dWidth
 #undef m2dDestAddress
 #undef m2dSourceAddress
+
+		case 0x5f: /* gtu - unsigned greater than (T800) */
+			   BADCODE(IsT414);
+			   /* AReg = (BReg >u AReg) ? 1 : 0 */
+			   temp = ((uint32_t)BReg > (uint32_t)AReg) ? 1 : 0;
+			   AReg = temp;
+			   BReg = CReg;
+			   CReg = Undefined_p;
+			   IPtr++;
+			   break;
+
+		/* ---- IMS T9000 narrow load/store/extend group -------------
+		 * These do not exist on the T414/T800/T805; they are modelled
+		 * here so that code built with tcc -mt9000 can be executed and
+		 * validated.  Memory is little-endian, matching the two-byte
+		 * sequences the T805 code generator emits for the same access.
+		 */
+		case 0xb8: /* xbword - extend byte to word              (T9000) */
+			   AReg = (uint32_t)(int32_t)(int8_t)(AReg & 0xFF);
+			   IPtr++;
+			   break;
+		case 0xb9: /* lbx - load byte and sign extend           (T9000) */
+			   AReg = (uint32_t)(int32_t)(int8_t)(byte (AReg) & 0xFF);
+			   IPtr++;
+			   break;
+		case 0xc1: /* ssub - 16 bit word subscript              (T9000) */
+			   /* AReg := AReg + 2*BReg (cf. bsub +1*, wsub +4*) */
+			   AReg = AReg + 2 * BReg;
+			   BReg = CReg;
+			   CReg = Undefined_p;
+			   IPtr++;
+			   break;
+		case 0xc8: /* ss - store sixteen                        (T9000) */
+			   writebyte (AReg,     BReg        & 0xFF);
+			   writebyte (AReg + 1, (BReg >> 8) & 0xFF);
+			   AReg = CReg;
+			   CReg = 0;
+			   IPtr++;
+			   break;
+		case 0xca: /* ls - load sixteen (zero extended)         (T9000) */
+			   AReg = (byte (AReg) & 0xFF)
+			        | ((byte (AReg + 1) & 0xFF) << 8);
+			   IPtr++;
+			   break;
+		case 0xf8: /* xsword - sign extend 16 bit word          (T9000) */
+			   AReg = (uint32_t)(int32_t)(int16_t)(AReg & 0xFFFF);
+			   IPtr++;
+			   break;
+		case 0xf9: /* lsx - load sixteen and sign extend        (T9000) */
+			   AReg = (uint32_t)(int32_t)(int16_t)
+			          (((byte (AReg) & 0xFF)
+			            | ((byte (AReg + 1) & 0xFF) << 8)) & 0xFFFF);
+			   IPtr++;
+			   break;
 
 		case 0x63: /* unpacksn    */
                            BADCODE(IsT800);
@@ -3487,7 +6623,50 @@ DescheduleOutWord:
                            BReg = CReg;
 		           IPtr++;
 		           break;
-                case 0x80: /* XXX fpsttest -- M.Bruestle  */
+		case 0xb1: /* break */
+			   IPtr++;
+			   handle_j0_break();
+			   break;
+		case 0xb2: /* clrj0break */
+			   EnableJ0BreakFlag = 0;
+			   IPtr++;
+			   break;
+		case 0xb3: /* setj0break */
+			   EnableJ0BreakFlag = 1;
+			   IPtr++;
+			   break;
+		case 0xb4: /* testj0break */
+			   CReg = BReg;
+			   BReg = AReg;
+			   AReg = EnableJ0BreakFlag ? true_t : false_t;
+			   IPtr++;
+			   break;
+		case 0x7a: /* timerdisableh */
+			   TimerEnableHi = 0;
+			   IPtr++;
+			   break;
+		case 0x7b: /* timerdisablel */
+			   TimerEnableLo = 0;
+			   IPtr++;
+			   break;
+		case 0x7c: /* timerenableh */
+			   TimerEnableHi = 1;
+			   IPtr++;
+			   break;
+		case 0x7d: /* timerenablel */
+			   TimerEnableLo = 1;
+			   IPtr++;
+			   break;
+		case 0x7e: /* ldmemstartval */
+			   CReg = BReg;
+			   BReg = AReg;
+			   AReg = MemStart;
+			   IPtr++;
+			   break;
+		case 0xfa: /* skip invalid opcode */
+			   IPtr++;
+			   break;
+		case 0x80: /* XXX fpsttest -- M.Bruestle  */
                            temp = FAReg.length;
                            if (FAReg.length == FP_REAL64)
                            {
@@ -4105,6 +7284,7 @@ DescheduleOutWord:
 			              break;
                            default  :  
                                       printf ("-E-EMU414: Error - bad Icode! (#%02X - %s)\n", OReg, mnemonic (Icode, OReg, AReg, 0));
+                                      maybe_log_nearest_sym(IPtr, "bad-icode");
                                       processor_state ();
 			              handler (-1);
 			              break;
@@ -4150,7 +7330,11 @@ DescheduleOutWord:
 			   IPtr++;
 		           PROFILE(profile[PRO_INSTR]++);
                            break;
-                case 0x102: /* eqc cj */
+                 case 0x102: /* eqc cj */
+			   /* Preserve exact standalone semantics for:
+			    *   EQC Arg0; CJ Arg1
+			    * EQC sets AReg to 1 when equal, else 0.
+			    * CJ pops on non-zero (continue), jumps on zero (no pop). */
 			   IPtr++;
 			   if (AReg == Arg0)
 			   {
@@ -4159,7 +7343,6 @@ DescheduleOutWord:
 			   }
 			   else
 			   {
-                                AReg = false_t;
 				IPtr = IPtr + Arg1;
 			   }
 		           PROFILE(profile[PRO_INSTR]++);
@@ -4270,7 +7453,31 @@ DescheduleOutWord:
 			   BReg = AReg;
 			   AReg = word (index (WPtr, Arg0));
                            T4DEBUG(checkWordAligned ("STNL", AReg));
-			   writeword (index (AReg, Arg1), BReg);
+			   {
+			       uint32_t addr = index (AReg, Arg1);
+			       /* Debug: catch framebuffer combo stores */
+			       if (fb_addr_in_range(addr)) {
+			           static int fb_combo_count = 0;
+			           if (fb_combo_count < 50) {
+			               fprintf(stderr, "[FB_LDL_STNL#%d] IPtr=0x%08X addr=0x%08X val=0x%08X\n",
+			                       fb_combo_count, IPtr, addr, BReg);
+			               fb_combo_count++;
+			           }
+			       }
+			       if (text_write_trace_enabled &&
+			           addr >= text_write_trace_start &&
+			           addr < text_write_trace_end) {
+			           uint32_t delta = 0;
+			           const link_sym *lsym = find_link_sym(IPtr, &delta);
+			           const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+			           fprintf(stderr,
+			                   "[TEXT_STNL_COMBO] IPtr=0x%08X addr=0x%08X BReg=0x%08X WPtr=0x%08X%s%s\n",
+			                   IPtr, addr, BReg, WPtr,
+			                   (lsym || sym) ? " sym=" : "",
+			                   lsym ? lsym->name : (sym ? sym->name : ""));
+			       }
+			       writeword (addr, BReg);
+			   }
 			   AReg = CReg;
 			   IPtr++;
 		           PROFILE(profile[PRO_INSTR]++);
@@ -4320,7 +7527,31 @@ DescheduleOutWord:
 			   AReg = index (AReg, BReg);
 			   BReg = CReg;
                            T4DEBUG(checkWordAligned ("STNL", AReg));
-			   writeword (index (AReg, Arg1), BReg);
+			   {
+			       uint32_t addr = index (AReg, Arg1);
+			       /* Debug: catch framebuffer combo stores */
+			       if (fb_addr_in_range(addr)) {
+			           static int fb_wsub_count = 0;
+			           if (fb_wsub_count < 50) {
+			               fprintf(stderr, "[FB_WSUB_STNL#%d] IPtr=0x%08X addr=0x%08X val=0x%08X\n",
+			                       fb_wsub_count, IPtr, addr, BReg);
+			               fb_wsub_count++;
+			           }
+			       }
+			       if (text_write_trace_enabled &&
+			           addr >= text_write_trace_start &&
+			           addr < text_write_trace_end) {
+			           uint32_t delta = 0;
+			           const link_sym *lsym = find_link_sym(IPtr, &delta);
+			           const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+			           fprintf(stderr,
+			                   "[TEXT_STNL_COMBO] IPtr=0x%08X addr=0x%08X BReg=0x%08X WPtr=0x%08X%s%s\n",
+			                   IPtr, addr, BReg, WPtr,
+			                   (lsym || sym) ? " sym=" : "",
+			                   lsym ? lsym->name : (sym ? sym->name : ""));
+			       }
+			       writeword (addr, BReg);
+			   }
 			   AReg = CReg;
 			   IPtr++;
 		           PROFILE(profile[PRO_INSTR]++);
@@ -4347,11 +7578,961 @@ DescheduleOutWord:
 			   IPtr++;
                            break;
 #endif
-                case 0x17c: /* XXX lddevid    */
-                           if (IsT800) /* TTH */
-                                BReg = CReg;
+                /* ---------------------------------------------------------
+                 * TVX - Transputer Vector eXtension (MXFP4 / bfloat16).
+                 * See transputer/t4/tvx.h and transputer/TVX-ISA.md.
+                 * --------------------------------------------------------- */
+                case 0x1c0: /* bf16tor32   A := f32bits(bf16 A[15:0])       */
+                           AReg = tvx_bf16_to_f32 (AReg);
                            IPtr++;
                            break;
+                case 0x1c1: /* r32tobf16   A := bf16bits(f32 A), RNE        */
+                           AReg = tvx_f32_to_bf16 (AReg);
+                           IPtr++;
+                           break;
+                case 0x1c2: /* bf16pack    A := (bf16(B)<<16)|bf16(A)       */
+                           AReg = tvx_bf16_pack (BReg, AReg);
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1c3: /* bf16unpkh   A := f32bits(bf16 A[31:16])      */
+                           AReg = tvx_bf16_unpack_hi (AReg);
+                           IPtr++;
+                           break;
+                case 0x1c4: /* mxfp4tor32  A := f32bits(E2M1 A[3:0])        */
+                           AReg = tvx_mxfp4_to_f32 (AReg);
+                           IPtr++;
+                           break;
+                case 0x1c5: /* r32tomxfp4  A := E2M1(f32 A), RNE+saturate   */
+                           AReg = tvx_f32_to_mxfp4 (AReg);
+                           IPtr++;
+                           break;
+                case 0x1c6: /* mxe8m0tor32 A := f32bits(E8M0 A[7:0])        */
+                           AReg = tvx_e8m0_to_f32 (AReg);
+                           IPtr++;
+                           break;
+                case 0x1c7: /* mxe8m0of    A := E8M0 scale for amax f32 A   */
+                           AReg = tvx_e8m0_of (AReg);
+                           IPtr++;
+                           break;
+                case 0x1c8: /* mxfp4dot    A=block ptr, B=act ptr           */
+                           {
+                                uint8_t  nib[16];
+                                uint32_t act[32];
+                                fpreal32_t r;
+                                float t, s;
+                                uint8_t scale;
+                                int i;
+
+                                BADCODE(IsT414);
+                                T4DEBUG(checkWordAligned ("MXFP4DOT", BReg));
+
+                                scale = byte (AReg);
+                                for (i = 0; i < 16; i++)
+                                        nib[i] = byte (AReg + 1 + i);
+                                for (i = 0; i < 32; i++)
+                                        act[i] = real32 (BReg + 4 * i).bits;
+
+                                t = tvx_mxfp4_block_acc (nib, act);
+                                s = tvx_bits_to_float (
+                                        tvx_e8m0_to_f32 (scale));
+
+                                fp_popsn (&sntemp1);
+                                r.fp = sntemp1.fp + (float)(s * t);
+                                fp_pushsn (r);
+                           }
+                           AReg = CReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1c9: /* bf16dot     A=x ptr, B=y ptr, C=count        */
+                           {
+                                fpreal32_t r;
+                                float t = 0.0f;
+                                uint32_t n = CReg, i;
+
+                                BADCODE(IsT414);
+                                for (i = 0; i < n; i++) {
+                                        uint32_t xb, yb;
+                                        xb = (uint32_t)byte (AReg + 2 * i)
+                                           | ((uint32_t)byte (AReg + 2 * i + 1) << 8);
+                                        yb = (uint32_t)byte (BReg + 2 * i)
+                                           | ((uint32_t)byte (BReg + 2 * i + 1) << 8);
+                                        t = t + (float)(
+                                            tvx_bits_to_float (tvx_bf16_to_f32 (xb)) *
+                                            tvx_bits_to_float (tvx_bf16_to_f32 (yb)));
+                                }
+
+                                fp_popsn (&sntemp1);
+                                r.fp = sntemp1.fp + t;
+                                fp_pushsn (r);
+                           }
+                           IPtr++;
+                           break;
+                case 0x1ca: /* mxfp4gemv   A=blocks ptr, B=act ptr, C=count */
+                           {
+                                uint8_t  nib[16];
+                                uint32_t act[32];
+                                fpreal32_t r;
+                                float acc;
+                                uint32_t nblk = CReg, b;
+                                int i;
+
+                                BADCODE(IsT414);
+                                fp_popsn (&sntemp1);
+                                acc = sntemp1.fp;
+
+                                /* Defined to be exactly nblk chained
+                                 * MXFP4DOTs, so the two are interchangeable. */
+                                for (b = 0; b < nblk; b++) {
+                                        uint32_t bp = AReg + b * 17;
+                                        uint32_t ap = BReg + b * 128;
+                                        float t, s;
+
+                                        for (i = 0; i < 16; i++)
+                                                nib[i] = byte (bp + 1 + i);
+                                        for (i = 0; i < 32; i++)
+                                                act[i] = real32 (ap + 4 * i).bits;
+
+                                        t = tvx_mxfp4_block_acc (nib, act);
+                                        s = tvx_bits_to_float (
+                                                tvx_e8m0_to_f32 (byte (bp)));
+                                        acc = acc + (float)(s * t);
+                                }
+                                r.fp = acc;
+                                fp_pushsn (r);
+                           }
+                           IPtr++;
+                           break;
+                /* ---- sub-word SIMD: 8 MXFP4 lanes / 2 bfloat16 lanes ---- */
+                case 0x1cb: /* mxfp4unpk8  A=packed nibbles, B=dst ptr; pop2 */
+                           {
+                                uint32_t w = AReg;
+                                int i;
+                                for (i = 0; i < 8; i++) {
+                                        fpreal32_t v;
+                                        v.bits = tvx_mxfp4_to_f32 ((w >> (4*i)) & 0xFu);
+                                        writereal32 (BReg + 4 * i, v);
+                                }
+                           }
+                           AReg = CReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1cc: /* r32tomxfp4x8 A=src ptr -> A=packed 8 nibbles  */
+                           {
+                                uint32_t w = 0;
+                                int i;
+                                for (i = 0; i < 8; i++)
+                                        w |= tvx_f32_to_mxfp4 (real32 (AReg + 4*i).bits)
+                                             << (4 * i);
+                                AReg = w;
+                           }
+                           IPtr++;
+                           break;
+                case 0x1cd: /* bf16mul2    A = B *packed* A, 2 lanes; pop 1  */
+                           AReg = tvx_bf16_pair_mul (BReg, AReg);
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1ce: /* bf16add2    A = B +packed* A, 2 lanes; pop 1  */
+                           AReg = tvx_bf16_pair_add (BReg, AReg);
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                /* ---- vector kernels for transformer inference ----------
+                 * Length comes from VSETLEN, in the MOVE2DINIT tradition,
+                 * because the 3-deep stack cannot carry dst+src+src2+count. */
+                case 0x1cf: /* vsetlen     A = element count; pop 1          */
+                           vec_len = AReg;
+                           AReg = BReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1d0: /* mxfp4gemvbf A=blocks, B=bf16 acts, C=nblocks */
+                           {
+                                uint8_t  nib[16];
+                                uint32_t act[32];
+                                float acc;
+                                uint32_t nblk = CReg, b;
+                                int i;
+
+                                BADCODE(IsT414);
+                                fp_popsn (&sntemp1);
+                                acc = sntemp1.fp;
+                                for (b = 0; b < nblk; b++) {
+                                        uint32_t bp = AReg + b * 17;
+                                        uint32_t ap = BReg + b * 64; /* 32 bf16 */
+                                        float t, s;
+
+                                        for (i = 0; i < 16; i++)
+                                                nib[i] = byte (bp + 1 + i);
+                                        for (i = 0; i < 32; i++) {
+                                                uint32_t h = (uint32_t)byte (ap + 2*i)
+                                                    | ((uint32_t)byte (ap + 2*i + 1) << 8);
+                                                act[i] = tvx_bf16_to_f32 (h);
+                                        }
+                                        t = tvx_mxfp4_block_acc (nib, act);
+                                        s = tvx_bits_to_float (
+                                                tvx_e8m0_to_f32 (byte (bp)));
+                                        acc = acc + (float)(s * t);
+                                }
+                                sntemp1.fp = acc;
+                                fp_pushsn (sntemp1);
+                           }
+                           IPtr++;
+                           break;
+                case 0x1d1: /* vaddsn      A=dst, B=src1, C=src2; pop 3      */
+                           {
+                                uint32_t i;
+                                BADCODE(IsT414);
+                                for (i = 0; i < vec_len; i++) {
+                                        fpreal32_t v;
+                                        v.fp = (float)((double)real32 (BReg + 4*i).fp
+                                                     + (double)real32 (CReg + 4*i).fp);
+                                        writereal32 (AReg + 4*i, v);
+                                }
+                           }
+                           IPtr++;
+                           break;
+                case 0x1d2: /* vmulsn      A=dst, B=src1, C=src2; pop 3      */
+                           {
+                                uint32_t i;
+                                BADCODE(IsT414);
+                                for (i = 0; i < vec_len; i++) {
+                                        fpreal32_t v;
+                                        v.fp = (float)((double)real32 (BReg + 4*i).fp
+                                                     * (double)real32 (CReg + 4*i).fp);
+                                        writereal32 (AReg + 4*i, v);
+                                }
+                           }
+                           IPtr++;
+                           break;
+                case 0x1d3: /* vsilusn     A=dst, B=src; pop 2               */
+                           {
+                                uint32_t i;
+                                BADCODE(IsT414);
+                                for (i = 0; i < vec_len; i++) {
+                                        fpreal32_t v;
+                                        v.fp = (float)tvx_silu_exact (
+                                                (double)real32 (BReg + 4*i).fp);
+                                        writereal32 (AReg + 4*i, v);
+                                }
+                           }
+                           AReg = CReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1d4: /* vrmsnorm    A=dst, B=src, C=gain; pop 3       */
+                           {
+                                uint32_t i;
+                                double ss = 0.0, r;
+                                BADCODE(IsT414);
+                                for (i = 0; i < vec_len; i++) {
+                                        double v = (double)real32 (BReg + 4*i).fp;
+                                        ss += v * v;
+                                }
+                                r = tvx_rmsnorm_scale (&ss, vec_len ? vec_len : 1);
+                                for (i = 0; i < vec_len; i++) {
+                                        fpreal32_t v;
+                                        v.fp = (float)((double)real32 (BReg + 4*i).fp * r
+                                                     * (double)real32 (CReg + 4*i).fp);
+                                        writereal32 (AReg + 4*i, v);
+                                }
+                           }
+                           IPtr++;
+                           break;
+                case 0x1d5: /* vsoftmaxsn  A=dst, B=src; pop 2               */
+                           {
+                                uint32_t i;
+                                double mx, sum = 0.0;
+                                BADCODE(IsT414);
+                                if (vec_len == 0) { AReg = CReg; BReg = CReg; IPtr++; break; }
+                                mx = (double)real32 (BReg).fp;
+                                for (i = 1; i < vec_len; i++) {
+                                        double v = (double)real32 (BReg + 4*i).fp;
+                                        if (v > mx) mx = v;
+                                }
+                                for (i = 0; i < vec_len; i++)
+                                        sum += exp ((double)real32 (BReg + 4*i).fp - mx);
+                                for (i = 0; i < vec_len; i++) {
+                                        fpreal32_t v;
+                                        v.fp = (float)(exp ((double)real32 (BReg + 4*i).fp - mx)
+                                                       / sum);
+                                        writereal32 (AReg + 4*i, v);
+                                }
+                           }
+                           AReg = CReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                /* ---- IEEE binary16 (ggml_half) and Q8_0 ---------------- */
+                case 0x1d6: /* f16tor32    A := f32bits(binary16 A[15:0])   */
+                           AReg = tvx_f16_to_f32 (AReg);
+                           IPtr++;
+                           break;
+                case 0x1d7: /* r32tof16    A := binary16 bits of f32 A, RNE */
+                           AReg = tvx_f32_to_f16 (AReg);
+                           IPtr++;
+                           break;
+                case 0x1d8: /* q8dot       A=q8_0 blocks, B=f32 acts, C=n   */
+                case 0x1d9: /* q8dotbf     A=q8_0 blocks, B=bf16 acts, C=n  */
+                           {
+                                int8_t   qs[32];
+                                uint32_t act[32];
+                                float acc;
+                                uint32_t nblk = CReg, b;
+                                int is_bf = (OReg == 0x1d9);
+                                int i;
+
+                                BADCODE(IsT414);
+                                fp_popsn (&sntemp1);
+                                acc = sntemp1.fp;
+
+                                for (b = 0; b < nblk; b++) {
+                                        uint32_t bp = AReg + b * 34;
+                                        uint32_t ap = BReg + b * (is_bf ? 64 : 128);
+                                        uint32_t h;
+                                        float t, d;
+
+                                        h = (uint32_t)byte (bp)
+                                          | ((uint32_t)byte (bp + 1) << 8);
+                                        for (i = 0; i < 32; i++)
+                                                qs[i] = (int8_t)byte (bp + 2 + i);
+                                        if (is_bf) {
+                                                for (i = 0; i < 32; i++) {
+                                                        uint32_t w =
+                                                            (uint32_t)byte (ap + 2*i)
+                                                          | ((uint32_t)byte (ap + 2*i + 1) << 8);
+                                                        act[i] = tvx_bf16_to_f32 (w);
+                                                }
+                                        } else {
+                                                for (i = 0; i < 32; i++)
+                                                        act[i] = real32 (ap + 4*i).bits;
+                                        }
+                                        t = tvx_q8_block_acc (qs, act);
+                                        d = tvx_bits_to_float (tvx_f16_to_f32 (h));
+                                        acc = acc + (float)(d * t);
+                                }
+                                sntemp1.fp = acc;
+                                fp_pushsn (sntemp1);
+                           }
+                           IPtr++;
+                           break;
+                /* ---- GGUF i-quants: IQ1_M / IQ2_XXS / IQ3_XXS --------- */
+                case 0x1da: /* iq1mdot    A=blocks, B=f32 acts, C=nblocks  */
+                case 0x1db: /* iq2xxsdot                                    */
+                case 0x1dc: /* iq3xxsdot                                    */
+                           {
+                                static uint8_t raw[128];
+                                static float dec[256];
+                                float acc;
+                                uint32_t nblk = CReg, b;
+                                uint32_t bsz = (OReg == 0x1da) ? TVX_IQ1M_BYTES
+                                             : (OReg == 0x1db) ? TVX_IQ2XXS_BYTES
+                                             :                   TVX_IQ3XXS_BYTES;
+                                int i;
+
+                                BADCODE(IsT414);
+                                fp_popsn (&sntemp1);
+                                acc = sntemp1.fp;
+
+                                for (b = 0; b < nblk; b++) {
+                                        uint32_t bp = AReg + b * bsz;
+                                        uint32_t ap = BReg + b * 256 * 4;
+                                        float t = 0.0f;
+
+                                        for (i = 0; i < (int)bsz; i++)
+                                                raw[i] = byte (bp + i);
+                                        if (OReg == 0x1da)      tvx_iq1m_decode (raw, dec);
+                                        else if (OReg == 0x1db) tvx_iq2xxs_decode (raw, dec);
+                                        else                    tvx_iq3xxs_decode (raw, dec);
+
+                                        for (i = 0; i < 256; i++)
+                                                t = t + (float)(dec[i] * real32 (ap + 4*i).fp);
+                                        acc = acc + t;
+                                }
+                                sntemp1.fp = acc;
+                                fp_pushsn (sntemp1);
+                           }
+                           IPtr++;
+                           break;
+                /* ---- generic GGUF quantised dot ----------------------
+                 * Covers every ggml quantisation type via llama.cpp's own
+                 * vendored decoders.  The format is a ggml type id set by
+                 * QSETFMT, so new formats need no new opcode. */
+                case 0x1dd: /* qsetfmt     A = ggml type id; pop 1          */
+                           quant_fmt = AReg;
+                           AReg = BReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1de: /* qdot        A=blocks, B=f32 acts, C=nblocks  */
+                           {
+                                static uint8_t raw[256];
+                                static float dec[256];
+                                float acc;
+                                uint32_t nblk = CReg, b;
+                                int bsz = tvx_gguf_block_bytes ((int)quant_fmt);
+                                int i, n;
+
+                                BADCODE(IsT414);
+                                fp_popsn (&sntemp1);
+                                acc = sntemp1.fp;
+
+                                if (bsz > 0 && bsz <= (int)sizeof(raw)) {
+                                    for (b = 0; b < nblk; b++) {
+                                        uint32_t bp = AReg + (uint32_t)b * (uint32_t)bsz;
+                                        float t = 0.0f;
+                                        uint32_t ap;
+
+                                        for (i = 0; i < bsz; i++)
+                                                raw[i] = byte (bp + i);
+                                        n = tvx_gguf_decode_block ((int)quant_fmt, raw, dec);
+                                        if (n <= 0)
+                                                break;
+                                        ap = BReg + (uint32_t)b * (uint32_t)n * 4u;
+                                        for (i = 0; i < n; i++)
+                                                t = t + (float)(dec[i] * real32 (ap + 4*i).fp);
+                                        acc = acc + t;
+                                    }
+                                }
+                                sntemp1.fp = acc;
+                                fp_pushsn (sntemp1);
+                           }
+                           IPtr++;
+                           break;
+                /* ---- block rotation (BRQ) ----------------------------
+                 * A 32-point randomised Hadamard applied *within* each MX
+                 * block.  Global rotation is what QuaRot/SpinQuant do and it
+                 * degrades MXFP4 badly (arXiv:2511.04214); confining the
+                 * rotation to the block size fixes that, and - because the
+                 * dimension is fixed at 32 - makes it one instruction rather
+                 * than another GEMV.  Length comes from VSETLEN and must be a
+                 * multiple of 32; a trailing partial group is ignored. */
+                case 0x1df: /* vhad32   A=dst, B=src, C=sign mask; pop 3    */
+                           {
+                                float v[32];
+                                uint32_t g, ngrp = vec_len / 32, i;
+
+                                BADCODE(IsT414);
+                                for (g = 0; g < ngrp; g++) {
+                                        uint32_t sp = BReg + g * 128;
+                                        uint32_t dp = AReg + g * 128;
+                                        for (i = 0; i < 32; i++)
+                                                v[i] = real32 (sp + 4*i).fp;
+                                        tvx_had32_rotate (v, CReg);
+                                        for (i = 0; i < 32; i++) {
+                                                fpreal32_t r;
+                                                r.fp = v[i];
+                                                writereal32 (dp + 4*i, r);
+                                        }
+                                }
+                           }
+                           IPtr++;
+                           break;
+                case 0x1e0: /* mxqrot   A=dst blocks, B=f32 src, C=mask     */
+                case 0x1e1: /* mxqrotbf A=dst blocks, B=bf16 src, C=mask    */
+                           {
+                                float   v[32];
+                                uint8_t blk[17];
+                                int      is_bf = (OReg == 0x1e1);
+                                uint32_t g, ngrp = vec_len / 32, i;
+
+                                BADCODE(IsT414);
+                                for (g = 0; g < ngrp; g++) {
+                                        uint32_t sp = BReg + g * (is_bf ? 64 : 128);
+                                        uint32_t dp = AReg + g * 17;
+
+                                        for (i = 0; i < 32; i++) {
+                                                if (is_bf) {
+                                                        uint32_t h =
+                                                            (uint32_t)byte (sp + 2*i)
+                                                          | ((uint32_t)byte (sp + 2*i + 1) << 8);
+                                                        v[i] = tvx_bits_to_float (
+                                                                tvx_bf16_to_f32 (h));
+                                                } else {
+                                                        v[i] = real32 (sp + 4*i).fp;
+                                                }
+                                        }
+                                        tvx_had32_rotate (v, CReg);
+                                        tvx_mxfp4_quantize_block (blk, v);
+                                        for (i = 0; i < 17; i++)
+                                                writebyte_int (dp + i, blk[i]);
+                                }
+                           }
+                           IPtr++;
+                           break;
+                /* ---------------------------------------------------------
+                 * TVX-GFX - Floating-point Transform & Project (T&L geometry).
+                 * See transputer/t4/tvx_gfx.h for the architectural spec.
+                 * --------------------------------------------------------- */
+                case 0x1e2: /* ftsetvp  A = viewport descriptor; pop 1      */
+                           {
+                                float d[5];
+                                uint32_t i;
+
+                                BADCODE(IsT414);
+                                for (i = 0; i < 5; i++)
+                                        d[i] = real32 (AReg + 4*i).fp;
+                                tvx_viewport_set (&tvx_vp, d);
+                           }
+                           AReg = BReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1e3: /* ftransp  A=dst rec, B=src xyz, C=4x4 mtx     */
+                case 0x1e4: /* ftranspb same but VSETLEN vertices, B/A step */
+                           {
+                                float mtx[16], v[3], out[4];
+                                uint32_t n = (OReg == 0x1e4) ? vec_len : 1;
+                                uint32_t i, j, and_code = 0x3Fu;
+
+                                BADCODE(IsT414);
+                                for (j = 0; j < 16; j++)
+                                        mtx[j] = real32 (CReg + 4*j).fp;
+                                for (i = 0; i < n; i++) {
+                                        uint32_t sp = BReg + ((OReg == 0x1e4)
+                                            ? i * TVX_STEP(2u, TVX_POS_DENSE())
+                                            : 0);
+                                        uint32_t dp = AReg + ((OReg == 0x1e4)
+                                            ? i * TVX_STEP(1u,
+                                                  4 * TVX_RECORD_WORDS) : 0);
+                                        uint32_t code;
+                                        fpreal32_t r;
+
+                                        for (j = 0; j < 3; j++)
+                                                v[j] = tvx_fetch_pos (sp, j);
+                                        code = tvx_transp (out, v, mtx,
+                                                           &tvx_vp);
+                                        for (j = 0; j < 4; j++) {
+                                                r.fp = out[j];
+                                                writereal32 (dp + 4*j, r);
+                                        }
+                                        writeword_int (dp + 16, code);
+                                        and_code &= code;
+                                }
+                                AReg = and_code;
+                           }
+                           IPtr++;
+                           break;
+                case 0x1e5: /* fsincos  A=dst {sin,cos}, B=BAMS angle; pop2 */
+                           {
+                                float s, c;
+                                fpreal32_t r;
+
+                                BADCODE(IsT414);
+                                tvx_sincos (BReg, &s, &c);
+                                r.fp = s;
+                                writereal32 (AReg, r);
+                                r.fp = c;
+                                writereal32 (AReg + 4, r);
+                           }
+                           AReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1e6: /* frsqrt   A = bits(1/sqrt(f32 A))             */
+                           AReg = tvx_rsqrt_bits (AReg);
+                           IPtr++;
+                           break;
+                case 0x1e7: /* frecip   A = bits(1/f32 A)                   */
+                           AReg = tvx_recip_bits (AReg);
+                           IPtr++;
+                           break;
+                case 0x1e8: /* fsincosb A=dst pairs, B=u16 BAMS[]; VSETLEN  */
+                           {
+                                uint32_t i;
+
+                                BADCODE(IsT414);
+                                for (i = 0; i < vec_len; i++) {
+                                        uint32_t sp = BReg
+                                            + i * TVX_STEP(2u, 2);
+                                        uint32_t dp = AReg
+                                            + i * TVX_STEP(1u, 8);
+                                        uint32_t a =
+                                            (uint32_t)byte (sp)
+                                          | ((uint32_t)byte (sp + 1) << 8);
+                                        float s, c;
+                                        fpreal32_t r;
+
+                                        tvx_sincos (a, &s, &c);
+                                        r.fp = s;
+                                        writereal32 (dp, r);
+                                        r.fp = c;
+                                        writereal32 (dp + 4, r);
+                                }
+                           }
+                           AReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1e9: /* vsetstride A=bytes (0=dense), B=mask; pop 2 */
+                           elem_stride = AReg;
+                           stride_mask = BReg;
+                           AReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1ec: /* vsetfmt  A = position format; pop 1         */
+                           tvx_src_fmt = AReg;
+                           AReg = BReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1ed: /* ftsetlit A = light descriptor; pop 1        */
+                           {
+                                float d[5];
+                                uint32_t i;
+
+                                BADCODE(IsT414);
+                                for (i = 0; i < 5; i++)
+                                        d[i] = real32 (AReg + 4*i).fp;
+                                tvx_light_set (&tvx_lit, d);
+                           }
+                           AReg = BReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1ee: /* flitb    A=dst recs, B=normals, C=3x3 mtx   */
+                           {
+                                float m9[9], n[3];
+                                uint32_t i, k, all_dark = 1;
+
+                                BADCODE(IsT414);
+                                for (k = 0; k < 9; k++)
+                                        m9[k] = real32 (CReg + 4*k).fp;
+                                for (i = 0; i < vec_len; i++) {
+                                        uint32_t sp = BReg
+                                            + i * TVX_STEP(2u,
+                                                           TVX_POS_DENSE());
+                                        uint32_t dp = AReg
+                                            + i * TVX_STEP(1u,
+                                                  4 * TVX_RECORD_WORDS);
+                                        float I;
+                                        fpreal32_t r;
+
+                                        for (k = 0; k < 3; k++)
+                                                n[k] = tvx_fetch_pos (sp, k);
+                                        I = tvx_lit_vertex (n, m9, &tvx_lit);
+                                        r.fp = I;
+                                        writereal32 (dp + 20, r);
+                                        if (I > tvx_lit.ambient)
+                                                all_dark = 0;
+                                }
+                                AReg = all_dark;
+                           }
+                           IPtr++;
+                           break;
+                case 0x1ef: /* qgemm    A=dst f32[], B=param, C=blocks/row */
+                           {
+                                static uint8_t raw[256];
+                                static float dec[256];
+                                uint32_t aptr = word (BReg);
+                                uint32_t wptr = word (BReg + 4);
+                                uint32_t nblk = CReg, r_, b;
+                                int bsz = tvx_gguf_block_bytes
+                                              ((int)quant_fmt);
+                                int i, n;
+
+                                BADCODE(IsT414);
+                                if (bsz > 0 && bsz <= (int)sizeof(raw)) {
+                                    for (r_ = 0; r_ < vec_len; r_++) {
+                                        float acc = 0.0f;
+                                        uint32_t rp = wptr
+                                            + r_ * nblk * (uint32_t)bsz;
+                                        uint32_t ap = aptr;
+                                        fpreal32_t out;
+
+                                        for (b = 0; b < nblk; b++) {
+                                            uint32_t bp = rp
+                                                + b * (uint32_t)bsz;
+                                            float t = 0.0f;
+
+                                            for (i = 0; i < bsz; i++)
+                                                raw[i] = byte (bp + i);
+                                            n = tvx_gguf_decode_block
+                                                ((int)quant_fmt, raw, dec);
+                                            if (n <= 0)
+                                                break;
+                                            for (i = 0; i < n; i++) {
+                                                float av;
+                                                if (tvx_src_fmt == 1) {
+                                                    uint32_t h =
+                                                      (uint32_t)byte (ap + 2*i)
+                                                    | ((uint32_t)byte (ap
+                                                        + 2*i + 1) << 8);
+                                                    av = tvx_bits_to_float (
+                                                        tvx_bf16_to_f32 (h));
+                                                } else {
+                                                    av = real32 (ap
+                                                                 + 4*i).fp;
+                                                }
+                                                t = t + (float)(dec[i] * av);
+                                            }
+                                            ap += (uint32_t)n
+                                                * (tvx_src_fmt == 1 ? 2u
+                                                                    : 4u);
+                                            acc = acc + t;
+                                        }
+                                        out.fp = acc;
+                                        writereal32 (AReg + 4 * r_, out);
+                                    }
+                                }
+                                AReg = vec_len;
+                           }
+                           IPtr++;
+                           break;
+                case 0x1f0: /* vblend8  A=dst px, B=src px, C=alpha ctl    */
+                           {
+                                uint32_t i;
+
+                                for (i = 0; i < vec_len; i++) {
+                                        uint32_t da = AReg
+                                            + i * TVX_STEP(1u, 4);
+                                        uint32_t sa = BReg
+                                            + i * TVX_STEP(2u, 4);
+                                        writeword_int (da,
+                                            tvx_blend_pixel (word (da),
+                                                             word (sa),
+                                                             CReg));
+                                }
+                           }
+                           IPtr++;
+                           break;
+                case 0x1f1: /* vfill    A=dst, B=pattern, C=byte count     */
+                           {
+                                uint32_t i;
+
+                                for (i = 0; i < CReg; i++) {
+                                        uint32_t a = AReg + i;
+                                        writebyte_int (a,
+                                            tvx_fill_byte (BReg, a));
+                                }
+                           }
+                           IPtr++;
+                           break;
+                case 0x1f2: /* vfill2d  BMReg rows/stride; C=width bytes   */
+                           {
+                                uint32_t r, i;
+
+                                for (r = 0; r < m2dLength; r++) {
+                                        uint32_t base = AReg
+                                            + r * m2dDestStride;
+                                        for (i = 0; i < CReg; i++) {
+                                                uint32_t a = base + i;
+                                                writebyte_int (a,
+                                                    tvx_fill_byte (BReg,
+                                                                   a));
+                                        }
+                                }
+                           }
+                           IPtr++;
+                           break;
+                case 0x1f3: /* csum     A=src, B=init, C=bytes; A<-folded  */
+                           {
+                                uint64_t acc = BReg;
+                                uint32_t i, n2 = CReg & ~1u;
+
+                                for (i = 0; i < n2; i += 2)
+                                        acc += (uint64_t)
+                                            ((uint32_t)byte (AReg + i)
+                                           | ((uint32_t)byte (AReg + i + 1)
+                                              << 8));
+                                if (CReg & 1u)
+                                        acc += byte (AReg + n2);
+                                acc = (acc & 0xFFFFFFFFu)
+                                    + (acc >> 32);
+                                AReg = tvx_csum_fold (
+                                    tvx_csum_fold ((uint32_t)acc
+                                        + (uint32_t)(acc >> 32)));
+                           }
+                           IPtr++;
+                           break;
+                case 0x1f4: /* vblend2d BMReg rows/strides; VSETLEN px/row */
+                           {
+                                uint32_t r, i;
+
+                                for (r = 0; r < m2dLength; r++) {
+                                        uint32_t db = AReg
+                                            + r * m2dDestStride;
+                                        uint32_t sb = BReg
+                                            + r * m2dSourceStride;
+                                        for (i = 0; i < vec_len; i++)
+                                                writeword_int (db + 4*i,
+                                                    tvx_blend_pixel (
+                                                        word (db + 4*i),
+                                                        word (sb + 4*i),
+                                                        CReg));
+                                }
+                           }
+                           IPtr++;
+                           break;
+                case 0x1f6: /* csumcpy  A=dst, B=src, C=bytes; A<-folded   */
+                           {
+                                uint64_t acc = 0;
+                                uint32_t i, n2 = CReg & ~1u;
+
+                                for (i = 0; i < n2; i += 2) {
+                                        uint32_t b0 = byte (BReg + i);
+                                        uint32_t b1 = byte (BReg + i + 1);
+                                        writebyte_int (AReg + i, b0);
+                                        writebyte_int (AReg + i + 1, b1);
+                                        acc += b0 | (b1 << 8);
+                                }
+                                if (CReg & 1u) {
+                                        uint32_t b0 = byte (BReg + n2);
+                                        writebyte_int (AReg + n2, b0);
+                                        acc += b0;
+                                }
+                                acc = (acc & 0xFFFFFFFFu) + (acc >> 32);
+                                AReg = tvx_csum_fold (
+                                    tvx_csum_fold ((uint32_t)acc
+                                        + (uint32_t)(acc >> 32)));
+                           }
+                           IPtr++;
+                           break;
+                case 0x1f5: /* stvxstate A = 15-word save area; pop 1      */
+                           {
+                                fpreal32_t r;
+                                uint32_t k;
+
+                                writeword_int (AReg, vec_len);
+                                writeword_int (AReg + 4, quant_fmt);
+                                writeword_int (AReg + 8, elem_stride);
+                                writeword_int (AReg + 12, stride_mask);
+                                writeword_int (AReg + 16, tvx_src_fmt);
+                                r.fp = tvx_vp.sx;
+                                writereal32 (AReg + 20, r);
+                                r.fp = tvx_vp.sy;
+                                writereal32 (AReg + 24, r);
+                                r.fp = tvx_vp.ox;
+                                writereal32 (AReg + 28, r);
+                                r.fp = tvx_vp.oy;
+                                writereal32 (AReg + 32, r);
+                                r.fp = tvx_vp.guard;
+                                writereal32 (AReg + 36, r);
+                                for (k = 0; k < 3; k++) {
+                                        r.fp = tvx_lit.dir[k];
+                                        writereal32 (AReg + 40 + 4*k, r);
+                                }
+                                r.fp = tvx_lit.ambient;
+                                writereal32 (AReg + 52, r);
+                                r.fp = tvx_lit.intensity;
+                                writereal32 (AReg + 56, r);
+                           }
+                           AReg = BReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1ea: /* ftcull   A=dst codes, B=xyz[], C=param      */
+                           {
+                                float planes[24], v[3];
+                                uint32_t nplanes = word (CReg);
+                                uint32_t mode    = word (CReg + 4);
+                                float    radius  = real32 (CReg + 8).fp;
+                                uint32_t xmask   = word (CReg + 12);
+                                uint32_t i, k, orbits = 0;
+                                uint32_t sstep = TVX_STEP(2u, TVX_POS_DENSE());
+
+                                BADCODE(IsT414);
+                                if (nplanes > 6) nplanes = 6;
+                                for (k = 0; k < nplanes * 4; k++)
+                                        planes[k] =
+                                            real32 (CReg + 16 + 4*k).fp;
+                                for (i = 0; i < vec_len; i++) {
+                                        uint32_t sp = BReg + i * sstep;
+                                        for (k = 0; k < 3; k++)
+                                                v[k] = tvx_fetch_pos (sp, k);
+                                        if (mode == 2) {
+                                                fpreal32_t r;
+                                                r.fp = tvx_plane_dist
+                                                    (planes, v);
+                                                writereal32 (AReg
+                                                    + i * TVX_STEP(1u, 4), r);
+                                        } else {
+                                                uint32_t c = tvx_cull_code
+                                                    (planes, nplanes, v,
+                                                     mode, radius, xmask);
+                                                writebyte_int (AReg
+                                                    + i * TVX_STEP(1u, 1), c);
+                                                orbits |= c;
+                                        }
+                                }
+                                AReg = (mode == 2) ? 0 : orbits;
+                           }
+                           IPtr++;
+                           break;
+                case 0x1eb: /* tskin    A=dst xyz, B=joints, C=param       */
+                           {
+                                uint32_t mode = word (CReg);
+                                uint32_t wp   = word (CReg + 4);
+                                uint32_t ip   = word (CReg + 8);
+                                uint32_t i, k, j = 0;
+                                uint32_t dstep = TVX_STEP(1u, 12);
+                                float mm[6];
+
+                                BADCODE(IsT414);
+                                if (mode & 1u)
+                                        for (k = 0; k < 6; k++)
+                                                mm[k] = real32
+                                                    (CReg + 12 + 4*k).fp;
+                                for (i = 0; i < vec_len; i++) {
+                                        float acc[3], w[4], m[12];
+                                        uint32_t off, flag;
+                                        fpreal32_t r;
+
+                                        acc[0] = acc[1] = acc[2] = 0.0f;
+                                        do {
+                                                off  = word (ip + 8*j);
+                                                flag = word (ip + 8*j + 4);
+                                                for (k = 0; k < 4; k++)
+                                                        w[k] = real32
+                                                            (wp + 16*j
+                                                             + 4*k).fp;
+                                                for (k = 0; k < 12; k++)
+                                                        m[k] = real32
+                                                            (BReg + off
+                                                             + 4*k).fp;
+                                                tvx_skin_acc (acc, m, w);
+                                                j++;
+                                        } while (flag == 0);
+                                        for (k = 0; k < 3; k++) {
+                                                r.fp = acc[k];
+                                                writereal32 (AReg + i*dstep
+                                                             + 4*k, r);
+                                        }
+                                        if (mode & 1u)
+                                                for (k = 0; k < 3; k++) {
+                                                        if (acc[k] < mm[k])
+                                                                mm[k] = acc[k];
+                                                        if (acc[k] > mm[k+3])
+                                                                mm[k+3] =
+                                                                    acc[k];
+                                                }
+                                }
+                                if (mode & 1u) {
+                                        fpreal32_t r;
+                                        for (k = 0; k < 6; k++) {
+                                                r.fp = mm[k];
+                                                writereal32 (CReg + 12
+                                                             + 4*k, r);
+                                        }
+                                }
+                                AReg = j;
+                           }
+                           IPtr++;
+                           break;
+                case 0x17c: /* lddevid */
+                           CReg = BReg;
+                           BReg = AReg;
+                           AReg = ProductIdentity;
+                           IPtr++;
+                           break;
+		case T9K_OP_SYSCALL: /* OReg -8 — system call (T9000, mem 60F8) */
+			   t9k_syscall();
+			   break;
+		case T9K_OP_GOPROT: /* OReg -6 — go protected (T9000, mem 60FA) */
+			   /* Areg = PDS, Breg = RODS (physical while in L) */
+			   t9k_goprot(AReg, BReg);
+			   break;
                 case 0x1ff: /* XXX start    */
                            quit = TRUE;
                            IPtr++;
@@ -4361,17 +8542,24 @@ DescheduleOutWord:
 BadCode:
 #endif
                            printf ("-E-EMU414: Error - bad Icode! (#%02X - %s)\n", OReg, mnemonic (Icode, OReg, AReg, 0));
+                           maybe_log_nearest_sym(IPtr, "bad-icode");
                            processor_state ();
-			   handler (-1);
-			   break;
+                           handler (-1);
+                           break;
 	} /* switch OReg */
 			   break;
 		default  : 
                            printf ("-E-EMU414: Error - bad Icode! (#%02X - %s)\n", OReg, mnemonic (Icode, OReg, AReg, 0));
+                           maybe_log_nearest_sym(IPtr, "bad-icode");
                            processor_state ();
-			   handler (-1);
-			   break;
+                           handler (-1);
+                           break;
 	} /* switch (Icode) */
+
+        /* Clear operand accumulator after executing a non-prefix instruction. */
+        if (Icode != 0x20 && Icode != 0x60) {
+                OReg = 0;
+        }
                 /* Reset rounding mode to round nearest. */
                 if (ResetRounding && (RoundingMode != ROUND_N))
                         fp_setrounding ("reset", ROUND_N);
@@ -4379,11 +8567,22 @@ BadCode:
 		PROFILE(profile[PRO_INSTR]++);
 
                 /* Halt when Error flag was set */
+#ifndef EMUDEBUG
+FastPrimaryError:
+#endif
 		if ((!PrevError && ReadError) &&
-                    (exitonerror || (ReadHaltOnError)))
+                    (exitonerror || (ReadHaltOnError))) {
+			fprintf(stderr, "[EXIT] Error flag set! IPtr=0x%08X WPtr=0x%08X AReg=0x%08X exitonerror=%d HaltOnError=%d heartbeat=%llu\n",
+				IPtr, WPtr, AReg, exitonerror, ReadHaltOnError, (unsigned long long)heartbeat_counter);
+			fflush(stderr);
 			break;
-		if (quit == TRUE)
+		}
+		if (quit == TRUE) {
+			fprintf(stderr, "[EXIT] quit=TRUE IPtr=0x%08X WPtr=0x%08X heartbeat=%llu\n",
+				IPtr, WPtr, (unsigned long long)heartbeat_counter);
+			fflush(stderr);
 			break;
+		}
 
 #ifndef NDEBUG
                 fp_chkexcept ("mainloop");
@@ -4584,6 +8783,30 @@ int run_process (void)
 	{
 	        lastptr = BPtrReg[ProcPriority];
 
+		/* AUDIT: an interrupted lo-pri process must only resume via
+		 * the register-restoring branch above.  If it is ALSO on the
+		 * run queue and gets dequeued here, it runs with stale
+		 * A/B/C - the suspected cause of the nondeterministic
+		 * garbage-argument hangs (see pcpu heisenbug). */
+		{
+			static int audit = -1;
+			if (audit < 0) {
+				const char *e = getenv("T4_INT_AUDIT");
+				audit = (e && *e) ? atoi(e) : 0;
+			}
+			if (audit >= 1 && ReadInterrupt &&
+			    (ProcPriority == LoPriority) &&
+			    GetDescWPtr(ptr) ==
+			        GetDescWPtr(word (index (MostNeg, 11)))) {
+				fprintf(stderr,
+					"[INT-ALARM] interrupted process "
+					"0x%08X resumed via QUEUE (A/B/C "
+					"lost) at IPtr=0x%08X\n",
+					ptr, IPtr);
+				fflush(stderr);
+			}
+		}
+
 	        EMUDBG5 ("-I-EMUDBG: RunProcess: ProcPriority = %s, ptr = #%08X. FPtrReg[Hi] = #%08X, FPtrReg[Lo] = #%08X.\n",
                                 StrPrio(ProcPriority), ptr, FPtrReg[0], FPtrReg[1]);
 
@@ -4669,7 +8892,7 @@ int start_process (void)
 
 		/* Check timer queue, update timers. */
                 active = active || (!TimerQEmpty);
-                if (++count1 > delayCount1)
+                if (++count1 > delayCount1 * speed_multiplier)
 		        update_time ();
                 if (!Idle)
                 {
@@ -4785,6 +9008,18 @@ void interrupt (void)
 #endif
 
 	/* Store the registers. */
+	{
+		static int audit = -1;
+		if (audit < 0) {
+			const char *e = getenv("T4_INT_AUDIT");
+			audit = (e && *e) ? atoi(e) : 0;
+		}
+		if (audit >= 2)
+			fprintf(stderr,
+				"[INT] IPtr=0x%08X Wdesc=0x%08X A=0x%08X "
+				"B=0x%08X C=0x%08X\n",
+				IPtr, Wdesc, AReg, BReg, CReg);
+	}
 	writeword (index (MostNeg, 11), Wdesc);
         if (IdleProcess_p != Wdesc)
         {
@@ -4953,9 +9188,9 @@ INLINE void update_time (void)
 
 	count2 += elapsed_usec;
 
-	/* Check high priority timer queue if HiPriority or interrupts enabled. */
-        /* ??? Timers may be not enabled. */
-        schedule_timerq (HiPriority);
+        /* Check high priority timer queue if enabled. */
+        if (TimerEnableHi)
+                schedule_timerq (HiPriority);
 
 	if (count2 > 64) /* ~ 64us */
 	{
@@ -4964,8 +9199,9 @@ INLINE void update_time (void)
 		count3 += (count2 / 64);
 		count2  =  count2 & 63;
 
-		/* Check low priority timer queue if HiPriority or interrupts enabled. */
-                schedule_timerq (LoPriority);
+		/* Check low priority timer queue if enabled. */
+                if (TimerEnableLo)
+                        schedule_timerq (LoPriority);
 
 		if (count3 > 16) /* ~ 1024us */
 		{
@@ -4978,6 +9214,10 @@ INLINE void update_time (void)
 		check_input();
 #endif
 	}
+#ifdef T4_SDL_FB
+    display_pump();
+    display_present();
+#endif
 }
 
 #define CoreAddr(a)     (INT32(a) < INT32(ExtMemStart))
@@ -4986,10 +9226,335 @@ INLINE void update_time (void)
 #define ExtMemRange(a,n)(ExtMemAddr(a) && ExtMemAddr((a)+(n)))
 #define MemWordPtr(a)   ((CoreAddr(a) ? core : mem) + (MemWordMask & (a)))
 
+static INLINE u_char code_byte(uint32_t ptr)
+{
+        /* Positive addresses are never RAM/core (both live in the signed-
+         * negative half), so XiP fetch from the SD windows costs normal
+         * execution a single never-taken branch. */
+        if (unlikely((int32_t)ptr >= 0)) {
+                if (ptr - BOOTBANK_BASE < BOOTBANK_SIZE)
+                        return sd_read_byte(ptr - BOOTBANK_BASE);
+                if (ptr >= SD_BASE && ptr < SD_LIMIT)
+                        return sd_read_byte(ptr - SD_BASE);
+        }
+        if (likely(!CoreAddr(ptr)))
+                return mem[ptr & MemByteMask];
+        return core[ptr & MemByteMask];
+}
+
+/* UART helper functions */
+static int uart_rx_available(void)
+{
+#ifndef _MSC_VER
+	struct timeval tv = {0, 0};
+	fd_set readfds;
+	FD_ZERO(&readfds);
+	FD_SET(STDIN_FILENO, &readfds);
+	return select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv) > 0;
+#else
+	return 0;
+#endif
+}
+
+static u_char uart_read_byte(void)
+{
+	u_char ch = 0;
+#ifndef _MSC_VER
+	ssize_t ret __attribute__((unused));
+	ret = read(STDIN_FILENO, &ch, 1);
+#endif
+	return ch;
+}
+
+#ifdef T4_SDL_FB
+	static void fb_console_flush_buffer(const char *buf)
+{
+	if (!fb_console_enabled || !buf || !*buf)
+		return;
+	for (const char *p = buf; *p; ++p)
+		fb_console_putc((u_char)*p);
+}
+#endif
+
+static void uart_write_byte(u_char ch)
+{
+	static char early_buf[128];
+	static size_t early_len = 0;
+#ifdef T4_SDL_FB
+	static int fb_console_active = 0;
+#endif
+
+	early_printk_bytes++;
+	if (ch >= 32 && ch < 127) {
+		if (early_len < sizeof(early_buf) - 1) {
+			early_buf[early_len++] = (char)ch;
+		} else {
+			memmove(early_buf, early_buf + 1, sizeof(early_buf) - 2);
+			early_buf[sizeof(early_buf) - 2] = (char)ch;
+		}
+		early_buf[early_len < sizeof(early_buf) ? early_len : sizeof(early_buf) - 1] = '\0';
+		if (!early_printk_seen) {
+			if (strstr(early_buf, "Linux version") ||
+			    strstr(early_buf, "early console") ||
+			    strstr(early_buf, "Transputer Linux") ||
+			    strstr(early_buf, "EPK:")) {
+				early_printk_seen = 1;
+				if (early_printk_trace_enabled)
+					fprintf(stderr, "[EARLY_PRINTK] detected\n");
+#ifdef T4_SDL_FB
+				if (fb_console_enabled) {
+					fb_console_active = 1;
+					fb_console_flush_buffer(early_buf);
+				}
+#endif
+			}
+		}
+	}
+	/* Write directly to stdout */
+	putchar(ch);
+	fflush(stdout);
+#ifdef T4_SDL_FB
+	if (fb_console_enabled && fb_console_active)
+		fb_console_putc(ch);
+#endif
+}
+
+void mmio_early_printk_report(void)
+{
+	fprintf(stderr,
+	        "[EARLY_PRINTK] %s bytes=%llu iserver_stream1=%llu msgs=%llu uart_mmio=%llu uart_seen=%s\n",
+	        early_printk_seen ? "seen" : "not-seen",
+	        (unsigned long long)early_printk_bytes,
+	        (unsigned long long)iserver_stream1_bytes,
+	        (unsigned long long)iserver_stream1_msgs,
+	        (unsigned long long)uart_mmio_bytes,
+	        early_printk_seen_uart ? "yes" : "no");
+}
+
+static void uart_direct_track(u_char ch)
+{
+	static char uart_buf[128];
+	static size_t uart_len = 0;
+
+	/* Log to UART file */
+	if (uart_log_file) {
+		fputc(ch, uart_log_file);
+	}
+
+	/* T4_PLAY_MOUSE: headless input injection.  When the guest prints
+	 * T4_PLAY_MARKER (default "DESKTOP_READY"), push the packet list
+	 * "dx,dy,btn;dx,dy,btn;..." into the mouse UART fifo as 3-byte
+	 * serial packets (0x80|btn, dx, dy) — enough to move the fbwm
+	 * cursor and click a desktop icon without SDL.  One-shot. */
+	{
+		static const char *play_pkts = (const char *)-1;
+		static const char *play_marker;
+		static size_t play_match;
+
+		if (play_pkts == (const char *)-1) {
+			play_pkts = getenv("T4_PLAY_MOUSE");
+			play_marker = getenv("T4_PLAY_MARKER");
+			if (!play_marker || !*play_marker)
+				play_marker = "DESKTOP_READY";
+		}
+		if (play_pkts && *play_pkts) {
+			if (ch == (u_char)play_marker[play_match]) {
+				play_match++;
+				if (!play_marker[play_match]) {
+					const char *p = play_pkts;
+					int npkt = 0;
+					while (*p) {
+						int dx = 0, dy = 0, bt = 0;
+						if (sscanf(p, "%d,%d,%d",
+							   &dx, &dy, &bt) == 3) {
+							mouse_fifo_push((unsigned char)(0x80 | (bt & 7)));
+							mouse_fifo_push((unsigned char)(dx & 0xFF));
+							mouse_fifo_push((unsigned char)(dy & 0xFF));
+							npkt++;
+						}
+						p = strchr(p, ';');
+						if (!p)
+							break;
+						p++;
+					}
+					fprintf(stderr,
+						"[PLAY_MOUSE] marker \"%s\" seen — injected %d packets\n",
+						play_marker, npkt);
+					play_pkts = NULL;
+				}
+			} else {
+				play_match = (ch == (u_char)play_marker[0]) ? 1 : 0;
+			}
+		}
+	}
+
+	/* Attribute grouper cycles to phases of the run.  The guest's own
+	 * progress markers are the only phase boundaries the emulator can see, so
+	 * every complete line of UART output gets a cycle snapshot when
+	 * T4_T9K_MARKS is set (T4_T9000=1 is what enables the model at all).
+	 * The line is what the guest printed, so filtering to SPLASH_DONE /
+	 * LOGIN / DESKTOP_READY is a grep on the output rather than a rebuild. */
+	{
+		static char mark_buf[160];
+		static size_t mark_len = 0;
+		static int mark_on = -1;
+		static int record_on = -1;
+
+		if (mark_on < 0) {
+			const char *e = getenv("T4_T9K_MARKS");
+			mark_on = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+			record_on = t4_env_truthy("T4_FB_RECORD_ON_FLIP");
+		}
+		if (mark_on || record_on) {
+			if (ch == '\n' || ch == '\r') {
+				if (mark_len) {
+					mark_buf[mark_len] = '\0';
+					if (mark_on)
+						t9k_mark(mark_buf);
+#ifdef T4_SDL_FB
+					/* Current kernels may carry an fbwm built before the
+					 * FLIP marker ABI.  Its existing completion messages
+					 * provide equivalent, tear-free boot boundaries. */
+					if (record_on &&
+					    (!strcmp(mark_buf, "SPLASH_DONE") ||
+					     !strcmp(mark_buf, "LOGIN_DONE") ||
+					     !strcmp(mark_buf, "DESKTOP_READY"))) {
+						t4_fb_record_present_seen = 1;
+						t4_fb_record_capture(0);
+					}
+#endif
+					mark_len = 0;
+				}
+			} else if (ch >= 32 && ch < 127 &&
+			           mark_len < sizeof(mark_buf) - 1) {
+				mark_buf[mark_len++] = (char)ch;
+			}
+		}
+	}
+
+	uart_mmio_bytes++;
+	if (ch >= 32 && ch < 127) {
+		if (uart_len < sizeof(uart_buf) - 1) {
+			uart_buf[uart_len++] = (char)ch;
+		} else {
+			memmove(uart_buf, uart_buf + 1, sizeof(uart_buf) - 2);
+			uart_buf[sizeof(uart_buf) - 2] = (char)ch;
+		}
+		uart_buf[uart_len < sizeof(uart_buf) ? uart_len : sizeof(uart_buf) - 1] = '\0';
+		if (!early_printk_seen_uart) {
+			if (strstr(uart_buf, "Linux version") ||
+			    strstr(uart_buf, "early console") ||
+			    strstr(uart_buf, "Transputer Linux") ||
+			    strstr(uart_buf, "EPK:")) {
+				early_printk_seen_uart = 1;
+				if (early_printk_trace_enabled)
+					fprintf(stderr, "[EARLY_PRINTK] uart-direct detected\n");
+			}
+		}
+	}
+}
+
 /* Read a word from memory. */
 uint32_t word_int (uint32_t ptr)
 {
 	uint32_t result;
+
+	/* T9000 P-mode: translate logical address first. */
+	if (unlikely(t9k_in_p() && !t9k_prot.phys_bypass))
+		ptr = t9k_translate(ptr, T9K_ACC_READ);
+
+	/* Fast path: normal extended memory below the historical MMIO cliff
+	 * (0x90000000). Guest FB carveout at 0x81E00000 sits inside that
+	 * window and is handled separately. */
+	if (likely((uint32_t)(ptr - ExtMemStart) < (uint32_t)(ram_fast_limit - ExtMemStart))) {
+#ifdef T4_SDL_FB
+		if (unlikely(fb_addr_in_range(ptr))) {
+			result = 0;
+			for (int i = 0; i < 4; i++)
+				result |= ((uint32_t)fb_read_byte(ptr + i)) << (8 * i);
+			return result;
+		}
+#endif
+		return *(uint32_t *)(mem + (MemWordMask & ptr));
+	}
+
+	/* Word reads from the SD windows — T9000 boot bank ("reads for
+	 * configuration words are assembled from bytes", TIS 10.5.1) and
+	 * the flat card mapping. */
+	if (ptr - BOOTBANK_BASE < BOOTBANK_SIZE - 3 ||
+	    (ptr >= SD_BASE && ptr < SD_LIMIT - 3)) {
+		uint32_t off = (ptr - BOOTBANK_BASE < BOOTBANK_SIZE)
+			? ptr - BOOTBANK_BASE : ptr - SD_BASE;
+		return (uint32_t)sd_read_byte(off) |
+		       ((uint32_t)sd_read_byte(off + 1) << 8) |
+		       ((uint32_t)sd_read_byte(off + 2) << 16) |
+		       ((uint32_t)sd_read_byte(off + 3) << 24);
+	}
+
+	/* With -ss, Link0In is an architectural channel word.  The host
+	 * server must be able to store/read the waiting workspace descriptor
+	 * there; only use the byte-stream MMIO shim when no server is active. */
+	if (unlikely(!serve && ptr == LINK0_IN))
+		return (uint32_t)mmio_iserver_read_byte();
+
+	/* Check for UART register access */
+	if (ptr == UART_STATUS) {
+		if (uart_trace_enabled)
+			fprintf(stderr, "[UART_RD_WORD: addr=0x%08X]\n", ptr);
+		result = UART_STATUS_TXRDY;  /* TX always ready */
+		if (uart_rx_available())
+			result |= UART_STATUS_RXAVAIL;
+		return result;
+	}
+	if (ptr == UART_DATA) {
+		if (uart_trace_enabled)
+			fprintf(stderr, "[UART_RD_WORD: addr=0x%08X]\n", ptr);
+		result = uart_read_byte();
+		return result;
+	}
+
+	/* T4Net MMIO word read */
+	if (ptr >= VIRTIO_NET_BASE && ptr < VIRTIO_NET_BASE + 0x3000) {
+		result = 0;
+		for (int i = 0; i < 4; i++)
+			result |= ((uint32_t)virtio_net_read_byte(ptr + i)) << (8 * i);
+		return result;
+	}
+
+#ifdef T4_SDL_FB
+	/* VGA controller register reads */
+	if (ptr == VGA_CTRL_CONTROL) return vga_ctrl_control;
+	if (ptr == VGA_CTRL_FB_BASE) return vga_ctrl_fb_base;
+	if (ptr == VGA_CTRL_WIDTH)   return vga_ctrl_width;
+	if (ptr == VGA_CTRL_HEIGHT)  return vga_ctrl_height;
+	if (ptr == VGA_CTRL_STRIDE)  return vga_ctrl_stride;
+
+	/* Keyboard UART (UART1 @ 0x11000000) */
+	if (ptr == KBD_UART_STATUS) {
+		uint32_t s = INPUT_UART_STATUS_TXRDY;
+		if (kbd_fifo_available()) s |= INPUT_UART_STATUS_RXAVAIL;
+		return s;
+	}
+	if (ptr == KBD_UART_DATA)
+		return (uint32_t)kbd_fifo_pop();
+
+	/* Mouse UART (UART2 @ 0x12000000) */
+	if (ptr == MOUSE_UART_STATUS) {
+		uint32_t s = INPUT_UART_STATUS_TXRDY;
+		if (mouse_fifo_available()) s |= INPUT_UART_STATUS_RXAVAIL;
+		return s;
+	}
+	if (ptr == MOUSE_UART_DATA)
+		return (uint32_t)mouse_fifo_pop();
+
+	if (fb_range_intersects(ptr, sizeof(uint32_t))) {
+		result = 0;
+		for (int i = 0; i < 4; i++) {
+			result |= ((uint32_t)fb_read_byte(ptr + i)) << (8 * i);
+		}
+		return result;
+	}
+#endif
 #if BYTE_ORDER==1234
 #ifndef _MSC_VER
 #warning Using little-endian access!
@@ -5050,6 +9615,312 @@ uint32_t word (uint32_t ptr)
 /* Write a word to memory. */
 void writeword_int (uint32_t ptr, uint32_t value)
 {
+#ifndef NDEBUG
+	static int write_count = 0;
+#endif
+	static int uart_col = 0;  /* Track column position for console output */
+	u_char ch = 0;
+	static uint32_t watch_addr = 0;
+
+	/* T9000 P-mode: translate + write-permit check. */
+	if (unlikely(t9k_in_p() && !t9k_prot.phys_bypass))
+		ptr = t9k_translate(ptr, T9K_ACC_WRITE);
+
+	/* Keep the write watchpoint ahead of the normal-RAM fast return. */
+	if (!watch_addr) {
+		const char *wa = getenv("T4_WATCH_ADDR");
+		watch_addr = wa ? (uint32_t)strtoul(wa, NULL, 16) : 0xFFFFFFFF;
+	}
+	if (unlikely(watch_addr != 0xFFFFFFFF &&
+	    (ptr & ~3u) == (watch_addr & ~3u))) {
+		/* Ring-buffer the hits instead of printing (the address is
+		 * usually a reused stack slot with millions of legitimate
+		 * writes); the last entries are dumped with each LIVE-FRAME,
+		 * so at a stall the final writers are visible. */
+		extern uint32_t watch_ring[128][3];
+		extern uint32_t watch_ring_n;
+		extern volatile uint64_t heartbeat_counter;
+		watch_ring[watch_ring_n & 127u][0] = value;
+		watch_ring[watch_ring_n & 127u][1] = IPtr;
+		watch_ring[watch_ring_n & 127u][2] =
+		    (uint32_t)heartbeat_counter;
+		watch_ring_n++;
+	}
+
+	/* Word writes to the SD windows (boot bank alias + flat card). */
+	if (ptr - BOOTBANK_BASE < BOOTBANK_SIZE - 3 ||
+	    (ptr >= SD_BASE && ptr < SD_LIMIT - 3)) {
+		uint32_t off = (ptr - BOOTBANK_BASE < BOOTBANK_SIZE)
+			? ptr - BOOTBANK_BASE : ptr - SD_BASE;
+		sd_write_byte(off, (u_char)(value & 0xFF));
+		sd_write_byte(off + 1, (u_char)((value >> 8) & 0xFF));
+		sd_write_byte(off + 2, (u_char)((value >> 16) & 0xFF));
+		sd_write_byte(off + 3, (u_char)((value >> 24) & 0xFF));
+		return;
+	}
+
+	/* Fast path: normal extended memory below the historical MMIO cliff.
+	 * FB carveout (0x81E00000) and legacy alias (0x90000000) redirect
+	 * into the host VGA surface so SDL present sees the pixels. */
+	if (likely((uint32_t)(ptr - ExtMemStart) < (uint32_t)(ram_fast_limit - ExtMemStart))) {
+#ifdef T4_SDL_FB
+		if (unlikely(fb_addr_in_range(ptr))) {
+			uint32_t fb_off;
+			if (fb_addr_to_offset(ptr, &fb_off) && fb_off + 4 <= FB_SIZE) {
+				*(uint32_t *)(vga_framebuffer + fb_off) = value;
+				vga_mark_dirty_offset(fb_off);
+			} else {
+				for (int i = 0; i < 4; i++)
+					writebyte_int(ptr + i, (u_char)((value >> (8 * i)) & 0xFF));
+			}
+			return;
+		}
+#endif
+		*(uint32_t *)(mem + (MemWordMask & ptr)) = value;
+		InvalidateRange(ptr, 4);
+		return;
+	}
+
+	/* Preserve the architectural Link0Out channel word in -ss mode. */
+	if (unlikely(!serve && ptr == LINK0_OUT)) {
+		static int mmio_word_log_count = 0;
+		if (link0_trace_enabled && mmio_word_log_count < 8) {
+		if (mmio_trace_enabled) {
+			fprintf(stderr, "[MMIO_OUT_WORD: addr=0x%08X val=0x%08X]\n", ptr, value);
+		}
+			mmio_word_log_count++;
+		}
+		mmio_iserver_write_byte((u_char)(value & 0xFF));
+		return;
+	}
+
+	/* T4Net MMIO word write */
+	if (ptr >= VIRTIO_NET_BASE && ptr < VIRTIO_NET_BASE + 0x3000) {
+		for (int i = 0; i < 4; i++)
+			virtio_net_write_byte(ptr + i, (u_char)((value >> (8 * i)) & 0xFF));
+		return;
+	}
+
+	/* Debug: Log ALL writes to see UART activity */
+	/* DISABLED: Too verbose during memory init */
+	/* fprintf(stderr, "[WR#%d: addr=0x%08X val=0x%08X]\n", write_count, ptr, value); */
+
+	/* BUT: Log UART writes specifically for debugging */
+	if (ptr == UART_DATA) {
+		ch = (u_char)(value & 0xFF);
+		if (uart_trace_enabled) {
+			fprintf(stderr, "[UART_WR_WORD: addr=0x%08X val=0x%08X]\n", ptr, value);
+			fprintf(stderr, "[UART_WR_WORD_IPTR: IPtr=0x%08X addr=0x%08X val=0x%08X]\n",
+			        IPtr, ptr, value);
+		}
+		if (outbyte_trace_enabled) {
+			uint32_t delta = 0;
+			const link_sym *lsym = find_link_sym(IPtr, &delta);
+			const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+			fprintf(stderr,
+			        "[UART_WR_IPTR] IPtr=0x%08X val=0x%02X%s%s\n",
+			        IPtr, value & 0xFF,
+			        (lsym || sym) ? " sym=" : "",
+			        lsym ? lsym->name : (sym ? sym->name : ""));
+			if (lsym) {
+				fprintf(stderr, "             sym_off=0x%X+0x%X\n",
+				        lsym->sym_off, delta);
+			} else if (sym) {
+				fprintf(stderr, "             sym_off=0x%X+0x%X\n",
+				        sym->text_off, delta);
+			}
+		}
+		if (uart_console_enabled && uart_trace_enabled) {
+			fprintf(stderr, "[UART: val=0x%02X='%c']\n", value & 0xFF,
+			        (value >= 32 && value < 127) ? (char)(value & 0xFF) : '?');
+		}
+	}
+#ifndef NDEBUG
+	write_count++;
+#endif
+
+	/* Trace writes into kernel text region to catch self-modifying clobbers. */
+	if (text_write_trace_enabled &&
+	    ptr >= 0x80880000 && ptr < 0x80890000 &&
+	    IPtr != 0) {
+		uint32_t delta = 0;
+		const link_sym *lsym = find_link_sym(IPtr, &delta);
+		const prolog_sym *sym = lsym ? NULL : find_prolog_sym(IPtr, &delta);
+		u_char op0 = byte_int(IPtr);
+		u_char op1 = byte_int(IPtr + 1);
+		u_char op2 = byte_int(IPtr + 2);
+		u_char op3 = byte_int(IPtr + 3);
+		fprintf(stderr,
+		        "[TEXT_WR] IPtr=0x%08X op=%02X %02X %02X %02X A=0x%08X B=0x%08X C=0x%08X O=0x%08X addr=0x%08X val=0x%08X%s%s\n",
+		        IPtr, op0, op1, op2, op3, AReg, BReg, CReg, OReg, ptr, value,
+		        (lsym || sym) ? " sym=" : "",
+		        lsym ? lsym->name : (sym ? sym->name : ""));
+		if (lsym) {
+			fprintf(stderr, "         sym_off=0x%X+0x%X\n",
+			        lsym->sym_off, delta);
+		} else if (sym) {
+			fprintf(stderr, "         sym_off=0x%X+0x%X\n",
+			        sym->text_off, delta);
+		}
+	}
+
+	/* Check for UART register access FIRST (before general logging) */
+		if (ptr == UART_DATA) {
+		/* Debug: log to stderr that we're writing to UART */
+		static int uart_verbose = -1;
+		if (uart_verbose < 0) {
+			const char *env = getenv("T4_UART_VERBOSE");
+			uart_verbose = env && *env && strcmp(env, "0") != 0;
+		}
+		if (uart_verbose) {
+			fprintf(stderr, "[UART_LOG] IPtr=0x%08X WPtr=0x%08X ch=0x%02X '%c'\n",
+				IPtr, WPtr, ch, (ch >= 32 && ch < 127) ? ch : '?');
+		}
+		uart_direct_track(ch);
+		if (!uart_console_enabled)
+			return;
+
+		// Check for banner to trigger PNG save
+		static char banner_buf[100];
+		static int banner_idx = 0;
+		static int banner_detected = 0;
+
+		if (!banner_detected) {
+			banner_buf[banner_idx++] = ch;
+			if (banner_idx >= sizeof(banner_buf) - 1) {
+				banner_buf[banner_idx] = '\0'; // Null terminate
+				banner_idx = 0;
+			}
+
+			// Check if we have the init banner (not just any "Transputer" string)
+			if (strstr(banner_buf, "PID1:init-ready")) {
+				banner_detected = 1;
+				if (png_save_filename) {
+					char banner_name[512];
+					snprintf(banner_name, sizeof(banner_name), "%s.banner.png", png_save_filename);
+					fprintf(stderr, "[BANNER] Detected init-ready banner, saving framebuffer to %s\n", banner_name);
+					save_framebuffer_png(banner_name);
+				}
+			}
+		}
+
+		/* Emit to console - handle newlines properly */
+		if (ch == '\n') {
+			putchar('\n');
+			fflush(stdout);
+			uart_col = 0;
+		} else if (ch == '\r') {
+			putchar('\r');
+			fflush(stdout);
+			uart_col = 0;
+		} else if (ch >= 32 && ch < 127) {
+			/* Printable ASCII */
+			putchar(ch);
+			fflush(stdout);
+			uart_col++;
+			if (uart_col >= 80) {
+				putchar('\n');
+				fflush(stdout);
+				uart_col = 0;
+			}
+		} else {
+			/* Non-printable - suppress RET instruction artifacts */
+			if (ch != 0xF0) {  /* Filter out OPR 0 (REV/RET) artifacts */
+				fprintf(stderr, "[0x%02X]", ch);
+				uart_col += 6;
+			}
+			/* Suppress 0xF0 which appears from RET instruction logging */
+		}
+		return;
+	}
+	if (ptr == UART_STATUS) {
+		if (uart_trace_enabled)
+			fprintf(stderr, "[UART_WR_WORD_STATUS: addr=0x%08X ignored]\n", ptr);
+		/* Status register is read-only, ignore writes */
+		fprintf(stderr, "[UART_WR_STATUS: addr=0x%08X ignored]\n", ptr);
+		return;
+	}
+
+#ifdef T4_SDL_FB
+	/* VGA Controller register handling at 0xA0000000 */
+	if (ptr == VGA_CTRL_CONTROL) {
+		uint32_t old_ctrl = vga_ctrl_control;
+		vga_ctrl_control = value;
+		/* Force present when display is first enabled */
+		if ((value & VGA_CTRL_ENABLE) && !(old_ctrl & VGA_CTRL_ENABLE)) {
+			if (vga_ctrl_width != FB_WIDTH || vga_ctrl_height != FB_HEIGHT)
+				display_resize(vga_ctrl_width, vga_ctrl_height);
+			vga_dirty = 1;
+			vga_dirty_y0 = 0;
+			vga_dirty_y1 = (int)(vga_ctrl_height ? vga_ctrl_height : FB_HEIGHT) - 1;
+			display_present_force();
+		}
+		return;
+	}
+	if (ptr == VGA_CTRL_FB_BASE) {
+		vga_ctrl_fb_base = value;
+		return;
+	}
+	if (ptr == VGA_CTRL_WIDTH) {
+		vga_ctrl_width = value;
+		return;
+	}
+	if (ptr == VGA_CTRL_HEIGHT) {
+		vga_ctrl_height = value;
+		return;
+	}
+	if (ptr == VGA_CTRL_STRIDE) {
+		vga_ctrl_stride = value;
+		return;
+	}
+	if (ptr == VGA_CTRL_FLIP) {
+		/* P2: present from back buffer without full-frame memcpy.
+		 * value is guest VA of buffer to show (or 0 = FB_BASE front).
+		 * Guest only owns FB_SIZE; host double-buffer offsets stay
+		 * in vga_framebuffer[FB_TOTAL]. */
+		uint32_t src = value ? value : FB_BASE;
+		uint32_t src_off;
+		if (fb_addr_to_offset(src, &src_off)) {
+			if (src_off != 0 && src_off + FB_SIZE <= FB_TOTAL)
+				vga_front_offset = src_off;
+			else
+				vga_front_offset = 0;
+		}
+		vga_dirty = 1;
+		vga_dirty_y0 = 0;
+		vga_dirty_y1 = (int)(vga_ctrl_height ? vga_ctrl_height : FB_HEIGHT) - 1;
+		display_present_force();
+		t4_fb_record_flip(value != 0);
+		return;
+	}
+	if (ptr == VGA_CTRL_SCREENSHOT) {
+		static int ss_count = 0;
+		char sname[64];
+		snprintf(sname, sizeof(sname), "screenshot_%d.bmp", ss_count++);
+		fprintf(stderr, "[VGA] SCREENSHOT: saving %s\n", sname);
+		vga_dump_framebuffer_bmp(sname, ss_count - 1);
+		return;
+	}
+	if (ptr == VGA_CTRL_LEAVE_P) {
+		/* Kernel SPAWN_EXIT: abandon P without trap (C-call exit path). */
+		t9k_leave_p();
+		return;
+	}
+
+	if (fb_range_intersects(ptr, sizeof(uint32_t))) {
+		uint32_t fb_off;
+		if (fb_addr_to_offset(ptr, &fb_off) && fb_off + 4 <= FB_SIZE) {
+			/* Single word store into guest-visible front buffer */
+			*(uint32_t *)(vga_framebuffer + fb_off) = value;
+			vga_mark_dirty_offset(fb_off);
+		} else {
+			for (int i = 0; i < 4; i++)
+				writebyte_int(ptr + i, (u_char)((value >> (8 * i)) & 0xFF));
+		}
+		return;
+	}
+#endif
+
 #if BYTE_ORDER==1234
 #ifndef _MSC_VER
 #warning Using little-endian access!
@@ -5103,11 +9974,93 @@ u_char byte_int (uint32_t ptr)
 {
 	u_char result;
 
+	if (unlikely(t9k_in_p() && !t9k_prot.phys_bypass))
+		ptr = t9k_translate(ptr, T9K_ACC_READ);
+
+	/* Fast path: RAM below historical MMIO cliff; FB carveout redirected. */
+	if (likely((uint32_t)(ptr - ExtMemStart) < (uint32_t)(ram_fast_limit - ExtMemStart))) {
+#ifdef T4_SDL_FB
+		if (unlikely(fb_addr_in_range(ptr)))
+			return fb_read_byte(ptr);
+#endif
+		return mem[ptr & MemByteMask];
+	}
+
+	if (unlikely(!serve && ptr == LINK0_IN))
+		return mmio_iserver_read_byte();
+
+	/* Check for SD card access */
+	if (ptr - BOOTBANK_BASE < BOOTBANK_SIZE) {
+		return sd_read_byte(ptr - BOOTBANK_BASE);
+	}
+
+	if (ptr >= SD_BASE && ptr < SD_LIMIT) {
+		return sd_read_byte(ptr - SD_BASE);
+	}
+
+	/* Check for virtio-net access */
+	if (ptr >= VIRTIO_NET_BASE && ptr < VIRTIO_NET_BASE + 0x3000) {
+		return virtio_net_read_byte(ptr);
+	}
+
+	/* Check for UART register access */
+	if ((ptr & ~3) == UART_BASE) {
+		int offset = ptr & 3;
+		if (ptr == UART_STATUS) {
+			uint32_t status = UART_STATUS_TXRDY;
+			if (uart_rx_available())
+				status |= UART_STATUS_RXAVAIL;
+			return (u_char)((status >> (offset * 8)) & 0xFF);
+		}
+
+		/* Treat all other offsets in the 4-byte window as data register */
+		result = uart_read_byte();
+		return result;
+	}
+
+#ifdef T4_SDL_FB
+	/* Keyboard UART byte read */
+	if ((ptr & ~3) == KBD_UART_BASE) {
+		if (ptr == KBD_UART_STATUS) {
+			uint32_t s = INPUT_UART_STATUS_TXRDY;
+			if (kbd_fifo_available()) s |= INPUT_UART_STATUS_RXAVAIL;
+			return (u_char)s;
+		}
+		return kbd_fifo_pop();
+	}
+
+	/* Mouse UART byte read */
+	if ((ptr & ~3) == MOUSE_UART_BASE) {
+		if (ptr == MOUSE_UART_STATUS) {
+			uint32_t s = INPUT_UART_STATUS_TXRDY;
+			if (mouse_fifo_available()) s |= INPUT_UART_STATUS_RXAVAIL;
+			return (u_char)s;
+		}
+		return mouse_fifo_pop();
+	}
+
+	if (fb_addr_in_range(ptr))
+		return fb_read_byte(ptr);
+#endif
+
 	/* Get byte, ensuring memory reference is in range. */
         if (CoreAddr(ptr))
 	        result = core[(ptr & MemByteMask)];
         else
 	        result = mem[(ptr & MemByteMask)];
+
+	/* Memory read watchpoint (byte) */
+	{
+	    static uint32_t watch_addr_rb = 0;
+	    if (!watch_addr_rb) {
+	        const char *wa = getenv("T4_WATCH_ADDR");
+	        watch_addr_rb = wa ? (uint32_t)strtoul(wa, NULL, 16) : 0xFFFFFFFF;
+	    }
+	    if (watch_addr_rb != 0xFFFFFFFF && ptr >= watch_addr_rb && ptr < watch_addr_rb + 4) {
+	        fprintf(stderr, "[WATCH_RB] addr=0x%08X val=0x%02X IPtr=0x%08X WPtr=0x%08X core=%d idx=0x%X\n",
+	                ptr, result, IPtr, WPtr, CoreAddr(ptr) ? 1 : 0, ptr & MemByteMask);
+	    }
+	}
 
 	return (result);
 }
@@ -5128,6 +10081,89 @@ u_char byte (uint32_t ptr)
 /* Write a byte to memory. */
 INLINE void writebyte_int (uint32_t ptr, u_char value)
 {
+	if (unlikely(t9k_in_p() && !t9k_prot.phys_bypass))
+		ptr = t9k_translate(ptr, T9K_ACC_WRITE);
+
+	/* Fast path: RAM below historical MMIO cliff; FB carveout redirected. */
+	if (likely((uint32_t)(ptr - ExtMemStart) < (uint32_t)(ram_fast_limit - ExtMemStart))) {
+#ifdef T4_SDL_FB
+		if (unlikely(fb_addr_in_range(ptr))) {
+			fb_write_byte(ptr, value);
+			return;
+		}
+#endif
+		mem[ptr & MemByteMask] = value;
+		INVALIDATE_ADDR(ptr);
+		return;
+	}
+
+	if (unlikely(!serve && ptr == LINK0_OUT)) {
+		mmio_iserver_write_byte(value);
+		return;
+	}
+
+	/* Check for SD card access */
+	if (ptr - BOOTBANK_BASE < BOOTBANK_SIZE) {
+		sd_write_byte(ptr - BOOTBANK_BASE, value);
+		return;
+	}
+
+	if (ptr >= SD_BASE && ptr < SD_LIMIT) {
+		sd_write_byte(ptr - SD_BASE, value);
+		return;
+	}
+
+	/* Check for virtio-net access */
+	if (ptr >= VIRTIO_NET_BASE && ptr < VIRTIO_NET_BASE + 0x3000) {
+		virtio_net_write_byte(ptr, value);
+		return;
+	}
+
+	/* Check for UART register access */
+	if ((ptr & ~3) == UART_BASE) {
+		if (uart_trace_enabled) {
+			fprintf(stderr, "[UART_WR_BYTE: addr=0x%08X val=0x%02X]\n", ptr, value);
+			fprintf(stderr, "[UART_WR_BYTE_IPTR: IPtr=0x%08X addr=0x%08X val=0x%02X]\n",
+			        IPtr, ptr, value);
+		}
+		if (ptr == UART_STATUS) {
+			if (uart_trace_enabled)
+				fprintf(stderr, "[UART_WR_BYTE_STATUS: addr=0x%08X ignored]\n", ptr);
+			return;
+		}
+		uart_direct_track(value);
+		if (uart_console_enabled) {
+			if (uart_trace_enabled) {
+				fprintf(stderr, "[UART_WR_BYTE: addr=0x%08X val=0x%02X ch='%c']\n",
+				        ptr, value, (value >= 32 && value < 127) ? (char)value : '.');
+
+			}
+			putchar(value);
+			fflush(stdout);
+		}
+		return;
+	}
+
+#ifdef T4_SDL_FB
+	if (fb_addr_in_range(ptr)) {
+		fb_write_byte(ptr, value);
+		return;
+	}
+#endif
+
+	/* Memory write watchpoint (byte) */
+	{
+	    static uint32_t watch_addr_b = 0;
+	    if (!watch_addr_b) {
+	        const char *wa = getenv("T4_WATCH_ADDR");
+	        watch_addr_b = wa ? (uint32_t)strtoul(wa, NULL, 16) : 0xFFFFFFFF;
+	    }
+	    if (watch_addr_b != 0xFFFFFFFF && ptr >= watch_addr_b && ptr < watch_addr_b + 4) {
+	        fprintf(stderr, "[WATCH_WB] addr=0x%08X val=0x%02X IPtr=0x%08X WPtr=0x%08X\n",
+	                ptr, value, IPtr, WPtr);
+	    }
+	}
+
 	/* Write byte, ensuring memory reference is in range. */
         if (CoreAddr(ptr))
                 core[(ptr & MemByteMask)] = value;
@@ -5141,6 +10177,29 @@ INLINE void writebyte_int (uint32_t ptr, u_char value)
 INLINE u_char* memrange (uint32_t ptr, u_char *data, uint32_t len)
 {
         u_char *dst;
+#ifdef T4_SDL_FB
+        if (len)
+        {
+                uint32_t off;
+                uint64_t start = ptr;
+                uint64_t end = start + (uint64_t)len;
+                if (fb_addr_to_offset(ptr, &off) &&
+                    (end - start) <= (uint64_t)(FB_SIZE - off) &&
+                    fb_addr_in_range((uint32_t)(end - 1)))
+                        return vga_framebuffer + off;
+        }
+#endif
+        /* SD windows FIRST: ExtMemAddr() below is a SIGNED comparison, so
+         * positive window addresses (0x20000000/0x7F000000) would match
+         * "extended memory" and hand back RAM garbage.  Direct pointers
+         * into the card buffer let block moves (move instruction, iserver
+         * DMA) work from/to the card. */
+        if (len && ptr - BOOTBANK_BASE < BOOTBANK_SIZE &&
+            (uint64_t)(ptr - BOOTBANK_BASE) + len <= BOOTBANK_SIZE)
+                return t4_sd_buffer() + (ptr - BOOTBANK_BASE);
+        if (len && ptr >= SD_BASE && ptr < SD_LIMIT &&
+            (uint64_t)(ptr - SD_BASE) + len <= SD_SIZE)
+                return t4_sd_buffer() + (ptr - SD_BASE);
         if (CoreRange(ptr,len))
         {
                 dst = core + (ptr & MemByteMask);
@@ -5158,6 +10217,10 @@ INLINE u_char* memrange (uint32_t ptr, u_char *data, uint32_t len)
 INLINE void writebytes_int (uint32_t ptr, u_char *data, uint32_t len)
 {
         u_char *dst;
+#ifdef T4_SDL_FB
+        if (fb_range_intersects(ptr, len))
+                fb_write_bytes(ptr, data, len);
+#endif
 	/* Write byte, ensuring memory reference is in range. */
         if (CoreRange(ptr,len))
         {
@@ -5167,6 +10230,21 @@ INLINE void writebytes_int (uint32_t ptr, u_char *data, uint32_t len)
         }
         else if (ExtMemAddr(ptr))
         {
+                /* Memory write watchpoint (bulk) */
+                {
+                    static uint32_t watch_addr_bk = 0;
+                    if (!watch_addr_bk) {
+                        const char *wa = getenv("T4_WATCH_ADDR");
+                        watch_addr_bk = wa ? (uint32_t)strtoul(wa, NULL, 16) : 0xFFFFFFFF;
+                    }
+                    if (watch_addr_bk != 0xFFFFFFFF) {
+                        uint32_t wend = watch_addr_bk + 4;
+                        if (ptr <= wend && (ptr + len) > watch_addr_bk) {
+                            fprintf(stderr, "[WATCH_WBULK] ptr=0x%08X len=%u IPtr=0x%08X WPtr=0x%08X\n",
+                                    ptr, len, IPtr, WPtr);
+                        }
+                    }
+                }
                 dst = mem + (ptr & MemByteMask);
                 memcpy (dst, data, len);
                 InvalidateRange (ptr, len);
@@ -5183,6 +10261,86 @@ INLINE void writebytes_int (uint32_t ptr, u_char *data, uint32_t len)
 INLINE void movebytes_int (uint32_t dst, uint32_t src, uint32_t len)
 {
         u_char *p, *q;
+#ifdef T4_SDL_FB
+        if (len && (fb_range_intersects(dst, len) || fb_range_intersects(src, len)))
+        {
+                /* Fast path: bulk read from source, bulk write to dest.
+                 * Use a stack buffer for small moves, heap for large. */
+                unsigned char tmp_stack[4096];
+                unsigned char *tmp = (len <= sizeof(tmp_stack)) ? tmp_stack : malloc(len);
+                if (!tmp) goto fb_slow;
+
+                /* Read source bytes — use direct pointer when possible */
+                {
+                    u_char *sp = memrange(src, tmp, len);
+                    if (sp != tmp)
+                        memcpy(tmp, sp, len);
+                }
+
+                /* Write dest: bulk FB path when dest hits either FB window */
+                if (fb_range_intersects(dst, len)) {
+                        size_t i;
+                        for (i = 0; i < len; i++) {
+                                uint32_t a = dst + (uint32_t)i;
+                                if (fb_addr_in_range(a))
+                                        fb_write_byte(a, tmp[i]);
+                                else
+                                        /* writebyte_int routes the on-chip
+                                         * core region (0x80000000-0x800007FF)
+                                         * to core[]; a raw mem[] store here
+                                         * left code_byte reading zeros for a
+                                         * kernel loaded at 0x80000070. */
+                                        writebyte_int(a, tmp[i]);
+                        }
+                        vga_dirty = 1;
+                } else if (CoreAddr(dst)) {
+                        /* Destination starts in the on-chip core region —
+                         * route byte-wise so the core/mem split holds. */
+                        size_t i;
+                        for (i = 0; i < len; i++)
+                                writebyte_int(dst + (uint32_t)i, tmp[i]);
+                } else {
+                        /* Dest not in FB, just regular memory */
+                        p = mem + (dst & MemByteMask);
+                        memcpy(p, tmp, len);
+                }
+
+                if (tmp != tmp_stack)
+                        free(tmp);
+                InvalidateRange(dst, len);
+                return;
+        fb_slow:
+                /* Fallback: byte-at-a-time */
+                if (dst < src) {
+                        for (uint32_t i = 0; i < len; i++)
+                                writebyte_int(dst + i, byte_int(src + i));
+                } else if (dst > src) {
+                        for (uint32_t i = len; i > 0; i--)
+                                writebyte_int(dst + i - 1, byte_int(src + i - 1));
+                }
+                return;
+        }
+#endif
+
+	/* SD windows: ExtMemAddr() below is signed and would claim the
+	 * positive window addresses, moving RAM garbage instead of card
+	 * bytes.  Route any move touching a card window through the
+	 * byte accessors (which know the windows). */
+        if ((src - BOOTBANK_BASE < BOOTBANK_SIZE) ||
+            (dst - BOOTBANK_BASE < BOOTBANK_SIZE) ||
+            (src >= SD_BASE && src < SD_LIMIT) ||
+            (dst >= SD_BASE && dst < SD_LIMIT))
+        {
+                uint32_t i;
+                if (dst <= src)
+                        for (i = 0; i < len; i++)
+                                writebyte_int(dst + i, byte_int(src + i));
+                else
+                        for (i = len; i > 0; i--)
+                                writebyte_int(dst + i - 1, byte_int(src + i - 1));
+                InvalidateRange (dst, len);
+                return;
+        }
 
 	/* Write byte, ensuring memory reference is in range. */
         if (CoreRange(src,len) && CoreRange(dst,len))
@@ -5194,6 +10352,21 @@ INLINE void movebytes_int (uint32_t dst, uint32_t src, uint32_t len)
         }
         else if (ExtMemAddr(src) && ExtMemAddr(dst))
         {
+                /* Memory move watchpoint */
+                {
+                    static uint32_t watch_addr_mv = 0;
+                    if (!watch_addr_mv) {
+                        const char *wa = getenv("T4_WATCH_ADDR");
+                        watch_addr_mv = wa ? (uint32_t)strtoul(wa, NULL, 16) : 0xFFFFFFFF;
+                    }
+                    if (watch_addr_mv != 0xFFFFFFFF) {
+                        uint32_t wend = watch_addr_mv + 4;
+                        if (dst <= wend && (dst + len) > watch_addr_mv) {
+                            fprintf(stderr, "[WATCH_MOVE] dst=0x%08X src=0x%08X len=%u IPtr=0x%08X WPtr=0x%08X\n",
+                                    dst, src, len, IPtr, WPtr);
+                        }
+                    }
+                }
                 p = mem + (dst & MemByteMask);
                 q = mem + (src & MemByteMask);
                 memmove (p, q, len);
@@ -5213,6 +10386,18 @@ INLINE void movebytes_int (uint32_t dst, uint32_t src, uint32_t len)
 INLINE u_char* bytes_int (uint32_t ptr, u_char *data, uint32_t len)
 {
         u_char *dst;
+#ifdef T4_SDL_FB
+        if (len)
+        {
+                uint32_t off;
+                uint64_t start = ptr;
+                uint64_t end = start + (uint64_t)len;
+                if (fb_addr_to_offset(ptr, &off) &&
+                    (end - start) <= (uint64_t)(FB_SIZE - off) &&
+                    fb_addr_in_range((uint32_t)(end - 1)))
+                        return vga_framebuffer + off;
+        }
+#endif
 	/* Write byte, ensuring memory reference is in range. */
         if (CoreRange(ptr,len))
         {
@@ -5334,6 +10519,337 @@ void writereal64 (uint32_t ptr, fpreal64_t value)
 #endif
         InvalidateRange (ptr, 8);
 }
+
+/* SD Card Emulation — file-backed persistent storage
+ *
+ * If $T4_SD_IMAGE is set, the SD card is loaded from and saved to that file.
+ * This gives TransputerOS a persistent "hard drive".
+ * If the file doesn't exist, it's created as a 128MB zero-filled image.
+ * The image is saved back on emulator exit (sd_save).
+ *
+ * Without $T4_SD_IMAGE, SD card is volatile (calloc, lost on exit).
+ */
+static uint8_t *sd_card = NULL;
+static const char *sd_image_path = NULL;
+static int sd_dirty = 0;
+
+static void sd_init(void) {
+    FILE *f;
+    if (sd_card) return;
+
+    sd_card = calloc(SD_SIZE, 1);
+    if (!sd_card) {
+        fprintf(stderr, "Failed to allocate SD card memory\n");
+        exit(1);
+    }
+
+    sd_image_path = getenv("T4_SD_IMAGE");
+    if (sd_image_path && sd_image_path[0]) {
+        f = fopen(sd_image_path, "rb");
+        if (f) {
+            size_t n = fread(sd_card, 1, SD_SIZE, f);
+            fclose(f);
+            fprintf(stderr, "[SD_INIT] Loaded %zuMB from %s\n", n / (1024*1024), sd_image_path);
+        } else {
+            fprintf(stderr, "[SD_INIT] Image %s not found — creating fresh 128MB\n", sd_image_path);
+        }
+    } else {
+        fprintf(stderr, "[SD_INIT] Volatile 128MB SD card (set T4_SD_IMAGE for persistence)\n");
+    }
+}
+
+void sd_save(void) {
+    FILE *f;
+    if (!sd_card || !sd_image_path || !sd_image_path[0]) return;
+    if (!sd_dirty) {
+        fprintf(stderr, "[SD_SAVE] No writes — skipping save\n");
+        return;
+    }
+    f = fopen(sd_image_path, "wb");
+    if (f) {
+        fwrite(sd_card, 1, SD_SIZE, f);
+        fclose(f);
+        fprintf(stderr, "[SD_SAVE] Saved 128MB to %s\n", sd_image_path);
+    } else {
+        fprintf(stderr, "[SD_SAVE] Failed to write %s\n", sd_image_path);
+    }
+}
+
+u_char *t4_sd_buffer(void) {
+    if (!sd_card) sd_init();
+    return sd_card;
+}
+
+int t4_sd_boot_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("T4_SD_BOOT");
+        on = (e && *e && atoi(e) != 0) ? 1 : 0;
+    }
+    return on;
+}
+
+u_char sd_read_byte(uint32_t offset) {
+    if (!sd_card) sd_init();
+    if (offset >= SD_SIZE) return 0;
+    return sd_card[offset];
+}
+
+void sd_write_byte(uint32_t offset, u_char value) {
+    if (!sd_card) sd_init();
+    if (offset >= SD_SIZE) return;
+    sd_card[offset] = value;
+    sd_dirty = 1;
+}
+
+/*
+ * T4Net — Simple MMIO Ethernet NIC with TAP backend
+ *
+ * Register map (base 0x30000000):
+ *   0x00  STATUS    (R)   bit0=link_up, bit1=rx_ready, bit2=tx_ready
+ *   0x04  TX_LEN    (W)   write packet length → triggers TX send
+ *   0x08  RX_LEN    (R)   length of pending RX packet (0 = none)
+ *   0x0C  MAC_LO    (R)   MAC bytes 0-3 (little-endian)
+ *   0x10  MAC_HI    (R)   MAC bytes 4-5 (little-endian, upper 16 bits = 0)
+ *   0x14  RX_ACK    (W)   write any value → acknowledge RX packet consumed
+ *   0x1000-0x15FF  TX_BUF  (W)   1536-byte TX packet buffer
+ *   0x2000-0x25FF  RX_BUF  (R)   1536-byte RX packet buffer
+ */
+
+#include <sys/ioctl.h>
+#include <poll.h>
+#include <net/if.h>
+#include <linux/if_tun.h>
+
+#define T4NET_BASE       VIRTIO_NET_BASE   /* 0x30000000 */
+#define T4NET_REG_STATUS 0x00
+#define T4NET_REG_TX_LEN 0x04
+#define T4NET_REG_RX_LEN 0x08
+#define T4NET_REG_MAC_LO 0x0C
+#define T4NET_REG_MAC_HI 0x10
+#define T4NET_REG_RX_ACK 0x14
+#define T4NET_TX_BUF     0x1000
+#define T4NET_RX_BUF     0x2000
+#define T4NET_BUF_SIZE   1536    /* MTU 1500 + ethernet header 14 + margin */
+#define T4NET_MMIO_SIZE  0x3000  /* Total MMIO window */
+
+static int    t4net_tap_fd = -1;
+static uint8_t t4net_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+static uint8_t t4net_tx_buf[T4NET_BUF_SIZE];
+static uint8_t t4net_rx_buf[T4NET_BUF_SIZE];
+static int     t4net_rx_len = 0;   /* length of pending RX packet, 0=none */
+
+/* Open TAP device. Returns fd or -1. */
+int t4net_tap_open(const char *dev_name)
+{
+    struct ifreq ifr;
+    int fd;
+
+    fd = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        fprintf(stderr, "[T4NET] Cannot open /dev/net/tun: %s\n", strerror(errno));
+        return -1;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+    if (dev_name && dev_name[0])
+        strncpy(ifr.ifr_name, dev_name, IFNAMSIZ - 1);
+
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+        fprintf(stderr, "[T4NET] TUNSETIFF failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    fprintf(stderr, "[T4NET] TAP device '%s' opened (fd=%d)\n", ifr.ifr_name, fd);
+    return fd;
+}
+
+void t4net_init(const char *tap_name)
+{
+    t4net_tap_fd = t4net_tap_open(tap_name);
+    if (t4net_tap_fd >= 0)
+        fprintf(stderr, "[T4NET] NIC online, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                t4net_mac[0], t4net_mac[1], t4net_mac[2],
+                t4net_mac[3], t4net_mac[4], t4net_mac[5]);
+    else
+        fprintf(stderr, "[T4NET] Running without TAP (no host networking)\n");
+}
+
+void t4net_cleanup(void)
+{
+    if (t4net_tap_fd >= 0) {
+        close(t4net_tap_fd);
+        t4net_tap_fd = -1;
+    }
+}
+
+/* Poll TAP for an incoming packet. Called periodically from emulator loop. */
+void t4net_poll_rx(void)
+{
+    if (t4net_tap_fd < 0 || t4net_rx_len > 0)
+        return;  /* no TAP, or already have a pending packet */
+
+    struct pollfd pfd = { .fd = t4net_tap_fd, .events = POLLIN };
+    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+        int n = read(t4net_tap_fd, t4net_rx_buf, T4NET_BUF_SIZE);
+        if (n > 0) {
+            t4net_rx_len = n;
+        }
+    }
+}
+
+/* Send TX buffer to TAP device. */
+static void t4net_do_tx(int len)
+{
+    if (len <= 0 || len > T4NET_BUF_SIZE)
+        return;
+
+    if (t4net_tap_fd >= 0) {
+        int n = write(t4net_tap_fd, t4net_tx_buf, len);
+        if (n < 0)
+            fprintf(stderr, "[T4NET] TX write error: %s\n", strerror(errno));
+    }
+}
+
+/* MMIO read (byte level, called from byte_int) */
+u_char virtio_net_read_byte(uint32_t addr)
+{
+    uint32_t offset = addr - T4NET_BASE;
+    uint32_t reg = offset & ~3U;     /* register-aligned offset */
+    int      byte_pos = offset & 3;  /* byte within 32-bit word */
+    uint32_t val = 0;
+
+    switch (reg) {
+    case T4NET_REG_STATUS:
+        val = 0x04;  /* tx_ready always set */
+        if (t4net_tap_fd >= 0)
+            val |= 0x01;  /* link_up */
+        if (t4net_rx_len > 0)
+            val |= 0x02;  /* rx_ready */
+        break;
+    case T4NET_REG_RX_LEN:
+        val = (uint32_t)t4net_rx_len;
+        break;
+    case T4NET_REG_MAC_LO:
+        val = t4net_mac[0] | (t4net_mac[1] << 8) |
+              (t4net_mac[2] << 16) | (t4net_mac[3] << 24);
+        break;
+    case T4NET_REG_MAC_HI:
+        val = t4net_mac[4] | (t4net_mac[5] << 8);
+        break;
+    default:
+        /* RX buffer read */
+        if (offset >= T4NET_RX_BUF && offset < T4NET_RX_BUF + T4NET_BUF_SIZE) {
+            int idx = offset - T4NET_RX_BUF;
+            return (idx < t4net_rx_len) ? t4net_rx_buf[idx] : 0;
+        }
+        break;
+    }
+
+    return (uint8_t)(val >> (byte_pos * 8));
+}
+
+/* MMIO write (byte level, called from writebyte_int) */
+void virtio_net_write_byte(uint32_t addr, u_char value)
+{
+    uint32_t offset = addr - T4NET_BASE;
+
+    /* TX buffer write (byte-by-byte accumulation) */
+    if (offset >= T4NET_TX_BUF && offset < T4NET_TX_BUF + T4NET_BUF_SIZE) {
+        int idx = offset - T4NET_TX_BUF;
+        t4net_tx_buf[idx] = value;
+        return;
+    }
+
+    /* TX_LEN register: accumulate bytes, trigger on final byte (byte 3) */
+    if ((offset & ~3U) == T4NET_REG_TX_LEN) {
+        int byte_pos = offset & 3;
+        /* Accumulate into static so 32-bit STNL (4 byte writes) works */
+        static uint32_t tx_len_accum = 0;
+        tx_len_accum &= ~(0xFF << (byte_pos * 8));
+        tx_len_accum |= (uint32_t)value << (byte_pos * 8);
+        if (byte_pos == 3) {
+            t4net_do_tx((int)tx_len_accum);
+            tx_len_accum = 0;
+        }
+        return;
+    }
+
+    /* RX_ACK register: consume pending RX packet */
+    if ((offset & ~3U) == T4NET_REG_RX_ACK) {
+        t4net_rx_len = 0;
+        return;
+    }
+}
+
+#ifdef T4_SDL_FB
+#include <png.h>
+
+void save_framebuffer_png(const char *filename) {
+    fprintf(stderr, "[PNG] save_framebuffer_png called with filename: %s\n", filename);
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        fprintf(stderr, "[PNG] Failed to open %s for writing\n", filename);
+        return;
+    }
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) {
+        fclose(fp);
+        return;
+    }
+
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_write_struct(&png, NULL);
+        fclose(fp);
+        return;
+    }
+
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        return;
+    }
+
+    png_init_io(png, fp);
+
+    // Set image attributes
+    png_set_IHDR(png, info, FB_WIDTH, FB_HEIGHT, 8, PNG_COLOR_TYPE_RGB,
+                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+
+    png_write_info(png, info);
+
+    // Write image data
+    png_bytep row = (png_bytep)malloc(3 * FB_WIDTH * sizeof(png_byte));
+    if (row) {
+        for (int y = 0; y < FB_HEIGHT; y++) {
+            for (int x = 0; x < FB_WIDTH; x++) {
+                uint32_t pixel = word_int(FB_BASE + (y * FB_WIDTH + x) * 4);
+                // Debug pixels at key positions
+                if ((y < 10 && x < 3) || (y == 16 && x < 3) || (y == 32 && x < 3)) {
+                    fprintf(stderr, "[PNG_PIXEL] x=%d y=%d addr=0x%08X pixel=0x%08X\n",
+                            x, y, FB_BASE + (y * FB_WIDTH + x) * 4, pixel);
+                }
+                // Convert ARGB to RGB
+                row[x*3 + 0] = (pixel >> 16) & 0xFF; // R
+                row[x*3 + 1] = (pixel >> 8) & 0xFF;  // G
+                row[x*3 + 2] = pixel & 0xFF;         // B
+            }
+            png_write_row(png, row);
+        }
+        free(row);
+    }
+
+    png_write_end(png, NULL);
+    png_destroy_write_struct(&png, &info);
+    fclose(fp);
+
+    fprintf(stderr, "[PNG] Framebuffer saved to %s (%dx%d)\n", filename, FB_WIDTH, FB_HEIGHT);
+}
+#endif
 
 /* Add an executing instruction to the profile list. */
 static uint32_t previnstruction = NO_ICODE;

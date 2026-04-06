@@ -14,3 +14,7 @@ dump
 *.c8h
 *.cah
 *.cfb
+*:Zone.Identifier
+*.uart
+framebuffer.bmp
+screenshot_*.bmp

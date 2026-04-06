@@ -64,7 +64,8 @@ extern uint32_t CLineTagsSize;
 
 extern uint32_t CoreSize;
 
-#define IsT800  (Txxx == 800)
+#define IsT800  (Txxx == 800 || Txxx == 806)
+#define IsT806  (Txxx == 806)
 #define IsT414  (Txxx == 414)
 #define IsTVS   (Txxx == 1144)
 
@@ -170,6 +171,8 @@ void purge_timer   (void);
 INLINE void update_time   (void);
 uint32_t word (uint32_t);
 void     writeword     (uint32_t, uint32_t);
+void t4_relocate_mmio_for_ram (uint32_t mem_size);
+extern uint32_t ram_fast_limit;
 u_char byte (uint32_t);
 INLINE
 void writebyte     (uint32_t, u_char);

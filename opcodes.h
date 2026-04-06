@@ -91,3 +91,24 @@ char* Combinations[] = {
 };
 #define MIN_COMBINATIONS 0x100
 #define MAX_COMBINATIONS 0x117
+
+
+/* TVX - Transputer Vector eXtension (MXFP4 / bfloat16), OPR 0x1C0..0x1E1 */
+char* TvxOps[] = {
+/*1C0*/ "BF16TOR32",   "R32TOBF16",  "BF16PACK",   "BF16UNPKH",
+/*1C4*/ "MXFP4TOR32",  "R32TOMXFP4", "MXE8M0TOR32","MXE8M0OF",
+/*1C8*/ "MXFP4DOT",    "BF16DOT",    "MXFP4GEMV",  "MXFP4UNPK8",
+/*1CC*/ "R32TOMXFP4X8","BF16MUL2",   "BF16ADD2",   "VSETLEN",
+/*1D0*/ "MXFP4GEMVBF", "VADDSN",     "VMULSN",     "VSILUSN",
+/*1D4*/ "VRMSNORM",    "VSOFTMAXSN", "F16TOR32",   "R32TOF16",
+/*1D8*/ "Q8DOT",       "Q8DOTBF",    "IQ1MDOT",    "IQ2XXSDOT",
+/*1DC*/ "IQ3XXSDOT",   "QSETFMT",    "QDOT",       "VHAD32",
+/*1E0*/ "MXQROT",      "MXQROTBF",   "FTSETVP",    "FTRANSP",
+/*1E4*/ "FTRANSPB",    "FSINCOS",    "FRSQRT",     "FRECIP",
+/*1E8*/ "FSINCOSB",    "VSETSTRIDE", "FTCULL",     "TSKIN",
+/*1EC*/ "VSETFMT",     "FTSETLIT",   "FLITB",      "QGEMM",
+/*1F0*/ "VBLEND8",     "VFILL",      "VFILL2D",    "CSUM",
+/*1F4*/ "VBLEND2D",    "STVXSTATE",  "CSUMCPY"
+};
+#define MIN_TVX 0x1c0
+#define MAX_TVX 0x1f6
