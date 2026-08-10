@@ -47,6 +47,18 @@ extern uint32_t vga_ctrl_base;
 #define VGA_CTRL_SCREENSHOT (VGA_CTRL_BASE + 0x18)
 /* Guest write → t9k_leave_p(): abandon P without trap (spawn longjmp path). */
 #define VGA_CTRL_LEAVE_P    (VGA_CTRL_BASE + 0x1C)
+/* Phase 10: stage RODS[0..3] then poke LOAD_RODS to install without goprot. */
+#define VGA_CTRL_LOAD_RODS  (VGA_CTRL_BASE + 0x20)
+#define VGA_CTRL_RODS0      (VGA_CTRL_BASE + 0x24)
+#define VGA_CTRL_RODS1      (VGA_CTRL_BASE + 0x28)
+#define VGA_CTRL_RODS2      (VGA_CTRL_BASE + 0x2C)
+#define VGA_CTRL_RODS3      (VGA_CTRL_BASE + 0x30)
+/* Phase 10: PMI private window + text ROM for active P-task */
+#define VGA_CTRL_PMI_PRIV_LO  (VGA_CTRL_BASE + 0x34)
+#define VGA_CTRL_PMI_PRIV_HI  (VGA_CTRL_BASE + 0x38)
+#define VGA_CTRL_PMI_TEXT_LO  (VGA_CTRL_BASE + 0x3C)
+#define VGA_CTRL_PMI_TEXT_HI  (VGA_CTRL_BASE + 0x40)
+#define VGA_CTRL_PMI_COMMIT   (VGA_CTRL_BASE + 0x44)
 #define VGA_CTRL_ENABLE     0x01
 
 /* -------------------------------------------------------------------

@@ -38,7 +38,11 @@ extern t9k_pmi_state_t t9k_pmi;
 
 void t9k_pmi_init(void);
 void t9k_pmi_add_bank(uint32_t base, uint32_t size, t9k_pmi_type_t type);
-/* 0 = ok, 1 = no bank / empty */
+/* 0 = ok, 1 = no bank / empty / foreign private / text write */
 int t9k_pmi_check_phys(uint32_t pa, int is_write);
+
+/* Phase 10: active P-task private phys window + optional text-as-ROM. */
+void t9k_pmi_set_private(uint32_t lo, uint32_t hi);
+void t9k_pmi_set_text_rom(uint32_t lo, uint32_t hi);
 
 #endif

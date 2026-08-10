@@ -154,9 +154,52 @@ static int translate_one(uint32_t la, int access, uint32_t *pa_out)
 	return 0;
 }
 
+/*
+ * Relocate-only: apply region map without permission traps.
+ * Used in L-mode after soft leave_p while C-call still has a Q3 WPtr —
+ * without this, stl/ldl/RET on Q3 LA touch unmapped phys and yield IPtr=0.
+ */
+static int relocate_only(uint32_t la, uint32_t *pa_out)
+{
+	unsigned region = (la >> 30) & 3u;
+	uint32_t d = t9k_prot.region[region];
+	int n;
+	uint32_t mask, need;
+
+	if (d == T9K_NULL_REGION || d == 0u || d == 0x80000000u)
+		return -1;
+	n = desc_size_n(d);
+	if (n < 8)
+		return -1;
+	mask = (1u << n) - 1u;
+	if (d & T9K_DESC_TOP) {
+		need = ((1u << (30 - n)) - 1u) << n;
+		if ((la & need) != need)
+			return -1;
+	} else {
+		need = ((1u << (30 - n)) - 1u) << n;
+		if (la & need)
+			return -1;
+	}
+	*pa_out = (d & ~mask) | (la & mask);
+	return 0;
+}
+
 int t9k_probe(uint32_t la, int access, uint32_t *pa_out)
 {
-	if (!t9k_prot.enabled || !t9k_prot.is_p || t9k_prot.phys_bypass) {
+	if (!t9k_prot.enabled || t9k_prot.phys_bypass) {
+		if (pa_out)
+			*pa_out = la;
+		return 0;
+	}
+	if (!t9k_prot.is_p) {
+		uint32_t pa;
+		/* L-mode: optional Q3 (etc.) relocate after leave_p */
+		if (relocate_only(la, &pa) == 0) {
+			if (pa_out)
+				*pa_out = pa;
+			return 0;
+		}
 		if (pa_out)
 			*pa_out = la;
 		return 0;
@@ -168,8 +211,18 @@ uint32_t t9k_translate(uint32_t la, int access)
 {
 	uint32_t pa;
 	int c;
-	if (!t9k_prot.enabled || !t9k_prot.is_p || t9k_prot.phys_bypass)
+	if (!t9k_prot.enabled || t9k_prot.phys_bypass)
 		return la;
+	if (!t9k_prot.is_p) {
+		/*
+		 * Soft leave_p clears is_p but keeps RODS.  C-call syscalls
+		 * still run on the user WPtr (often Q3 LA).  Keep relocate so
+		 * workspace / RET do not read unmapped 0xCxxx_xxxx as phys.
+		 */
+		if (relocate_only(la, &pa) == 0)
+			return pa;
+		return la;
+	}
 	c = translate_one(la, access, &pa);
 	if (c) {
 		if (t9k_prot.debug)
@@ -288,13 +341,30 @@ void t9k_leave_p(void)
 	 * Soft leave: Linux spawn may longjmp out of a P-session without a
 	 * trap (C-call exit).  Clear P so the next goprot is legal.
 	 * Does not restore IPtr/WPtr — guest longjmp already did that.
+	 * RODS stay loaded: t9k_translate still relocates Q3 so a C-call
+	 * that leave_p's mid-syscall keeps a working user workspace.
 	 */
 	if (t9k_prot.is_p) {
 		t9k_prot.is_p = 0;
 		if (t9k_prot.debug)
-			fprintf(stderr, "[T9K-PROT] leave_p (soft) traps=%u\n",
-				t9k_prot.trap_count);
+			fprintf(stderr,
+				"[T9K-PROT] leave_p IPtr=0x%08X WPtr=0x%08X traps=%u\n",
+				IPtr, WPtr, t9k_prot.trap_count);
 	}
+}
+
+void t9k_load_rods(const uint32_t rods[4])
+{
+	int i;
+
+	if (!rods)
+		return;
+	for (i = 0; i < 4; i++)
+		t9k_prot.region[i] = rods[i];
+	if (t9k_prot.debug)
+		fprintf(stderr,
+			"[T9K-PROT] load_rods R0=%08X R1=%08X R2=%08X R3=%08X is_p=%d\n",
+			rods[0], rods[1], rods[2], rods[3], t9k_prot.is_p);
 }
 
 void t9k_goprot(uint32_t pds_phys, uint32_t rods_phys)

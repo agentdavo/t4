@@ -97,6 +97,9 @@ void t9k_goprot(uint32_t pds_phys, uint32_t rods_phys);
 /* Force L-mode without trap (spawn longjmp abandoned P; re-goprot needs L). */
 void t9k_leave_p(void);
 
+/* Phase 10: install region descriptors without changing IPtr/WPtr/is_p. */
+void t9k_load_rods(const uint32_t rods[4]);
+
 /* syscall in P -> trap to supervisor; in L -> soft note (THDS not fully modelled) */
 void t9k_syscall(void);
 

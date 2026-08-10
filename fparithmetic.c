@@ -1319,6 +1319,25 @@ int    fp_gtdb (fpreal64_t fb, fpreal64_t fa)
 
         return result;
 }
+int    fp_gedb (fpreal64_t fb, fpreal64_t fa)
+{
+        /* T9000 fpge (ISM 11.10): IEEE '>=' - false if either operand is
+         * a NaN.  -0 >= +0 is true.  Host IEEE compare gives exactly these
+         * semantics.  FP_Error mirrors the sibling comparisons. */
+        if (fp_notfinitedb (fb) || fp_notfinitedb (fa))
+                FP_Error = TRUE;
+
+        return fb.fp >= fa.fp;
+}
+int    fp_lgdb (fpreal64_t fb, fpreal64_t fa)
+{
+        /* T9000 fplg (ISM 11.10): IEEE '<>' - true when the operands are
+         * ordered and unequal, false if either is a NaN. */
+        if (fp_notfinitedb (fb) || fp_notfinitedb (fa))
+                FP_Error = TRUE;
+
+        return fb.fp < fa.fp || fb.fp > fa.fp;
+}
 int    fp_eqdb (fpreal64_t fb, fpreal64_t fa)
 {
         if (fp_notfinitedb (fb) || fp_notfinitedb (fa))
@@ -1754,6 +1773,22 @@ int    fp_gtsn (fpreal32_t fb, fpreal32_t fa)
                 result = fp_expfracsn (fb) > fp_expfracsn (fa);
 
         return result;
+}
+int    fp_gesn (fpreal32_t fb, fpreal32_t fa)
+{
+        /* T9000 fpge, single precision: see fp_gedb. */
+        if (fp_notfinitesn (fb) || fp_notfinitesn (fa))
+                FP_Error = TRUE;
+
+        return fb.fp >= fa.fp;
+}
+int    fp_lgsn (fpreal32_t fb, fpreal32_t fa)
+{
+        /* T9000 fplg, single precision: see fp_lgdb. */
+        if (fp_notfinitesn (fb) || fp_notfinitesn (fa))
+                FP_Error = TRUE;
+
+        return fb.fp < fa.fp || fb.fp > fa.fp;
 }
 int    fp_eqsn (fpreal32_t fb, fpreal32_t fa)
 {

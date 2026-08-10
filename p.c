@@ -1785,6 +1785,11 @@ int count1;
 int count2;
 int count3;
 _Atomic int timeslice;
+/* T9000 settimeslice / intdis / intenb state (ISM 13.6).  Gating is applied
+ * at the D_check timeslice decision; high-priority interrupt delivery (link
+ * comms) is NOT deferred - the emulated kernel does not rely on that. */
+int TimesliceDisabled = 0;
+int IntsDisabled = 0;
 int delayCount1 = 5;
 int speed_multiplier = 1;  /* T800=1, T806=10 (200MHz/20MHz) */
 int32_t quit = FALSE;
@@ -2298,7 +2303,50 @@ void fp_dounary (fpreal64_t (*dbop)(fpreal64_t), fpreal32_t (*snop)(fpreal32_t))
                         break;
         }
 }
+
 #endif
+
+void reschedule (void);
+
+/* ---- T9000 fpstall / fpldall (ISM 11.12.3, table 11.26) ----------------
+ * Seven-word structure: FPstatusReg @0, FPAreg @1-2, FPBreg @3-4,
+ * FPCreg @5-6 (single precision occupies the lower-addressed word).
+ * The real T9000 status word layout is not modelled bit-for-bit; this is a
+ * self-consistent local encoding (lengths, rounding mode, FP_Error) so a
+ * context switch round-trips the FPU state faithfully under emulation. */
+static uint32_t t9k_fp_lenc (int length)
+{
+        if (length == FP_REAL32) return 1;
+        if (length == FP_REAL64) return 2;
+        return 0;
+}
+static int t9k_fp_ldec (uint32_t code)
+{
+        if (code == 1) return FP_REAL32;
+        if (code == 2) return FP_REAL64;
+        return FP_UNKNOWN;
+}
+static void t9k_fp_store_reg (uint32_t ptr, REAL *r)
+{
+        if (r->length == FP_REAL64)
+        {
+                writeword (ptr,     (uint32_t)(r->u.db.bits & 0xFFFFFFFFu));
+                writeword (ptr + 4, (uint32_t)(r->u.db.bits >> 32));
+        }
+        else
+        {
+                writeword (ptr,     r->u.sn.bits);
+                writeword (ptr + 4, 0);
+        }
+}
+static void t9k_fp_load_reg (uint32_t ptr, REAL *r, int length)
+{
+        r->length = length;
+        if (length == FP_REAL64)
+                r->u.db.bits = ((uint64_t)word (ptr + 4) << 32) | word (ptr);
+        else
+                r->u.sn.bits = word (ptr);
+}
 
 
 struct timeval LastTOD;         /* Time-of-day */
@@ -4810,13 +4858,26 @@ FastDispatch:
 			           printf("[AJW] IPtr=0x%08X delta=%d WPtr=0x%08X→0x%08X\n",
 			                  IPtr, delta, WPtr, new_wptr);
 			       }
-			       /* Validate workspace pointer - use actual configured memory size */
-			       if (new_wptr == 0x2FFA2FFA || new_wptr < MemStart ||
-			           (uint64_t)new_wptr >= (uint64_t)MemStart + (uint64_t)MemSize) {
-			           printf("[ERROR] Invalid WPtr after ajw: 0x%08X at IPtr=0x%08X (valid range: 0x%08X-0x%08X)\n",
-			                  new_wptr, IPtr, MemStart,
-			                  (uint32_t)((uint64_t)MemStart + (uint64_t)MemSize - 1));
-			           fault_history_dump("invalid AJW workspace");
+			       /* Validate workspace pointer - use actual configured memory size.
+			        * Q3 LAs (0xC0000000+) are legal under T9000 multi-quarter when
+			        * RODS region 3 is loaded; t9k_translate relocates them. */
+			       {
+				   int wptr_q3_ok = (new_wptr >= 0xC0000000u) &&
+						    t9k_in_p();
+				   /* Also OK if region[3] still maps after leave_p */
+				   if (!wptr_q3_ok && new_wptr >= 0xC0000000u &&
+				       t9k_prot.enabled &&
+				       t9k_prot.region[3] != 0u &&
+				       t9k_prot.region[3] != 0x80000000u)
+					   wptr_q3_ok = 1;
+				   if (!wptr_q3_ok &&
+				       (new_wptr == 0x2FFA2FFA || new_wptr < MemStart ||
+				        (uint64_t)new_wptr >= (uint64_t)MemStart + (uint64_t)MemSize)) {
+					   printf("[ERROR] Invalid WPtr after ajw: 0x%08X at IPtr=0x%08X (valid range: 0x%08X-0x%08X)\n",
+						  new_wptr, IPtr, MemStart,
+						  (uint32_t)((uint64_t)MemStart + (uint64_t)MemSize - 1));
+					   fault_history_dump("invalid AJW workspace");
+				   }
 			       }
                                UpdateWdescReg (new_wptr | ProcPriority);
                                T4DEBUG(checkWPtr ("AJW", WPtr));
@@ -5051,6 +5112,34 @@ FastDispatch:
 			           printf("[WILDJUMP] GCALL from=0x%08X to=0x%08X (target<MemStart) "
 			                  "ret=0x%08X WPtr=0x%08X BReg=0x%08X CReg=0x%08X\n",
 			                  call_site, temp, AReg, WPtr, BReg, CReg);
+				   if ((WPtr >> 30) == 3u) {
+					   int wi;
+					   uint32_t pa = 0;
+					   (void)t9k_probe(WPtr, T9K_ACC_READ, &pa);
+					   fprintf(stderr,
+						   "[Q3-GCALL0] is_p=%d WPtr=0x%08X pa=0x%08X B=0x%08X frame:",
+						   t9k_in_p(), WPtr, pa, BReg);
+					   for (wi = 0; wi < 32; wi++)
+						   fprintf(stderr, " [%d]=%08X",
+							   wi, word_int(index(WPtr, wi)));
+					   fprintf(stderr, "\n");
+					   /* B as structure: dump first words if in RAM */
+					   if (BReg >= 0x80000000u && BReg < 0x90000000u) {
+						   fprintf(stderr, "[Q3-GCALL0] *B:");
+						   for (wi = 0; wi < 8; wi++)
+							   fprintf(stderr, " %08X",
+								   word_int(BReg + 4u * (uint32_t)wi));
+						   fprintf(stderr, "\n");
+					   }
+					   /* current_thread_info is a global at fixed VA on this port */
+					   {
+						   uint32_t cti = word_int(0x80408000u);
+						   uint32_t task = cti ? word_int(cti) : 0;
+						   fprintf(stderr,
+							   "[Q3-GCALL0] __cti_ptr@80408000=%08X task=%08X\n",
+							   cti, task);
+					   }
+				   }
 			           wj_gcall++;
 			       }
 			   }
@@ -5559,6 +5648,18 @@ DescheduleOutWord:
 			           IPtr >= 0x80000000 && IPtr < 0x81000000) {
 			           printf("[RET] from=0x%08X to=0x%08X WPtr=0x%08X→0x%08X\n",
 			                  IPtr, return_addr, WPtr, new_wptr);
+			       }
+			       /* Q3 WPtr + null ret: dump frame (Phase 9 hard-P debug) */
+			       if (return_addr < MemStart && (WPtr >> 30) == 3u) {
+				       uint32_t pa = 0;
+				       int pr = t9k_probe(WPtr, T9K_ACC_READ, &pa);
+				       fprintf(stderr,
+					       "[Q3-RET0] from=0x%08X WPtr=0x%08X is_p=%d probe=%d pa=0x%08X "
+					       "w[0..3]=%08X %08X %08X %08X A=%08X B=%08X C=%08X\n",
+					       old_iptr, WPtr, t9k_in_p(), pr, pa,
+					       word_int(WPtr), word_int(index(WPtr, 1)),
+					       word_int(index(WPtr, 2)), word_int(index(WPtr, 3)),
+					       AReg, BReg, CReg);
 			       }
 			       /* Validate return address */
 			       if (return_addr == 0x2FFA2FFA || return_addr == 0x80000000) {
@@ -6663,9 +6764,6 @@ DescheduleOutWord:
 			   AReg = MemStart;
 			   IPtr++;
 			   break;
-		case 0xfa: /* skip invalid opcode */
-			   IPtr++;
-			   break;
 		case 0x80: /* XXX fpsttest -- M.Bruestle  */
                            temp = FAReg.length;
                            if (FAReg.length == FP_REAL64)
@@ -7123,6 +7221,343 @@ DescheduleOutWord:
                            BReg = CReg;
 		           IPtr++;
 		           break;
+		case 0x8d: /* fprange - fp range reduce                 (T9000) */
+		           BADCODE(IsT414);
+                           /* FBreg := integer quotient, FAreg := IEEE
+                            * remainder of FBreg / FAreg; FCreg unaffected.
+                            * The remainder is exact; the quotient is
+                            * recovered from it and verified with fma so the
+                            * pair is consistent (ISM 11.8). */
+                           if (FAReg.length == FP_REAL64)
+                           {
+                               double b = DB(FBReg).fp, a = DB(FAReg).fp;
+                               double r = remainder (b, a);
+                               double q = nearbyint ((b - r) / a);
+                               int k;
+                               for (k = 0; k < 4 && fma (-q, a, b) != r; k++)
+                                   q += (fma (-q, a, b) > r) ==
+                                        (a > 0.0) ? 1.0 : -1.0;
+                               if (!isfinite (b) || !isfinite (a) || a == 0.0)
+                                   FP_Error = TRUE;
+                               DB(FBReg).fp = q;
+                               DB(FAReg).fp = r;
+                           }
+                           else
+                           {
+                               double b = (double)SN(FBReg).fp;
+                               double a = (double)SN(FAReg).fp;
+                               double r = remainder (b, a);
+                               if (!isfinite (b) || !isfinite (a) || a == 0.0)
+                                   FP_Error = TRUE;
+                               SN(FBReg).fp = (float)nearbyint ((b - r) / a);
+                               SN(FAReg).fp = (float)r;
+                           }
+                           ResetRounding = TRUE;
+		           IPtr++;
+		           break;
+		case 0x9b: /* fplg - fp less than or greater than       (T9000) */
+		           BADCODE(IsT414);
+                           temp = fp_binary2word (fp_lgdb, fp_lgsn);
+                           CReg = BReg;
+                           BReg = AReg;
+                           AReg = temp;
+		           IPtr++;
+		           break;
+		case 0xb0: /* settimeslice                              (T9000) */
+		           BADCODE(IsT414);
+                           temp = TimesliceDisabled ? 0 : 1;
+                           TimesliceDisabled = (AReg == 0);
+                           AReg = temp;
+		           IPtr++;
+		           break;
+		case 0xb6: /* ldflags                                   (T9000) */
+		           BADCODE(IsT414);
+                           /* Local flag encoding (see stflags): bit0 =
+                            * IntegerError, bit1 = FP_Error.  Trap-enable
+                            * bits are not modelled. */
+                           CReg = BReg;
+                           BReg = AReg;
+                           AReg = ((STATUSReg & ErrorFlag) ? 1u : 0u)
+                                | (FP_Error ? 2u : 0u);
+		           IPtr++;
+		           break;
+		case 0xb7: /* stflags                                   (T9000) */
+		           BADCODE(IsT414);
+                           if (AReg & 1u) { SetError; } else { ClearError; }
+                           FP_Error = (AReg & 2u) ? TRUE : FALSE;
+                           AReg = BReg;
+                           BReg = CReg;
+		           IPtr++;
+		           break;
+		case 0xba: /* cb - check byte                           (T9000) */
+		           BADCODE(IsT414);
+                           if (INT32(AReg) < -128 || INT32(AReg) > 127)
+                               SetError;
+		           IPtr++;
+		           break;
+		case 0xbb: /* cbu - check byte unsigned                 (T9000) */
+		           BADCODE(IsT414);
+                           if (AReg > 255u)
+                               SetError;
+		           IPtr++;
+		           break;
+		case 0xc4: /* intdis - disable interruption+timeslice   (T9000) */
+		           BADCODE(IsT414);
+                           IntsDisabled = 1;
+		           IPtr++;
+		           break;
+		case 0xc5: /* intenb - enable interruption              (T9000) */
+		           BADCODE(IsT414);
+                           IntsDisabled = 0;
+		           IPtr++;
+		           break;
+		case 0xcf: /* fprem - fp IEEE remainder                 (T9000) */
+		           BADCODE(IsT414);
+                           /* FAreg := FBreg REM FAreg (exact); FCreg pops
+                            * into FBreg (ISM 11.8, table 11.12). */
+                           if (FAReg.length == FP_REAL64)
+                           {
+                               double b = DB(FBReg).fp, a = DB(FAReg).fp;
+                               if (!isfinite (b) || !isfinite (a) || a == 0.0)
+                                   FP_Error = TRUE;
+                               DB(FAReg).fp = remainder (b, a);
+                               FAReg.length = FP_REAL64;
+                           }
+                           else
+                           {
+                               double b = (double)SN(FBReg).fp;
+                               double a = (double)SN(FAReg).fp;
+                               if (!isfinite (b) || !isfinite (a) || a == 0.0)
+                                   FP_Error = TRUE;
+                               /* exact in double; result representable */
+                               SN(FAReg).fp = (float)remainder (b, a);
+                               FAReg.length = FP_REAL32;
+                           }
+                           FBReg = FCReg;
+                           FCReg.length = FP_UNKNOWN;
+                           ResetRounding = TRUE;
+		           IPtr++;
+		           break;
+		case 0xdd: /* fpadddbsn - add doubles to single         (T9000) */
+		           BADCODE(IsT414);
+                           /* Correctly-rounded (double+double)->single.
+                            * 80-bit extended holds the sum with one rounding
+                            * to 64-bit significand; 64 >= 2*24+2, so the
+                            * second rounding to single is innocuous (no
+                            * double-rounding error).  ISM 11.11. */
+                           SN(FAReg).fp = (float)((long double)DB(FBReg).fp
+                                                + (long double)DB(FAReg).fp);
+                           FAReg.length = FP_REAL32;
+                           FBReg = FCReg;
+                           FCReg.length = FP_UNKNOWN;
+                           ResetRounding = TRUE;
+		           IPtr++;
+		           break;
+		case 0xde: /* fpchki32                                  (T9000) */
+		           BADCODE(IsT414);
+                           if (FAReg.length == FP_REAL64)
+                               fp_chki32db (DB(FAReg));
+                           else
+                               fp_chki32sn (SN(FAReg));
+                           ResetRounding = TRUE;
+		           IPtr++;
+		           break;
+		case 0xdf: /* fpchki64                                  (T9000) */
+		           BADCODE(IsT414);
+                           if (FAReg.length == FP_REAL64)
+                               fp_chki64db (DB(FAReg));
+                           else
+                               fp_chki64sn (SN(FAReg));
+                           ResetRounding = TRUE;
+		           IPtr++;
+		           break;
+		case 0xf0: /* devlb - device load byte                  (T9000) */
+		           BADCODE(IsT414);
+                           /* No cache or write buffering is modelled, so the
+                            * device accesses behave exactly like lb/ls/ldnl 0
+                            * etc. (ISM table 7.23 says they use the same
+                            * registers and, absent reordering, the same
+                            * behavior). */
+                           AReg = byte (AReg) & 0xFF;
+		           IPtr++;
+		           break;
+		case 0xf1: /* devsb - device store byte                 (T9000) */
+		           BADCODE(IsT414);
+                           writebyte (AReg, BReg);
+                           AReg = CReg;
+                           CReg = 0;
+		           IPtr++;
+		           break;
+		case 0xf2: /* devls - device load sixteen               (T9000) */
+		           BADCODE(IsT414);
+                           AReg = (byte (AReg) & 0xFF)
+                                | ((byte (AReg + 1) & 0xFF) << 8);
+		           IPtr++;
+		           break;
+		case 0xf3: /* devss - device store sixteen              (T9000) */
+		           BADCODE(IsT414);
+                           writebyte (AReg,     BReg        & 0xFF);
+                           writebyte (AReg + 1, (BReg >> 8) & 0xFF);
+                           AReg = CReg;
+                           CReg = 0;
+		           IPtr++;
+		           break;
+		case 0xf4: /* devlw - device load word                  (T9000) */
+		           BADCODE(IsT414);
+                           AReg = word (AReg);
+		           IPtr++;
+		           break;
+		case 0xf5: /* devsw - device store word                 (T9000) */
+		           BADCODE(IsT414);
+                           writeword (AReg, BReg);
+                           AReg = CReg;
+                           CReg = 0;
+		           IPtr++;
+		           break;
+		/* T9000 VCP / configuration instructions: no Virtual Channel
+		 * Processor or config space is modelled - fail loudly by name. */
+		case 0xbc: /* insphdr */
+		case 0xbd: /* readbfr */
+		case 0xbe: /* ldconf */
+		case 0xbf: /* stconf */
+		case 0xc0: /* ldcnt */
+		case 0xc2: /* ldth */
+		case 0xc3: /* ldchstatus */
+		case 0xc7: /* cir */
+		case 0xc9: /* chantype */
+		case 0xcc: /* ciru */
+                           printf ("-E-EMU9000: unimplemented T9000 VCP/config instruction (OReg #%02X)\n", OReg);
+                           maybe_log_nearest_sym(IPtr, "t9k-vcp-unimpl");
+                           processor_state ();
+			   handler (-1);
+			   break;
+		case 0xfa: /* cs - check sixteen                        (T9000) */
+		           BADCODE(IsT414);
+                           if (INT32(AReg) < -32768 || INT32(AReg) > 32767)
+                               SetError;
+		           IPtr++;
+		           break;
+		case 0xfb: /* csu - check sixteen unsigned              (T9000) */
+		           BADCODE(IsT414);
+                           if (AReg > 65535u)
+                               SetError;
+		           IPtr++;
+		           break;
+		case 0x97: /* fpge - fp greater than or equals          (T9000) */
+		           BADCODE(IsT414);
+                           temp = fp_binary2word (fp_gedb, fp_gesn);
+                           CReg = BReg;
+                           BReg = AReg;
+                           AReg = temp;
+		           IPtr++;
+		           break;
+		case 0xcb: /* fpseterr                                  (T9000) */
+		           BADCODE(IsT414);
+                           FP_Error = TRUE;
+                           ResetRounding = TRUE;
+		           IPtr++;
+		           break;
+		case 0xd0: /* fprn - set round to nearest               (T9000) */
+		           BADCODE(IsT414);
+                           fp_setrounding ("fprn", ROUND_N);
+                           /* Do not reset rounding mode. */
+		           IPtr++;
+		           break;
+		case 0xd1: /* fpdivby2                                  (T9000) */
+		           BADCODE(IsT414);
+                           fp_dounary (fp_divby2db, fp_divby2sn);
+		           IPtr++;
+		           break;
+		case 0xd2: /* fpmulby2                                  (T9000) */
+		           BADCODE(IsT414);
+                           fp_dounary (fp_mulby2db, fp_mulby2sn);
+		           IPtr++;
+		           break;
+		case 0xd3: /* fpsqrt                                    (T9000) */
+		           BADCODE(IsT414);
+                           fp_dounary (fp_sqrtlastdb, fp_sqrtlastsn);
+		           IPtr++;
+		           break;
+		case 0xd4: /* fprp - set round to plus infinity         (T9000) */
+		           BADCODE(IsT414);
+                           fp_setrounding ("fprp", ROUND_P);
+                           /* Do not reset rounding mode. */
+		           IPtr++;
+		           break;
+		case 0xd5: /* fprm - set round to minus infinity        (T9000) */
+		           BADCODE(IsT414);
+                           fp_setrounding ("fprm", ROUND_M);
+                           /* Do not reset rounding mode. */
+		           IPtr++;
+		           break;
+		case 0xd6: /* fprz - set round to zero                  (T9000) */
+		           BADCODE(IsT414);
+                           fp_setrounding ("fprz", ROUND_Z);
+                           /* Do not reset rounding mode. */
+		           IPtr++;
+		           break;
+		case 0xd7: /* fpr32tor64                                (T9000) */
+		           BADCODE(IsT414);
+#ifdef EMUDEBUG
+                           if (FAReg.length == FP_REAL32)
+#endif
+                           {
+                               FAReg.length = FP_REAL64;
+                               DB(FAReg)    = fp_r32tor64 (SN(FAReg));
+                           }
+#ifdef EMUDEBUG
+                           else
+                           {
+                               printf ("-W-EMUFPU: Warning - FAReg is not REAL32! (fpr32tor64)\n");
+                               FAReg.length = FP_UNKNOWN;
+                               DB(FAReg)    = DUndefined;
+                           }
+#endif
+                           ResetRounding = TRUE;
+		           IPtr++;
+		           break;
+		case 0xd8: /* fpr64tor32                                (T9000) */
+		           BADCODE(IsT414);
+#ifdef EMUDEBUG
+                           if (FAReg.length == FP_REAL64)
+#endif
+                           {
+                               FAReg.length = FP_REAL32;
+                               SN(FAReg) = fp_r64tor32 (DB(FAReg));
+                           }
+#ifdef EMUDEBUG
+                           else
+                           {
+                               printf ("-W-EMUFPU: Warning - FAReg is not REAL64! (fpr64tor32)\n");
+                               FAReg.length = FP_UNKNOWN;
+                               SN(FAReg)    = RUndefined;
+                           }
+#endif
+                           ResetRounding = TRUE;
+		           IPtr++;
+		           break;
+		case 0xd9: /* fpexpdec32 - divide by 2^32               (T9000) */
+		           BADCODE(IsT414);
+                           fp_dounary (fp_expdec32db, fp_expdec32sn);
+		           IPtr++;
+		           break;
+		case 0xda: /* fpexpinc32 - multiply by 2^32             (T9000) */
+		           BADCODE(IsT414);
+                           fp_dounary (fp_expinc32db, fp_expinc32sn);
+		           IPtr++;
+		           break;
+		case 0xdb: /* fpabs                                     (T9000) */
+		           BADCODE(IsT414);
+                           fp_dounary (fp_absdb, fp_abssn);
+		           IPtr++;
+		           break;
+		case 0xdc: /* fpclrerr                                  (T9000) */
+		           BADCODE(IsT414);
+                           fp_clrexcept ();
+                           FP_Error = FALSE;
+                           ResetRounding = TRUE;
+		           IPtr++;
+		           break;
 		case 0xab: /* fpentry    */
 		           BADCODE(IsT414);
                            temp = AReg;
@@ -7371,7 +7806,21 @@ DescheduleOutWord:
                 case 0x106: /* ajw ret */
                            WPtr = index (WPtr, Arg0);
                            T4DEBUG(checkWPtr ("AJW", WPtr));
-			   IPtr = word (WPtr);
+			   {
+				   uint32_t ra106 = word(WPtr);
+				   if (ra106 < MemStart && (WPtr >> 30) == 3u) {
+					   uint32_t pa = 0;
+					   (void)t9k_probe(WPtr, T9K_ACC_READ, &pa);
+					   fprintf(stderr,
+						   "[Q3-AJWRET0] IPtr=0x%08X WPtr=0x%08X ajw=%d is_p=%d pa=0x%08X "
+						   "w0=%08X w1=%08X w2=%08X w3=%08X A=%08X B=%08X\n",
+						   IPtr, WPtr, (int)Arg0, t9k_in_p(), pa,
+						   word_int(WPtr), word_int(index(WPtr, 1)),
+						   word_int(index(WPtr, 2)), word_int(index(WPtr, 3)),
+						   AReg, BReg);
+				   }
+				   IPtr = ra106;
+			   }
 			   UpdateWdescReg (index (WPtr, 4) | ProcPriority);
                            T4DEBUG(checkWPtr ("RET", WPtr));
 		           PROFILE(profile[PRO_INSTR]++);
@@ -8526,6 +8975,205 @@ DescheduleOutWord:
                            AReg = ProductIdentity;
                            IPtr++;
                            break;
+		case 0xFFFFFFFFu: /* fpstall - store all FPU state (T9000, 6X FF) */
+                           {
+                               uint32_t ptr = AReg;
+                               writeword (ptr,
+                                          t9k_fp_lenc (FAReg.length)
+                                        | (t9k_fp_lenc (FBReg.length) << 2)
+                                        | (t9k_fp_lenc (FCReg.length) << 4)
+                                        | (FP_Error ? (1u << 6) : 0u)
+                                        | (((uint32_t)RoundingMode & 7u) << 8));
+                               t9k_fp_store_reg (ptr + 4,  &FAReg);
+                               t9k_fp_store_reg (ptr + 12, &FBReg);
+                               t9k_fp_store_reg (ptr + 20, &FCReg);
+                               AReg = BReg;
+                               BReg = CReg;
+                               FAReg.length = FP_UNKNOWN;
+                               FBReg.length = FP_UNKNOWN;
+                               FCReg.length = FP_UNKNOWN;
+                           }
+			   IPtr++;
+			   break;
+		case 0xFFFFFFFEu: /* fpldall - load all FPU state (T9000, 6X FE) */
+                           {
+                               uint32_t ptr = AReg;
+                               uint32_t st = word (ptr);
+                               t9k_fp_load_reg (ptr + 4,  &FAReg, t9k_fp_ldec (st & 3u));
+                               t9k_fp_load_reg (ptr + 12, &FBReg, t9k_fp_ldec ((st >> 2) & 3u));
+                               t9k_fp_load_reg (ptr + 20, &FCReg, t9k_fp_ldec ((st >> 4) & 3u));
+                               FP_Error = (st & (1u << 6)) ? TRUE : FALSE;
+                               fp_setrounding ("fpldall", (int)((st >> 8) & 7u));
+                               AReg = BReg;
+                               BReg = CReg;
+                           }
+			   IPtr++;
+			   break;
+		case 0xFFFFFFF5u: /* wait - semaphore P (T9000, ISM 8.6) */
+                           {
+                               uint32_t sem = AReg;
+                               uint32_t count = word (sem);
+                               AReg = BReg;
+                               BReg = CReg;
+                               IPtr++;
+                               if (count != 0)
+                               {
+                                   writeword (sem, count - 1);
+                               }
+                               else
+                               {
+                                   /* Append current process to the semaphore
+                                    * queue (s.Front @4, s.Back @8) and
+                                    * deschedule. */
+                                   uint32_t wdesc = WPtr | ProcPriority;
+                                   uint32_t front = word (sem + 4);
+                                   if (front == NotProcess_p)
+                                       writeword (sem + 4, wdesc);
+                                   else
+                                       writeword (index (GetDescWPtr (word (sem + 8)), Link_s), wdesc);
+                                   writeword (sem + 8, wdesc);
+                                   deschedule ();
+                               }
+                           }
+			   break;
+		case 0xFFFFFFF4u: /* signal - semaphore V (T9000, ISM 8.6) */
+                           {
+                               uint32_t sem = AReg;
+                               uint32_t front = word (sem + 4);
+                               AReg = BReg;
+                               BReg = CReg;
+                               if (front == NotProcess_p)
+                               {
+                                   writeword (sem, word (sem) + 1);
+                               }
+                               else
+                               {
+                                   if (front == word (sem + 8))
+                                       writeword (sem + 4, NotProcess_p);
+                                   else
+                                       writeword (sem + 4,
+                                                  word (index (GetDescWPtr (front), Link_s)));
+                                   schedule (front);
+                               }
+                           }
+			   IPtr++;
+			   break;
+		case 0xFFFFFFF3u: /* timeslice - force a timeslice (T9000) */
+			   IPtr++;
+                           reschedule ();
+                           IntsDisabled = 0;
+                           SetGotoSNP;
+			   break;
+		case 0xFFFFFFF2u: /* insertqueue (T9000, ISM 13.7) */
+                           {
+                               uint32_t pri = AReg & 1u;
+                               if (BReg != NotProcess_p)
+                               {
+                                   uint32_t oldf = FPtrReg[pri];
+                                   FPtrReg[pri] = BReg;
+                                   if (oldf == NotProcess_p)
+                                       BPtrReg[pri] = CReg;
+                                   else
+                                       writeword (index (CReg, Link_s), oldf);
+                               }
+                               /* integer stack left undefined */
+                               AReg = BReg;
+                               BReg = CReg;
+                           }
+			   IPtr++;
+			   break;
+		case 0xFFFFFFF1u: /* swaptimer (T9000, ISM 13.7) */
+                           {
+                               uint32_t pri = AReg & 1u;
+                               uint32_t oldf = TPtrLoc[pri];
+                               TPtrLoc[pri] = BReg;
+                               AReg = oldf;
+                           }
+			   IPtr++;
+			   break;
+		case 0xFFFFFFF0u: /* swapqueue (T9000, ISM 13.7) */
+                           {
+                               uint32_t pri  = AReg & 1u;
+                               uint32_t oldf = FPtrReg[pri];
+                               uint32_t oldb = BPtrReg[pri];
+                               FPtrReg[pri] = BReg;
+                               BPtrReg[pri] = CReg;
+                               AReg = oldf;
+                               BReg = oldb;
+                           }
+			   IPtr++;
+			   break;
+		case 0xFFFFFFE0u: /* stmove2dinit - store 2D move state (T9000) */
+                           writeword (AReg,     m2dLength);
+                           writeword (AReg + 4, m2dDestStride);
+                           writeword (AReg + 8, m2dSourceStride);
+                           AReg = BReg;
+                           BReg = CReg;
+			   IPtr++;
+			   break;
+		case 0xFFFFFFDFu: /* causeerror (T9000) */
+                           SetError;
+			   IPtr++;
+			   break;
+		case 0xFFFFFFD4u: /* devmove - device block move (T9000) */
+                           /* Same data movement as move; the device ordering
+                            * guarantees are trivially met (no reordering). */
+                           if (INT32(AReg) > 0)
+                               movebytes_int (BReg, CReg, AReg);
+                           AReg = BReg = CReg = Undefined_p;
+			   IPtr++;
+			   break;
+		case 0xFFFFFFD3u: /* icl - invalidate cache line  (T9000): no cache */
+		case 0xFFFFFFD2u: /* fdcl - flush dirty cache line (T9000) */
+			   IPtr++;
+			   break;
+		case 0xFFFFFFD1u: /* ica - invalidate cache address (T9000) */
+		case 0xFFFFFFD0u: /* fdca - flush dirty cache address (T9000) */
+                           AReg = BReg;
+                           BReg = CReg;
+			   IPtr++;
+			   break;
+		case 0xFFFFFFC0u: /* nop (T9000) */
+			   IPtr++;
+			   break;
+		case 0xFFFFFF7Cu: /* ldprodid (T9000) */
+                           CReg = BReg;
+                           BReg = AReg;
+                           AReg = ProductIdentity;
+			   IPtr++;
+			   break;
+		/* T9000 VCP and protection-shadow instructions.  The emulator
+		 * has physical OS-links, no Virtual Channel Processor and no
+		 * shadow register file, so these cannot be given meaningful
+		 * semantics.  Fail loudly with a name instead of "bad Icode". */
+		case 0xFFFFFFFDu: /* stshadow */
+		case 0xFFFFFFFCu: /* ldshadow */
+		case 0xFFFFFFFBu: /* tret */
+		case 0xFFFFFFF9u: /* selth */
+		case 0xFFFFFFF7u: /* swapgstatus */
+		case 0xFFFFFFEEu: /* stopch */
+		case 0xFFFFFFEDu: /* vout */
+		case 0xFFFFFFECu: /* vin */
+		case 0xFFFFFFE9u: /* swapbfr */
+		case 0xFFFFFFE8u: /* sethdr */
+		case 0xFFFFFFE7u: /* setchmode */
+		case 0xFFFFFFE6u: /* initvlcb */
+		case 0xFFFFFFE5u: /* writehdr */
+		case 0xFFFFFFE4u: /* readhdr */
+		case 0xFFFFFFE3u: /* disg */
+		case 0xFFFFFFE2u: /* enbg */
+		case 0xFFFFFFE1u: /* grant */
+		case 0xFFFFFFDDu: /* unmkrc */
+		case 0xFFFFFFDCu: /* mkrc */
+		case 0xFFFFFFDBu: /* irdsq */
+		case 0xFFFFFFDAu: /* erdsq */
+		case 0xFFFFFFD9u: /* stresptr */
+		case 0xFFFFFFD8u: /* ldresptr */
+                           printf ("-E-EMU9000: unimplemented T9000 VCP/shadow instruction (OReg #%08X)\n", OReg);
+                           maybe_log_nearest_sym(IPtr, "t9k-vcp-unimpl");
+                           processor_state ();
+			   handler (-1);
+			   break;
 		case T9K_OP_SYSCALL: /* OReg -8 — system call (T9000, mem 60F8) */
 			   t9k_syscall();
 			   break;
@@ -8932,6 +9580,9 @@ void deschedule (void)
         }
 #endif
         EMUDBG2 ("-I-EMUDBG: Deschedule process #%08X.\n", Wdesc);
+        /* ISM 13.6: interruption is automatically re-enabled when a
+         * process is descheduled. */
+        IntsDisabled = 0;
         /* Write Iptr into workspace */
 	writeword (index (WPtr, Iptr_s), IPtr);
 
@@ -8973,6 +9624,10 @@ void D_check (void)
 
         /* High priority processes never timesliced. */
         if (ProcPriority == HiPriority)
+                return;
+
+        /* T9000: settimeslice(false)/intdis suppress timeslicing. */
+        if (TimesliceDisabled || IntsDisabled)
                 return;
 
 	/* Check for timeslice. */
@@ -9459,8 +10114,9 @@ uint32_t word_int (uint32_t ptr)
 {
 	uint32_t result;
 
-	/* T9000 P-mode: translate logical address first. */
-	if (unlikely(t9k_in_p() && !t9k_prot.phys_bypass))
+	/* T9000: translate when P-mode, or L-mode with RODS still loaded
+	 * (soft leave_p mid C-call keeps Q3 WPtr — must relocate). */
+	if (unlikely(t9k_prot.enabled && !t9k_prot.phys_bypass))
 		ptr = t9k_translate(ptr, T9K_ACC_READ);
 
 	/* Fast path: normal extended memory below the historical MMIO cliff
@@ -9622,8 +10278,8 @@ void writeword_int (uint32_t ptr, uint32_t value)
 	u_char ch = 0;
 	static uint32_t watch_addr = 0;
 
-	/* T9000 P-mode: translate + write-permit check. */
-	if (unlikely(t9k_in_p() && !t9k_prot.phys_bypass))
+	/* T9000: translate (+ write check in P-mode). L-mode still relocates Q3. */
+	if (unlikely(t9k_prot.enabled && !t9k_prot.phys_bypass))
 		ptr = t9k_translate(ptr, T9K_ACC_WRITE);
 
 	/* Keep the write watchpoint ahead of the normal-RAM fast return. */
@@ -9906,6 +10562,31 @@ void writeword_int (uint32_t ptr, uint32_t value)
 		t9k_leave_p();
 		return;
 	}
+	/* Phase 10: per-task RODS install (scheduler / soft rebind). */
+	{
+		static uint32_t rods_stage[4];
+		if (ptr == VGA_CTRL_RODS0) { rods_stage[0] = value; return; }
+		if (ptr == VGA_CTRL_RODS1) { rods_stage[1] = value; return; }
+		if (ptr == VGA_CTRL_RODS2) { rods_stage[2] = value; return; }
+		if (ptr == VGA_CTRL_RODS3) { rods_stage[3] = value; return; }
+		if (ptr == VGA_CTRL_LOAD_RODS) {
+			t9k_load_rods(rods_stage);
+			return;
+		}
+	}
+	/* Phase 10 PMI private + text ROM (always available, even headless). */
+	{
+		static uint32_t pmi_priv_lo, pmi_priv_hi, pmi_text_lo, pmi_text_hi;
+		if (ptr == VGA_CTRL_PMI_PRIV_LO) { pmi_priv_lo = value; return; }
+		if (ptr == VGA_CTRL_PMI_PRIV_HI) { pmi_priv_hi = value; return; }
+		if (ptr == VGA_CTRL_PMI_TEXT_LO) { pmi_text_lo = value; return; }
+		if (ptr == VGA_CTRL_PMI_TEXT_HI) { pmi_text_hi = value; return; }
+		if (ptr == VGA_CTRL_PMI_COMMIT) {
+			t9k_pmi_set_private(pmi_priv_lo, pmi_priv_hi);
+			t9k_pmi_set_text_rom(pmi_text_lo, pmi_text_hi);
+			return;
+		}
+	}
 
 	if (fb_range_intersects(ptr, sizeof(uint32_t))) {
 		uint32_t fb_off;
@@ -9974,7 +10655,7 @@ u_char byte_int (uint32_t ptr)
 {
 	u_char result;
 
-	if (unlikely(t9k_in_p() && !t9k_prot.phys_bypass))
+	if (unlikely(t9k_prot.enabled && !t9k_prot.phys_bypass))
 		ptr = t9k_translate(ptr, T9K_ACC_READ);
 
 	/* Fast path: RAM below historical MMIO cliff; FB carveout redirected. */
@@ -10081,7 +10762,7 @@ u_char byte (uint32_t ptr)
 /* Write a byte to memory. */
 INLINE void writebyte_int (uint32_t ptr, u_char value)
 {
-	if (unlikely(t9k_in_p() && !t9k_prot.phys_bypass))
+	if (unlikely(t9k_prot.enabled && !t9k_prot.phys_bypass))
 		ptr = t9k_translate(ptr, T9K_ACC_WRITE);
 
 	/* Fast path: RAM below historical MMIO cliff; FB carveout redirected. */

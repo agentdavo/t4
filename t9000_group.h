@@ -617,6 +617,25 @@ static inline int t9k_class_opr(int oreg, uint32_t creg, uint32_t veclen,
             return T9K_STORE;
         default: break;
         }
+        /* T9000-only FPU secondaries (direct encodings of the fpentry
+         * operations).  fpsqrt keeps the 8-cycle figure the comment above
+         * quotes for the single-precision hardware; precision conversions
+         * cost a normalise pass; the by-2/exp/abs monadics and the
+         * rounding-mode sets are simple exponent/flag updates. */
+        switch (oreg) {
+        case 0xD3:                            /* fpsqrt              */
+            *latency = 8; return T9K_SLOW;
+        case 0xD7: case 0xD8:                 /* fpr32tor64/64tor32  */
+            *latency = 3; return T9K_SLOW;
+        case 0xD1: case 0xD2:                 /* fpdivby2, fpmulby2  */
+        case 0xD9: case 0xDA:                 /* fpexpdec32/inc32    */
+        case 0xDB:                            /* fpabs               */
+            *latency = 2; return T9K_SLOW;
+        case 0xD0: case 0xD4: case 0xD5: case 0xD6:  /* fprn/rp/rm/rz */
+        case 0xCB: case 0xDC:                 /* fpseterr, fpclrerr  */
+            return T9K_ALU;
+        default: break;
+        }
         if (oreg >= 0x80 && oreg <= 0xAF) {   /* T800 FPU            */
             /* "The FPU is capable of performing single precision addition
              * and multiplication in 2 cycles, and double precision
