@@ -1790,6 +1790,10 @@ _Atomic int timeslice;
  * comms) is NOT deferred - the emulated kernel does not rely on that. */
 int TimesliceDisabled = 0;
 int IntsDisabled = 0;
+/* T9000 trap-handler register (ISM 10.2).  Minimal model: selth/ldth
+ * maintain the pointer; L-trap delivery itself is not modelled, so the
+ * status-bit exchange between old and new THDS is omitted. */
+uint32_t ThReg = 0x80000000u;   /* NotProcess.p */
 int delayCount1 = 5;
 int speed_multiplier = 1;  /* T800=1, T806=10 (200MHz/20MHz) */
 int32_t quit = FALSE;
@@ -3339,8 +3343,15 @@ u_short ProfileCode (u_char instrCode, uint32_t oprCode)
         {
                 if (0xab == oprCode)
                         ret = 0x300; /* XXX */
-                else
+                else if (oprCode < 0x300)
                         ret = 0x100 + oprCode;
+                else
+                        /* Out-of-range OReg (negative-prefix secondaries, or
+                         * pfix-built values like the kernel's 0x60F9 selth
+                         * spelling): never fold these into combinations - the
+                         * table is indexed by 10-bit codes and 0x100+oprCode
+                         * would run off its end. */
+                        ret = 0x3FF;
         }
         return ret;
 }
@@ -4345,6 +4356,22 @@ ExecuteInstr:
 	    !(t4_sd_boot_enabled() &&
 	      (IPtr - BOOTBANK_BASE < BOOTBANK_SIZE ||
 	       (IPtr >= SD_BASE && IPtr < SD_LIMIT)))) {
+		/* A P-process that runs off its regions is an AccessViolation
+		 * (ISM 9.5): the machine traps to the supervisor, which is
+		 * exactly the case protection exists to contain.  Killing the
+		 * host instead loses the supervisor's diagnosis and turns a
+		 * contained guest fault into a dead emulator.  L-mode has no
+		 * supervisor to trap to, so it still halts below. */
+		if (t9k_in_p()) {
+			fprintf(stderr,
+				"[T9K-PROT] P-process left RAM: IPtr=0x%08X "
+				"WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X "
+				"— AccessViolation to supervisor\n",
+				IPtr, WPtr, AReg, BReg, CReg);
+			fflush(stderr);
+			t9k_p_trap(T9K_TRAP_ACCESS, IPtr);
+			/* not reached: t9k_p_trap longjmps to the mainloop */
+		}
 		fault_history_dump("execution left configured RAM");
 		/* Fatal: continuing would fetch from a negative mem[] index
 		 * (host SIGSEGV) or spin in garbage until timeout.  Stop with
@@ -7301,6 +7328,16 @@ DescheduleOutWord:
                                SetError;
 		           IPtr++;
 		           break;
+		case 0xc2:   /* ldth - load trap-handler pointer          (T9000) */
+		case 0x2CF2: /* ldth via the kernel stub's pfix-built OReg.
+		              * thds_selth.S encodes App B's "2C F2" byte pair as
+		              * a positive prefix chain; accept both spellings. */
+		           BADCODE(IsT414);
+                           CReg = BReg;
+                           BReg = AReg;
+                           AReg = ThReg;
+		           IPtr++;
+		           break;
 		case 0xc4: /* intdis - disable interruption+timeslice   (T9000) */
 		           BADCODE(IsT414);
                            IntsDisabled = 1;
@@ -7421,7 +7458,6 @@ DescheduleOutWord:
 		case 0xbe: /* ldconf */
 		case 0xbf: /* stconf */
 		case 0xc0: /* ldcnt */
-		case 0xc2: /* ldth */
 		case 0xc3: /* ldchstatus */
 		case 0xc7: /* cir */
 		case 0xc9: /* chantype */
@@ -8975,6 +9011,17 @@ DescheduleOutWord:
                            AReg = ProductIdentity;
                            IPtr++;
                            break;
+		case 0xFFFFFFF9u: /* selth - select trap-handler (T9000, mem 60F9) */
+		case 0x60F9:      /* selth via the kernel stub's pfix-built OReg */
+                           /* ThReg := Areg; stacks undefined (popped).  The
+                            * ISM status/control-bit exchange with the THDS is
+                            * omitted - L-trap delivery is not modelled. */
+                           temp = ThReg;
+                           ThReg = AReg;
+                           AReg = temp;
+                           BReg = CReg;
+			   IPtr++;
+			   break;
 		case 0xFFFFFFFFu: /* fpstall - store all FPU state (T9000, 6X FF) */
                            {
                                uint32_t ptr = AReg;
@@ -9149,7 +9196,6 @@ DescheduleOutWord:
 		case 0xFFFFFFFDu: /* stshadow */
 		case 0xFFFFFFFCu: /* ldshadow */
 		case 0xFFFFFFFBu: /* tret */
-		case 0xFFFFFFF9u: /* selth */
 		case 0xFFFFFFF7u: /* swapgstatus */
 		case 0xFFFFFFEEu: /* stopch */
 		case 0xFFFFFFEDu: /* vout */
