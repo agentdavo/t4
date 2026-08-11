@@ -97,6 +97,21 @@
 #define T9K_GROUP_BYTES 8
 #define T9K_FETCH_BYTES 4
 
+/* Why a group ended - see t9k.why[]. */
+enum {
+    T9KW_OTHER = 0,
+    T9KW_STORE,      /* stl/stnl: stage-5 write terminates the group   */
+    T9KW_JUMP,       /* j/cj/call/ret/ajw: stage-5 branch terminates it */
+    T9KW_SLOW,       /* multi-cycle op (FPU, mul, div, TVX)            */
+    T9KW_S_LOCAL,    /* stage 1 full: 2 cached local reads             */
+    T9KW_S_ADDR,     /* stage 2 full: 2 address calculations           */
+    T9KW_S_NONLOC,   /* stage 3 full: 2 non-local reads                */
+    T9KW_S_ALU,      /* stage 4 full: 1 ALU/FPU op                     */
+    T9KW_BYTES,      /* the 8-byte fetch window filled                 */
+    T9KW_COUNT8      /* 8 instructions                                 */
+};
+/* Opcode that caused the most recent close, for T4_T9K_WHY reporting. */
+
 /* Which pipeline resource an instruction consumes. */
 enum {
     T9K_NONE = 0,   /* prefixes: folded into the instruction they modify */
@@ -135,6 +150,12 @@ typedef struct {
     int      mac_lanes;       /* TVX MAC lanes; divides block latency       */
     int      n_units;         /* independent TVX functional units           */
     int      n_acc;           /* TVX accumulator registers                  */
+    /* Group-close attribution (T4_T9K_WHY=1).  Counts why each group ended,
+     * so codegen work can be aimed at the resource that actually binds
+     * rather than at whichever one looks worst in a disassembly. */
+    int      why_on;
+    uint64_t why[8];          /* indexed by T9KW_* */
+    uint64_t why_n1[8];       /* ... restricted to groups that held 1 instr */
     int      rd_bw;           /* block-op read bandwidth, bytes/cycle (8 =
                                  the documented 2 words from 4 banks)      */
     int      wr_bw;           /* block-op write bandwidth, bytes/cycle (4 =
@@ -179,6 +200,7 @@ static inline void t9k_init(void)
         { "T4_T9K_SPLITWRJMP", 0,  offsetof(t9k_state, split_wr_jmp)    },
         { "T4_T9K_PIPESLOW",   0,  offsetof(t9k_state, slow_pipelined)  },
         { "T4_T9K_AJWSTAGE2",  0,  offsetof(t9k_state, ajw_stage2)      },
+        { "T4_T9K_WHY",        0,  offsetof(t9k_state, why_on)          },
         { "T4_T9K_MACLANES",   1,  offsetof(t9k_state, mac_lanes)       },
         { "T4_T9K_UNITS",      1,  offsetof(t9k_state, n_units)         },
         { "T4_T9K_ACCUM",      1,  offsetof(t9k_state, n_acc)           },
@@ -245,16 +267,26 @@ static inline void t9k_init(void)
     if (t9k.n_acc > T9K_MAX_ACC) t9k.n_acc = T9K_MAX_ACC;
 }
 
-static inline void t9k_close_group(void)
+static inline void t9k_close_group_why(int why)
 {
     if (t9k.n) {
         t9k.groups++;
         t9k.cycle++;
         if (t9k.n <= 8)
             t9k.hist[t9k.n]++;
+        if (t9k.why_on) {
+            t9k.why[why & 7]++;
+            if (t9k.n == 1)
+                t9k.why_n1[why & 7]++;
+        }
     }
     t9k.n = t9k.n_bytes = t9k.n_local = t9k.n_addr = 0;
     t9k.n_nonlocal = t9k.n_alu = t9k.n_wrjmp = 0;
+}
+
+static inline void t9k_close_group(void)
+{
+    t9k_close_group_why(T9KW_OTHER);
 }
 
 /* Feed one executed instruction to the model.  `kind` is a T9K_* class,
@@ -263,6 +295,7 @@ static inline void t9k_close_group(void)
 static inline void t9k_issue(int kind, int latency, int bytes)
 {
     int d_local = 0, d_addr = 0, d_nonlocal = 0, d_alu = 0, d_wrjmp = 0;
+
 
     if (!t9k.enabled)
         return;
@@ -339,10 +372,10 @@ static inline void t9k_issue(int kind, int latency, int bytes)
             return;
         }
         t9k.tvx_issue = 0;
-        t9k_close_group();           /* cannot share a group */
+        t9k_close_group_why(T9KW_SLOW);   /* cannot share a group */
         t9k.n = 1;
         t9k.n_bytes = bytes;
-        t9k_close_group();
+        t9k_close_group_why(T9KW_SLOW);
         t9k.stall += (uint64_t)(latency > 0 ? latency - 1 : 0);
         t9k.cycle += (uint64_t)(latency > 0 ? latency - 1 : 0);
         return;
@@ -362,14 +395,18 @@ static inline void t9k_issue(int kind, int latency, int bytes)
 
     /* Would this instruction exceed a stage limit, the group size, or the
      * 8-byte window the grouper can examine at once? */
-    if (t9k.n >= 8
-        || t9k.n_bytes + bytes > T9K_GROUP_BYTES
-        || t9k.n_local    + d_local    > 2
-        || t9k.n_addr     + d_addr     > 2
-        || t9k.n_nonlocal + d_nonlocal > 2
-        || t9k.n_alu      + d_alu      > 1
-        || t9k.n_wrjmp    + d_wrjmp    > 1)
-        t9k_close_group();
+    if (t9k.n >= 8)
+        t9k_close_group_why(T9KW_COUNT8);
+    else if (t9k.n_bytes + bytes > T9K_GROUP_BYTES)
+        t9k_close_group_why(T9KW_BYTES);
+    else if (t9k.n_local + d_local > 2)
+        t9k_close_group_why(T9KW_S_LOCAL);
+    else if (t9k.n_addr + d_addr > 2)
+        t9k_close_group_why(T9KW_S_ADDR);
+    else if (t9k.n_nonlocal + d_nonlocal > 2)
+        t9k_close_group_why(T9KW_S_NONLOC);
+    else if (t9k.n_alu + d_alu > 1 || t9k.n_wrjmp + d_wrjmp > 1)
+        t9k_close_group_why(T9KW_S_ALU);
 
     t9k.n_local    += d_local;
     t9k.n_addr     += d_addr;
@@ -382,7 +419,7 @@ static inline void t9k_issue(int kind, int latency, int bytes)
     /* A write or jump is the last stage, so it always ends the group -
      * unless the write and branch slots have been split. */
     if (d_wrjmp && !t9k.split_wr_jmp)
-        t9k_close_group();
+        t9k_close_group_why(kind == T9K_STORE ? T9KW_STORE : T9KW_JUMP);
 }
 
 /* Classify a primary (high-nibble) opcode.  `oreg` is the folded operand,
@@ -760,6 +797,50 @@ static inline int t9k_class_opr(int oreg, uint32_t creg, uint32_t veclen,
     }
 }
 
+/* Classify a ProfileCode-style opcode: primaries are stored as (op << 4),
+ * T9000 secondaries as 0x100 + oreg.  This is the encoding the emulator's
+ * combined[] table uses for the two halves of a fused pair. */
+static inline int t9k_class_profile(int code, uint32_t oreg, uint32_t creg,
+                                    uint32_t veclen, int *latency)
+{
+    *latency = 1;
+    if (code < 0x100)
+        return t9k_class_primary(code >> 4, oreg);
+    return t9k_class_opr(code - 0x100, creg, veclen, latency);
+}
+
+/* Feed a fused instruction pair as the two instructions it really is.
+ *
+ * The emulator fuses common adjacent pairs into a single Icache slot with a
+ * pseudo-opcode in 0x100..0x115 (combined[] in p.c) - `stl;ldl`, `ldl;adc`,
+ * `eqc;cj`, `ldc;ldl`, `ldl;ldl` and so on.  Those pseudo-opcodes are not
+ * T9000 secondaries, so t9k_class_opr fell through to its default and charged
+ * each fused pair exactly one stage-4 ALU operation.
+ *
+ * That is not a small distortion.  It made `ldc;ldl` and `ldl;ldl` cost the
+ * same, so moving work off the ALU stage - the whole point of the stage-4
+ * bound - was invisible.  It also charged `stl;ldl` and `ajw;ret` to the ALU
+ * stage, inflating the stage-4 share of group closes at the expense of the
+ * store and jump stages.  Any measurement taken before this fix understates
+ * ALU-pressure changes and overstates the ALU's share of the profile. */
+static inline void t9k_issue_pair(int code0, uint32_t oreg0,
+                                  int code1, uint32_t oreg1,
+                                  uint32_t creg, uint32_t veclen, int bytes)
+{
+    int lat0, lat1, k0, k1, b0;
+
+    if (!t9k.enabled)
+        return;
+    k0 = t9k_class_profile(code0, oreg0, creg, veclen, &lat0);
+    k1 = t9k_class_profile(code1, oreg1, creg, veclen, &lat1);
+    /* The fetcher pulled `bytes` for the pair; the second half of every
+     * fused pair is a single byte in practice, so charge it one and give the
+     * rest (any prefix chain included) to the first. */
+    b0 = bytes > 1 ? bytes - 1 : 1;
+    t9k_issue(k0, lat0, b0);
+    t9k_issue(k1, lat1, bytes - b0 > 0 ? bytes - b0 : 1);
+}
+
 /* Cycles so far, on the same basis as t9k_report(): whichever of the issue
  * bound and the fetch bound is larger, plus multi-cycle stall.  Does not close
  * the group in progress - this is meant to be called mid-run, and closing
@@ -826,6 +907,25 @@ static inline void t9k_report(void)
         fprintf(stderr, " %d:%llu", i, (unsigned long long)t9k.hist[i]);
     fprintf(stderr, "\n[T9000]   at 50 MHz that is    : %.3f ms\n",
             (double)cycles / 50000.0);
+    if (t9k.why_on) {
+        static const char *const wn[8] = {
+            "other", "store (stl/stnl)", "jump (j/cj/call/ret/ajw)",
+            "multi-cycle op", "stage1 local x2", "stage2 addr x2",
+            "stage3 nonlocal x2", "stage4 ALU x1"
+        };
+        uint64_t tot = 0;
+        int k;
+        for (k = 0; k < 8; k++) tot += t9k.why[k];
+        fprintf(stderr, "[T9000]   --- why groups closed (%llu groups) ---\n",
+                (unsigned long long)tot);
+        for (k = 0; k < 8; k++) {
+            if (!t9k.why[k]) continue;
+            fprintf(stderr, "[T9000]   %-26s %9llu (%5.1f%%)  of which size-1: %llu\n",
+                    wn[k], (unsigned long long)t9k.why[k],
+                    tot ? 100.0 * (double)t9k.why[k] / (double)tot : 0.0,
+                    (unsigned long long)t9k.why_n1[k]);
+        }
+    }
 }
 
 #endif /* T9000_GROUP_H */

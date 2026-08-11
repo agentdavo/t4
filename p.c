@@ -2006,6 +2006,12 @@ static struct {
         { 0x142 /* mint */, 0x146 /* and      */, 0x115 },
         { NO_ICODE, NO_ICODE, NO_ICODE }
 };
+/* The fused pseudo-opcodes occupy 0x100.. contiguously and are dispatched only
+ * by the combined cases in the OPR switch - no real T9000 secondary lives
+ * there.  The T9000 grouper model uses this range to decompose a fused slot
+ * back into the pair it stands for. */
+#define T9K_COMBINED_BASE   0x100
+#define T9K_COMBINED_COUNT  ((int)(sizeof combined / sizeof combined[0]) - 1)
 static u_char combinations[0x400 * 0x400];
 
 /* Support functions. */
@@ -4343,7 +4349,17 @@ ExecuteInstr:
 		 * instruction (the slot is hashed once, before the pfix/nfix
 		 * loop), so this is the encoded length the fetcher must pull. */
 		int t9k_bytes = (int)(IPtr - Icache[islot].IPtr);
-		if (Icode == 0xf0) {
+		if (Icode == 0xf0 && (int)OReg >= T9K_COMBINED_BASE &&
+		    (int)OReg < T9K_COMBINED_BASE + T9K_COMBINED_COUNT) {
+			/* A fused pair (combined[] above): issue both halves,
+			 * or the model charges the pair one ALU op and cannot
+			 * see the difference between e.g. `ldc;ldl` and
+			 * `ldl;ldl`. */
+			const int ci = (int)OReg - T9K_COMBINED_BASE;
+			t9k_issue_pair (combined[ci].code0, Arg0,
+					combined[ci].code1, Arg1,
+					CReg, vec_len, t9k_bytes);
+		} else if (Icode == 0xf0) {
 			int lat, kind = t9k_class_opr((int)OReg, CReg,
 						      vec_len, &lat);
 			t9k_issue(kind, lat, t9k_bytes);
