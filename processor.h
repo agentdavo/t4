@@ -112,7 +112,17 @@ extern uint32_t CoreSize;
 #else
 #define MAX_DATA        1022
 #define SCH_DATA        2
-#define SCHLength(ch)   (*(u_short*)(ch)->schbuf)
+/* The length word is the mailbox handshake between node threads (and
+ * router threads): the producer writes it after the data, the consumer
+ * clears it after copying the data out.  Hence acquire/release. */
+#if defined(__GNUC__)
+#define SCHLength(ch)   __atomic_load_n((u_short*)(ch)->schbuf, __ATOMIC_ACQUIRE)
+#define SCHSetLength(ch, n) \
+        __atomic_store_n((u_short*)(ch)->schbuf, (u_short)(n), __ATOMIC_RELEASE)
+#else
+#define SCHLength(ch)   (*(volatile u_short*)(ch)->schbuf)
+#define SCHSetLength(ch, n) (SCHLength(ch) = (u_short)(n))
+#endif
 #endif
 
 #define SCH_SIZE        (MAX_DATA+SCH_DATA)
@@ -200,6 +210,7 @@ u_char* memrange (uint32_t, u_char*, uint32_t);
 void add_profile   (uint32_t);
 void print_profile (void);
 void open_channel  (uint32_t);
+void open_link_channel (Channel *chan, uint32_t addr, int theLink, int chanIn);
 Channel *reset_channel(uint32_t);
 void alt_channel   (Channel*);
 int channel_ready  (Channel *chan);

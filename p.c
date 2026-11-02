@@ -172,6 +172,7 @@ int shlink_free (void){return EINVAL;}
 #include "t9000_protect.h"
 #include "t9000_pmi.h"
 #include "t9000_vcp.h"
+#include "t9000_ctl.h"
 #ifdef __MWERKS__
 #include "mac_input.h"
 #endif
@@ -2689,7 +2690,7 @@ int channel_recvP (Channel *chan, u_char *data, int doWait)
                 {
                         ret = SCHLength(chan);
                         memcpy (data, &chan->schbuf[SCH_DATA], ret);
-                        SCHLength(chan) = 0;
+                        SCHSetLength(chan, 0);
                         t4_wake_node_id(chan->peer);
                 }
         }
@@ -2793,7 +2794,7 @@ int channel_sendP (Channel *chan, u_char *data, int ndata, int doWait)
                         }
 #endif
                         memcpy (&chan->schbuf[SCH_DATA], data, ndata);
-                        SCHLength(chan) = ndata;
+                        SCHSetLength(chan, ndata);
                         ret = ndata;
                         t4_wake_node_id(chan->peer);
                 }
@@ -2956,6 +2957,10 @@ int linkcomms (char *where, int doBoot, int timeOut)
 
         if (nodeid < 0 && !t4cpu->s_loopback)
                 return 0;
+        /* T9000 control links (t9000_ctl.c): a Run or Reboot command ends
+         * a boot wait */
+        if (t4cpu->s_ctl_links && (t9k_ctl_poll () & T9K_CTL_START))
+                return 1;
         for (i = 0; i < 8; i++)
                 vlk[i] = -1;
 
@@ -2965,6 +2970,10 @@ int linkcomms (char *where, int doBoot, int timeOut)
         for (i = 0; i < 4; i++)
         {
                 if ((0 == i) && serve) /* skip Host link */
+                        continue;
+                /* a link put in virtual mode (a CPoke during a control-link
+                 * boot) is the VCP's, not a byte-stream boot link */
+                if (doBoot && t9k_link_virtual (i))
                         continue;
 
                 if (!doBoot && t9k_link_virtual (i))
@@ -3045,8 +3054,15 @@ int linkcomms (char *where, int doBoot, int timeOut)
                  * Link/Process/Timer activity" the moment idle polling
                  * dropped below a second. */
                 if (doBoot)
+                {
+                        /* only the control links can boot this node now */
+                        if (t4cpu->s_ctl_links && timeOut)
+                                t9k_ctl_wait (timeOut);
                         return 0;
-                if (timeOut)
+                }
+                if (timeOut && t4cpu->s_ctl_links)
+                        t9k_ctl_wait (timeOut);     /* woken by a command */
+                else if (timeOut)
                         usleep (timeOut * 1000);
                 /* A stand-alone node (T4_LINK_LOOPBACK) has nobody
                  * outside it to send. */
@@ -3311,16 +3327,24 @@ static void init_link_loopback (void)
 /* Open a link channel */
 void open_channel (uint32_t addr)
 {
-        Channel *chan;
-        int chanIn, theLink;
+        open_link_channel (reset_channel (addr), addr, TheLink(addr), IsLinkIn(addr));
+}
+
+/* Mailbox slot of a node link in shared memory: Link0-3 In at 4-7,
+ * CLink0-1 In (network-map links 4 and 5) at 0-1; t4_fabric_inbox() is
+ * the threaded fabric's equivalent. */
+#define LINK_SLOT(l)    ((l) < 4 ? 4 + (l) : (l) - 4)
+
+/* Wire one end of a link as the network map says: theLink 0-3 is a data
+ * link, 4-5 a control link (t9000_ctl.c, which passes addr 0). */
+void open_link_channel (Channel *chan, uint32_t addr, int theLink, int chanIn)
+{
         int othernode, otherlink;
         int ret;
         u_char *nodeBase;
 
-        chan = reset_channel (addr);
-        chanIn = IsLinkIn(addr);
-        theLink = TheLink(addr);
-
+        chan->Address = MostNeg;
+        chan->Length  = 0;
         chan->LinkAddress = addr;
         chan->linkno = theLink;
         chan->url[0] = '\0';
@@ -3337,7 +3361,7 @@ void open_channel (uint32_t addr)
         if (nodeid < 0 && t4cpu->s_loopback)
         {
                 /* T4_LINK_LOOPBACK: a cable from LinkaOut to LinkbIn */
-                int other = t4_loopback_peer[theLink];
+                int other = theLink < 4 ? t4_loopback_peer[theLink] : -1;
 
                 if (other >= 0)
                         chan->schbuf = t4cpu->s_loopback +
@@ -3349,14 +3373,14 @@ void open_channel (uint32_t addr)
 
         if (t4_fabric) {
                 if (chanIn) {
-                        nodeBase = t4_fabric->base + (nodeid * 8 * SCH_SIZE);
-                        chan->schbuf = nodeBase + (4 + theLink) * SCH_SIZE;
+                        chan->schbuf = t4_fabric_inbox(t4_fabric, nodeid, theLink);
                         if (0 == connectedNetLink(nodeid, theLink, &othernode, &otherlink))
                                 chan->peer = othernode;
                 } else if (0 == connectedNetLink(nodeid, theLink, &othernode, &otherlink)) {
-                        nodeBase = t4_fabric->base + (othernode * 8 * SCH_SIZE);
-                        chan->schbuf = nodeBase + (4 + otherlink) * SCH_SIZE;
-                        chan->peer = othernode;
+                        /* the far end may be a router (t4_fabric.c) */
+                        chan->schbuf = t4_fabric_inbox(t4_fabric, othernode, otherlink);
+                        if (chan->schbuf)
+                                chan->peer = othernode;
                 }
                 return;
         }
@@ -3385,7 +3409,7 @@ void open_channel (uint32_t addr)
                 if (chanIn)
                 {
                         nodeBase = SharedLinks + (nodeid * 8 * SCH_SIZE);
-                        chan->schbuf = nodeBase + (4 + theLink) * SCH_SIZE;
+                        chan->schbuf = nodeBase + LINK_SLOT(theLink) * SCH_SIZE;
                         if (0 == connectedNetLink(nodeid, theLink, &othernode, &otherlink))
                                 chan->peer = othernode;
                         if (verbose)
@@ -3397,7 +3421,7 @@ void open_channel (uint32_t addr)
                 else if (0 == connectedNetLink(nodeid, theLink, &othernode, &otherlink))
                 {
                         nodeBase = SharedLinks + (othernode * 8 * SCH_SIZE);
-                        chan->schbuf = nodeBase + (4 + otherlink) * SCH_SIZE;
+                        chan->schbuf = nodeBase + LINK_SLOT(otherlink) * SCH_SIZE;
                         chan->peer = othernode;
                         if (verbose)
                                 printf ("-I-EMU414: Link%dIn  at #%08lX %d:%d.\n",
@@ -3407,6 +3431,9 @@ void open_channel (uint32_t addr)
                 }
                 return;
         }
+        /* a control link that is not in the map gets no socket */
+        if (theLink >= 4 && 0 != connectedNetLink(nodeid, theLink, &othernode, &otherlink))
+                return;
         if (chanIn)
         {
                 strcpy (&chan->url[0], netLinkURL (nodeid, theLink));
@@ -3662,6 +3689,9 @@ void init_processor (void)
         TPtrLoc[0] = NotProcess_p;
         TPtrLoc[1] = NotProcess_p;
         ClearInterrupt; /* XXX not required ??? */
+
+        /* T9000 control system and CLink0-1, after the CPU's reset state */
+        t9k_ctl_reset_node ();
 
         /* Init TOD. */
         LastTOD.tv_sec  = 0;
@@ -3937,9 +3967,21 @@ void mainloop (void)
 
 	fprintf(stderr, "[DEBUG: Entering mainloop, IPtr=0x%08X Wptr=0x%08X]\n", IPtr, WPtr);
 
-	/* T9000 protection / PMI (once per mainloop entry). */
-	t9k_protect_init();
-	t9k_pmi_init();
+	/* T9000 protection / PMI, once per node.  A CPU the control unit
+	 * restarts (Run, Reboot: the only re-entry) keeps the PMI set-up
+	 * (HRM table 8.10) and starts outside any P-process. */
+	{
+		static T4_THREAD_LOCAL int t9k_entered;
+
+		if (t9k_entered)
+			t9k_leave_p();
+		else {
+			t9k_protect_init();
+			t9k_pmi_init();
+			t9k_entered = 1;
+		}
+	}
+	t9k_ctl_cpu_entry();
 
 	/* Decode cache: opt-in (T4_DCACHE=1). Default off — correctness first. */
 	{
@@ -10095,6 +10137,49 @@ uint32_t t4_product_identity (void)
         return ProductIdentity;
 }
 
+/* CPU control for the T9000 control system (t9000_ctl.c). */
+
+/* StatusReg in the ISM table 5.5 layout, for the state block a Run or
+ * Reboot hands to the new process (HRM 8.5.4). */
+uint32_t t4_status_reg (void)
+{
+        return t9k_status_pack (STATUSReg, FP_Error, TimesliceDisabled, t9k_in_p ());
+}
+
+/* Stop the CPU: now, or (Stop command, HRM 8.5.4) when the current process
+ * next deschedules or reaches a timeslice point.  start_process() then
+ * returns from mainloop(). */
+void t4_cpu_halt (int now)
+{
+        t4cpu->s_ctl_halt = 1;
+        if (now)
+                SetGotoSNP;
+}
+
+/* "CPU cleared" (HRM table 8.10): stopped, Wdesc NotProcess.p, scheduling
+ * and timer queues empty (HRM 8.7.1). */
+void t4_cpu_clear (void)
+{
+        FPtrReg[0] = FPtrReg[1] = NotProcess_p;
+        BPtrReg[0] = BPtrReg[1] = NotProcess_p;
+        TPtrLoc[0] = TPtrLoc[1] = NotProcess_p;
+        ClearInterrupt;
+        UpdateWdescReg (NotProcess_p | HiPriority);
+        STATUSReg = 0;
+        IntsDisabled = 0;
+        TimesliceDisabled = 0;
+        ThReg = NotProcess_p;
+}
+
+/* Run or Reboot: the CPU starts the process wdesc at iptr. */
+void t4_cpu_start (uint32_t wdesc, uint32_t iptr)
+{
+        UpdateWdescReg (wdesc);
+        IPtr = iptr;
+        ClearGotoSNP;
+        t4cpu->s_ctl_halt = 0;
+}
+
 /* Add a process to the relevant priority process queue. */
 void schedule (uint32_t wdesc)
 {
@@ -10283,6 +10368,9 @@ int start_process (void)
         do
         {
                 active = TRUE;
+                /* the control system has stopped the CPU (t9000_ctl.c) */
+                if (t4cpu->s_ctl_halt)
+                        return 1;
                 if (0 == run_process ())
                         break;
 

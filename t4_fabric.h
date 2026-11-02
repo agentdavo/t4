@@ -11,11 +11,15 @@ typedef struct t4_idle {
         unsigned        idle_gen;
 } t4_idle_t;
 
+struct t4_router;
+
 typedef struct t4_fabric {
         int      nnodes;
         u_char  *base;
         u_char  *events;
         cpu_t  **cpus;
+        int      nrouters;              /* IMS C104s from the network map */
+        struct t4_router *routers;
 } t4_fabric_t;
 
 extern t4_fabric_t *t4_fabric;
@@ -23,6 +27,9 @@ extern t4_fabric_t *t4_fabric;
 t4_fabric_t *t4_fabric_create(int nnodes);
 void t4_fabric_destroy(t4_fabric_t *f);
 void t4_fabric_set_cpu(t4_fabric_t *f, int nid, cpu_t *c);
+u_char *t4_fabric_inbox(t4_fabric_t *f, int nid, int link);
+int  t4_fabric_start_routers(t4_fabric_t *f);
+void t4_fabric_stop_routers(t4_fabric_t *f);
 int  t4_idle_init(cpu_t *c);
 void t4_idle_destroy(cpu_t *c);
 void t4_node_wake(cpu_t *c);

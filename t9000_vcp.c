@@ -22,6 +22,7 @@
 #include "processor.h"
 #include "cpu_state.h"
 #include "t9000_vcp.h"
+#include "t9000_ctl.h"
 
 extern int  channel_sendP (Channel *chan, u_char *data, int ndata, int doWait);
 extern int  channel_recvP (Channel *chan, u_char *data, int doWait);
@@ -128,6 +129,7 @@ typedef struct t9k_event {
 typedef struct t9k_vcp {
         int      space;                 /* T9000 channel space in use */
         int      state;
+        int      stop_sig;              /* control unit Stop while waiting */
         uint32_t command;
         uint32_t memstart, min_invalid, ext_rc_base, hdr_area_base;
         uint32_t status, chan_wlock;
@@ -612,9 +614,11 @@ static void in_deliver (t9k_vcp_t *v, uint32_t n, u_char *d, uint32_t len, int l
 
 /* A non-attributable soft error (HRM 11.9): the packet is discarded and the
  * first one is recorded in VCPStatus (HRM 11.7.2).  Unless the link's
- * LocalizeError bit is set it is signalled to the control system, which on
- * a reliable link halts the VCP: with no control system to restart it, the
- * VCP goes into the 'discarding' state (HRM 11.8.2, 13.5.1) until reset. */
+ * LocalizeError bit is set it is signalled to the control system (HRM
+ * 13.5.1, reliable link): the CPU is stopped, the VCP sent to 'discarding'
+ * (11.8.2) and a VCP error (#02) reported on CLink0 - see t9k_ctl_error().
+ * A node with no control link wired and StandAloneMode clear has nothing to
+ * report to; there the VCP just discards until reset and the CPU runs on. */
 static void vcp_error (t9k_vcp_t *v, int link, uint32_t code, uint32_t hdr)
 {
         static const char *const what[] = {
@@ -626,6 +630,8 @@ static void vcp_error (t9k_vcp_t *v, int link, uint32_t code, uint32_t hdr)
                 v->status = 1u | (code << 1) | ((uint32_t)link << 4) | (hdr << 16);
         VDBG (v, "link%d: %s (header %u)\n", link, what[code & 3u], hdr);
         if (v->plink[link].vmode & T9K_VLM_LOCALIZEERROR)
+                return;
+        if (t9k_ctl_error (T9K_CE_VCP))
                 return;
         if (v->state != VCP_DISCARDING)
                 printf ("-E-EMU9000: Node%d VCP error on Link%d: %s (header %u); "
@@ -765,6 +771,19 @@ void t9k_link_rx (int link)
                 rx_packet (v, link, pkt, n);
         }
         /* acknowledges and follow-on data packets go out at once */
+        for (i = 0; i < T9K_NUM_LINKS; i++)
+                t9k_link_tx (i);
+}
+
+/* Move packets on the virtual links while the CPU is stopped: linkcomms(),
+ * which normally does it, only runs with the CPU. */
+void t9k_vcp_serve_links (void)
+{
+        int i;
+
+        for (i = 0; i < T9K_NUM_LINKS; i++)
+                if (t9k_link_virtual (i) && t9k_link_listening (i))
+                        t9k_link_rx (i);
         for (i = 0; i < T9K_NUM_LINKS; i++)
                 t9k_link_tx (i);
 }
@@ -1847,21 +1866,18 @@ static void op_chantype (t9k_vcp_t *v)
 
 /* ---- configuration space (HRM ch.15) ------------------------------------ */
 
-/* Registers that are documented but have no behaviour in T4 (PMI, system
- * services, cache, control links): stored so that software reads back what
- * it wrote. */
+/* Registers that are documented but have no behaviour in T4 (PMI, cache):
+ * stored so that software reads back what it wrote.  System services and
+ * the control links are t9000_ctl.c's. */
 static int misc_reg (uint32_t a, int *writable, int *readable)
 {
         *writable = *readable = 1;
         if ((a >= 0x0202u && a <= 0x0213u) || a == 0x0600u ||
             (a >= 0x0401u && a <= 0x0416u) ||
-            (a >= 0x2001u && a <= 0x2005u) ||
-            (a >= 0x1003u && a <= 0x1006u) ||
-            ((a >= 0xFD01u && a <= 0xFD04u) || (a >= 0xFE01u && a <= 0xFE04u))) {
-                if (a == 0x0212u || a == 0x0416u || a == 0x2002u || a == 0x2005u ||
-                    a == 0xFD02u || a == 0xFE02u)
+            (a >= 0x2001u && a <= 0x2005u)) {
+                if (a == 0x0212u || a == 0x0416u || a == 0x2002u || a == 0x2005u)
                         *readable = 0;          /* action registers */
-                if (a == 0x0213u || a == 0x1004u || a == 0xFD03u || a == 0xFE03u)
+                if (a == 0x0213u)
                         *writable = 0;
                 return 1;
         }
@@ -1898,7 +1914,7 @@ static void vcp_command (t9k_vcp_t *v, uint32_t cmd)
                 v->status = 0;
                 v->state = VCP_RESETTING;
         } else if (cmd & T9K_VCPCMD_START) {
-                v->state = VCP_RUNNING;
+                v->state = v->stop_sig ? VCP_STOPPING : VCP_RUNNING;
         } else if (cmd & T9K_VCPCMD_STOP) {
                 v->state = VCP_STOPPING;
         } else {
@@ -1908,6 +1924,54 @@ static void vcp_command (t9k_vcp_t *v, uint32_t cmd)
         if (v->state >= VCP_RUNNING)
                 for (i = 0; i < T9K_NUM_LINKS; i++)
                         t9k_link_tx (i);
+}
+
+/* Signals from the control unit (HRM 11.8.2), and its resets (HRM table
+ * 8.10: level 2 clears the VCP and the links but keeps their configuration,
+ * level 1 also returns that to its power-on values). */
+void t9k_vcp_signal (int sig)
+{
+        t9k_vcp_t *v = vcp_get ();
+        uint32_t n;
+        int i;
+
+        switch (sig) {
+        case T9K_VCPSIG_STOP:
+                if (v->state == VCP_RUNNING)
+                        v->state = VCP_STOPPING;
+                else if (v->state == VCP_WAITING)
+                        v->stop_sig = 1;        /* stopping once started */
+                break;
+        case T9K_VCPSIG_ERROR:
+                if (v->state != VCP_RESETTING)
+                        v->state = VCP_DISCARDING;
+                break;
+        case T9K_VCPSIG_RESET2:
+                for (n = 0; n < v->nvl; n++)
+                        vl_clear (&v->vl[n]);
+                for (i = 0; i < T9K_NUM_LINKS; i++) {
+                        t9k_plink_t *p = &v->plink[i];
+
+                        plink_clear_queues (p);
+                        p->ack_turn[0] = p->ack_turn[1] = 0;
+                        p->ds_status = 0x2u;    /* link engine restarted, as at power-on */
+                        p->ds_wlock = 0;
+                        p->warned = 0;
+                }
+                memset (v->ev, 0, sizeof v->ev);
+                v->status = 0;
+                v->command = 0;
+                v->chan_wlock = 0;
+                v->stop_sig = 0;
+                /* 'resetting' for a fixed number of cycles, then 'waiting' */
+                v->state = VCP_WAITING;
+                break;
+        case T9K_VCPSIG_RESET1:
+                t9k_vcp_reset_node ();
+                v = vcp_get ();
+                break;
+        }
+        VDBG (v, "control unit signal %d -> state %d\n", sig, v->state);
 }
 
 /* Link0-3 DS-link registers: #8n01 Mode, #8n02 Command, #8n03 Status,
@@ -1963,6 +2027,8 @@ static int conf_read (t9k_vcp_t *v, uint32_t a, uint32_t *val)
         case T9K_CR_DEVICEID:           *val = t4_product_identity () & 0xFFFFu; return 1;
         case T9K_CR_DEVICEREVISION:     *val = 0; return 1;
         }
+        if ((r = t9k_ctl_conf_read (a, val)) != 0)
+                return r > 0;
         if (misc_reg (a, &w, &r) && r) {
                 s = misc_slot (v, a);
                 *val = s ? *s : 0;
@@ -1971,16 +2037,22 @@ static int conf_read (t9k_vcp_t *v, uint32_t a, uint32_t *val)
         return 0;
 }
 
-static int conf_write (t9k_vcp_t *v, uint32_t a, uint32_t val)
+/* by_cpu: an stconf, which write locks stop; the control unit's CPoke is
+ * not (HRM 15.3: "Reads are not affected nor are writes by the control
+ * unit").  A lock stops every CPU write to its subsystem, its own included,
+ * so only the control unit or a reset (HRM 8.7.6) clears it. */
+static int conf_write (t9k_vcp_t *v, uint32_t a, uint32_t val, int by_cpu)
 {
         int w, r, lk, reg;
         uint32_t *s;
 
         /* ChanWriteLock guards the CPU, VCP and scheduler registers */
-        if (v->chan_wlock && a != T9K_CR_CHANWRITELOCK &&
+        if (by_cpu && v->chan_wlock &&
             ((a >= 0x0100u && a <= 0x01FFu) || (a >= 0x0800u && a <= 0x09FFu) ||
-             (a >= 0x4100u && a <= 0x41FFu)))
+             (a >= 0x4000u && a <= 0x41FFu) || (a >= 0x4900u && a <= 0x49FFu)))
                 return 0;
+        if ((r = t9k_ctl_conf_write (a, val, by_cpu)) != 0)
+                return r > 0;
         if (a >= T9K_CR_VCPLINK0MODE && a < T9K_CR_VCPLINK0MODE + 16u) {
                 int n = (int)((a - T9K_CR_VCPLINK0MODE) >> 2);
                 t9k_plink_t *p = &v->plink[n];
@@ -2002,7 +2074,7 @@ static int conf_write (t9k_vcp_t *v, uint32_t a, uint32_t val)
         if (ds_reg (a, &lk, &reg)) {
                 t9k_plink_t *p = &v->plink[lk];
 
-                if (p->ds_wlock && reg != 4)
+                if (by_cpu && p->ds_wlock)
                         return 0;
                 switch (reg) {
                 case 1: p->ds_mode = val & 0x1Fu; return 1;
@@ -2056,6 +2128,16 @@ static int conf_write (t9k_vcp_t *v, uint32_t a, uint32_t val)
         return 0;
 }
 
+int t9k_cfg_read (uint32_t a, uint32_t *val)
+{
+        return conf_read (vcp_get (), a, val);
+}
+
+int t9k_cfg_write (uint32_t a, uint32_t val, int by_cpu)
+{
+        return conf_write (vcp_get (), a, val, by_cpu);
+}
+
 /* ---- dispatcher ---------------------------------------------------------- */
 
 int t9k_vcp_exec (uint32_t op)
@@ -2078,7 +2160,7 @@ int t9k_vcp_exec (uint32_t op)
                         int_error (v, "ldconf", AReg);
                 return 1;
         case 0xBFu:                             /* stconf */
-                if (!conf_write (v, AReg, BReg))
+                if (!conf_write (v, AReg, BReg, 1))
                         int_error (v, "stconf", AReg);
                 AReg = CReg;
                 return 1;

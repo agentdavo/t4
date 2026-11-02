@@ -27,6 +27,7 @@ typedef struct t9k_shadow {
 } t9k_shadow_t;
 
 struct t9k_vcp;
+struct t9k_ctl;
 
 typedef struct cpu_t {
         uint32_t s_IPtr, s_WPtr, s_AReg, s_BReg, s_CReg, s_OReg;
@@ -80,6 +81,14 @@ typedef struct cpu_t {
         uint32_t s_vcp_span;
         t9k_shadow_t s_sh;
         u_char  *s_loopback;            /* single-node link loopback slots */
+
+        /* T9000 control system (t9000_ctl.c).  s_ctl_links: a control link
+         * is wired; s_ctl_halt: the control unit has stopped the CPU, which
+         * start_process() turns into a return from mainloop(). */
+        struct t9k_ctl *s_ctl;
+        LinkIface s_CLink[2];
+        int      s_ctl_links;
+        int      s_ctl_halt;
 } cpu_t;
 
 extern T4_THREAD_LOCAL cpu_t *t4cpu;

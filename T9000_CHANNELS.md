@@ -3,17 +3,20 @@
 T4 implements the IMS T9000 communication architecture: the Virtual Channel
 Processor (VCP) multiplexing virtual links over the physical links, event
 channels, resource channels, variable-length communication, the
-configuration register space, and the shadow / trap-return state
-instructions.  Code: `t9000_vcp.c` / `t9000_vcp.h` (channels, VCP,
-configuration space) and `p.c` (instruction dispatch, shadow state,
-`tret`, `restart`).
+configuration register space, the shadow / trap-return state
+instructions, and the control system with its control links.  Code:
+`t9000_vcp.c` / `t9000_vcp.h` (channels, VCP, configuration space),
+`t9000_ctl.c` / `t9000_ctl.h` (control links, control unit, system
+services) and `p.c` (instruction dispatch, shadow state, `tret`,
+`restart`).
 
 Sources, in authority order (see `../CLAUDE.md`): T9000 ISM ch.8.4-8.8
 (communication, ALT, resources), ch.12 (channels), ch.13.3-13.4 (shadow
 state, restart), appendix C (instruction definitions); T9000 HRM ch.6
 (links, packet and token protocol), ch.7 (routing, header deletion), ch.11
 (communications, VLCBs, VCP registers, errors), ch.12 (events), ch.13
-(DS-links), ch.15 (configuration register map).
+(DS-links), ch.15 (configuration register map), and part 2 ch.8 (control
+system).
 
 ## Channel address space (ISM fig 12.5, HRM 11.6)
 
@@ -76,15 +79,19 @@ channel words.
   channel it acts on), discarding.
 * **Errors** (HRM 11.9, 11.7.2): header out of range, header too short,
   short non-terminal packet and over-long packet are recorded in
-  `VCPStatus`.  With the link's `LocalizeError` bit clear the error is
-  reported and the VCP goes to *discarding* (accept and drop everything,
-  send nothing) until a VCPCommand reset - the closest equivalent of the
-  control system halting a reliable link.  A `vin` overrun stores
-  `LengthError.p` and is read back with `ldcnt`.
+  `VCPStatus`.  With the link's `LocalizeError` bit clear (a reliable
+  link, HRM 13.5.1) the error goes to the control system: the CPU stops,
+  the VCP goes to *discarding* (accept and drop everything, send nothing)
+  until reset, and a VCP error (#02) is reported on CLink0 - see "Control
+  system" below.  A node with no control link wired and StandAloneMode
+  clear has nothing to report to (HRM 8.1.2 rules that configuration out);
+  there T4 keeps the CPU running and only the VCP discards.  A `vin`
+  overrun stores `LengthError.p` and is read back with `ldcnt`.
 
-No IMS C104 is modelled: emulated links connect nodes directly, so a
-receiver sees exactly the sender's header (HRM 7.2.1: header deletion
-happens in the router).
+Between two directly connected nodes a receiver sees exactly the sender's
+header.  Longer headers - a routing header in front of the virtual-link
+header - need an IMS C104 in the path to delete the routing part; see
+"Routing switch" below.
 
 ### Instructions
 
@@ -97,16 +104,248 @@ happens in the router).
 `ldconf`/`stconf` implement MemStart, MinInvalidChannel, ExternalRCBase,
 HdrAreaBase, ChanWriteLock, InitialIptr/Wptr, Reason, EmiBadAddress,
 VCPStatus, VCPCommand, VCPLink0-3 Mode/MaxHeader/MinHeader/HdrOffset,
-DeviceID, DeviceRevision and Link0-3 Mode/Command/Status/WriteLock.  PMI,
-system services, cache and control-link registers are stored and read
-back.  Any other address signals IntegerError, as does a write blocked by
-ChanWriteLock or a link WriteLock.
+DeviceID, DeviceRevision, Link0-3 Mode/Command/Status/WriteLock, and
+(`t9000_ctl.c`) ModeStatus, ErrorCode, DSLinkPLL, SysServWriteLock and
+CLink0-1 Mode/Command/Status/WriteLock.  PMI and cache registers are
+stored and read back.  Any other address signals IntegerError, as does a
+write blocked by a write lock.  The control unit's CPeek/CPoke use the
+same bus and are not stopped by write locks; a lock stops every CPU write
+to its subsystem, its own included (HRM 15.3), so it is cleared by the
+control unit or by a reset to level 1 or 2.
 
 Physical links reset into **byte-stream mode** (so T800 code, the link boot
 protocol and the host link are unchanged); software selects virtual mode
 with `stconf` on `VCPLinkNMode`.  In byte-stream mode the link carries T4's
 existing OS-link messages, i.e. the T9000 behaves as if an IMS C100 joined
 it to a T8-series neighbour (HRM 11.5).
+
+## Routing switch: IMS C104 (HRM part 1 ch.7, part 3 ch.2)
+
+A threaded network (`-st -sn -N`) can contain IMS C104 packet routing
+switches, so virtual channels reach nodes that are not directly connected.
+Code: the router engine in `t4_fabric.c`, its description in the network
+map in `netcfg.c`.
+
+* **Node.** A router is a node of the map with its own id - any id that is
+  not a processor's, so at least N - and up to 32 links.  It runs as one
+  more thread on the fabric with an input mailbox per link, the same format
+  as a transputer's link inputs; an output writes into the input mailbox at
+  the far end of its link, which may be a processor or another router.
+* **Wormhole routing** (HRM 7.2, figure 7.3) is approximated a packet at a
+  time: the VCP sends each packet as one link message, and the switch
+  forwards whole packets.  A packet stays in its input until an output takes
+  it, which stalls that input - and through it the sender - as a blocked
+  worm does.  Packets of any length pass; anything after the header bytes
+  is just packet body (HRM 7.2.1).
+* **Interval routing** (HRM 7.3.1, figure 7.9).  The first one or two bytes
+  of a packet are its header, according to the input link's header length.
+  Each input link has an interval selector: `lo <= header < hi` leaves on a
+  given output link.  Intervals must not overlap on a link.  Two-byte
+  headers are read first byte least significant, which is the HRM's general
+  rule for values sent as several components (HRM preface, "Significance":
+  the least significant component is transmitted first) and how the T4 VCP
+  sends them.
+* **Header deletion** (HRM 7.2.1, figures 7.4-7.6) is a property of an
+  output link: it drops the header bytes the switch routed on, so the next
+  bytes become the header seen by the device beyond.  With a 1-byte network
+  header in front of the virtual-link header, every T9000 can number its
+  virtual links from 0 (figure 7.5b); without deletion the network uses one
+  global label per virtual channel and each receiver subtracts its
+  `VCPLinkNHdrOffset` (figure 7.5a).  Deleting at every level gives the
+  hierarchical routing of figure 7.6.
+* **Grouped adaptive routing.**  An interval may name a group of
+  consecutive links, `a-b`: the packet leaves on the first of them that is
+  free.  The HRM only lists the feature ("Grouped adaptive routing"); this is
+  T4's reading of it, meant for parallel cables between switches.
+* **Arbitration.**  Each output serves the inputs waiting for it round
+  robin, starting after the input it served last, so a waiting packet gets
+  its output within one packet from each other contender.  Different
+  input/output pairs move concurrently, as in the 32x32 crossbar.
+* **Errors.**  The HRM leaves these to the C104's control system, which is
+  not modelled.  A header that falls in no interval, or a packet that ends
+  inside its header, is discarded with a `-W-EMU104` message (once per input
+  link; every time with `T4_ROUTER_DEBUG=1`).  An interval leading to an
+  unconnected link blocks its input, as an unanswered worm would.
+* **Configuration.**  On the chip the interval tables, header lengths and
+  deletion flags are programmed over the control link.  T4 takes a static
+  description from the network map instead; a router programmed over
+  CLink0 is not modelled yet.  The other features of the product preview -
+  universal routing and the congestion-reduction circuitry - are not
+  modelled either.  The per-link tables do let one C104 serve two
+  independently labelled networks, as the test below does.
+
+Network-map syntax (numbers decimal, `#hex` or `0xhex`; `<links>` a
+comma-separated list of `n` and `a-b`; without `on` a statement applies to
+every input link):
+
+```
+router <id> [links <n>]                          a C104 with n links (32)
+router <id> header 1|2 [on <links>]              input header length (1)
+router <id> interval <lo> <hi> <out>|<a-b> [on <links>]
+router <id> delete <links>                       header deletion on outputs
+Connect processor <p> link <l> to router <id> link <m>
+Connect router <id> link <m> to router <id2> link <n>
+```
+
+Use `Connect` for router links: it defines both directions, and a processor
+finds its links from its own side.  A map with routers is refused without
+`-st`, as are overlapping intervals, links a router does not have, and a
+router id that a processor uses.  A node still waiting to boot from a link
+takes the first message on *any* link as boot data, so route nothing to a
+node until it has booted (the test has node 1 report back on its boot link
+first).  Example: two T9000s on one C104, one
+1-byte network header deleted on the way out, so node 0 is reached as
+header 0 and node 1 as header 1:
+
+```
+Connect HOST to processor 0 link 0
+Connect processor 0 link 3 to processor 1 link 3   -- boot
+router 2 links 2
+Connect processor 0 link 1 to router 2 link 0
+Connect processor 1 link 1 to router 2 link 1
+router 2 interval 0 1 0
+router 2 interval 1 2 1
+router 2 delete 0-1
+```
+
+`T4_ROUTER_DEBUG=1` traces every routing decision on stderr.
+
+## Control system: CLink0 and CLink1 (HRM part 2 ch.8)
+
+Each node has the two control links, a packet handler, a control unit and
+the system services registers.  Code: `t9000_ctl.c`.
+
+* **Wiring.**  The control links are links 4 (CLink0) and 5 (CLink1) of the
+  network map, written `clink`:
+  `Connect processor 0 link 2 to processor 1 clink 0`.  They work on the
+  threaded fabric (`-st`), shared-memory links and ipc sockets; in a
+  node's 8 mailbox slots CLink0-1 In take 0-1 (data links use 4-7).
+* **The controlling side is ordinary T9000 code.**  HRM 8.1: "a control
+  link network is generally connected to one of the data links of a
+  controlling IMS T9000", so the controller drives a virtual link on a data
+  link in virtual mode with 2-byte headers: the virtual link's header is
+  the device's label, and the return header it gives the device maps back
+  to that virtual link.  The VCP does the packet work.
+* **Packets** are the VCP's, always with 2-byte headers: a command is one
+  packet `label | code | operands | EOM`, every message packet is
+  acknowledged with an empty EOP packet, and a device sends nothing more
+  until its last message is acknowledged (HRM 8.1.1).
+* **Packet handler** (HRM 8.3.1-8.3.2).  The first header seen on CLink0
+  after power-on becomes the device's label (Reset 1 keeps it).  Packets
+  with another header go down CLink1, once software has started it with a
+  CPoke of CLink1Command (StartLink), or are destroyed with a #C1 error.
+  Packets arriving on CLink1 go up CLink0, alternating fairly with the
+  device's own.  Start programs the return header put on every outgoing
+  packet; a later Start re-programs it, the acknowledge going under the old
+  header and the handshake under the new.  CLink0 starts on its first
+  token.  Only Reset, RecoverError and ErrorHandshake may overtake an
+  unacknowledged handshake; any other command is discarded with #C1.
+
+### Commands
+
+The command figures of HRM 8.4 (figures 8.6/8.7) are illegible in the text
+T4 is built from.  Three codes survive (IdentifyResult #80, CPeekHandshake
+#82, PeekHandshake #F4) and the HRM states that a response is its command
+with the top bit inverted; the others are T4's.
+
+| Command | Code | Operands (lsb first) | Valid in (HRM table 8.7) |
+|---|---|---|---|
+| Identify | #00 | - | every state |
+| CPeek | #02 | address (2) | Ready, Booting |
+| CPoke | #03 | address (2), data (4) | Ready, Booting |
+| Start | #10 | return header (2) | every state; must come first |
+| Reset | #11 | level (1): 1, 2 or 3 | every state |
+| Stop | #12 | - | Running, Stopping |
+| RecoverError | #13 | - | every state |
+| ErrorHandshake | #60 | - | answers an Error message; no handshake |
+| Peek | #74 | address (4) | Ready, Booting |
+| Poke | #75 | address (4), data (4) | Ready, Booting |
+| Boot | #76 | length (4), address (4) | Ready |
+| BootData | #77 | 16 bytes | Booting |
+| Run | #78 | Wptr (4), Iptr (4) | Ready |
+| Reboot | #79 | - | Ready, Booting |
+| Error message (device to controller) | #E0 | error code (1) | |
+
+Every handshake is `code ^ #80, status` - status 0 valid, 1 invalid or
+failed - followed by 4 data bytes for Identify, CPeek and Peek (zero on
+failure).  A command that is not valid in the current state is handshaken
+with status 1, as are an unaligned Peek, Poke, Boot or Run address, an
+invalid configuration address, a write-only register read by CPeek and a
+Reset level other than 1-3.
+
+* **Gross state** (HRM 8.4.1): Initial (no Start yet), Ready, Booting,
+  Running, Stopping, Error.  A CPU booted down a data link, from a file or
+  from ROM is Running without a Start, the "doubling" HRM 8.4.1 notes.
+* **Boot, BootData** load 16 bytes at a time into consecutive blocks of
+  four words; the excess of the last block is discarded and the last one
+  returns to Ready.  **Run** and **Reboot** (Wptr and Iptr from #7FFFFFFC
+  and #7FFFFFF8) start a high-priority process, as a boot from ROM does
+  (HRM 10.5.2), after writing the state the CPU stopped in at Wptr+0..6:
+  Wdesc, Iptr, Status (ISM table 5.5 layout), ThReg, Reason, error type,
+  Eptr (HRM 8.5.4; T4 records the last two only for traps, so they are 0).
+* **Reset** (HRM 8.7, table 8.10).  Every level stops and clears the CPU
+  (queues empty, Wdesc NotProcess.p) and the handshake state.  Level 2 also
+  clears the error records and the CPU write locks, resets the VCP's channel
+  state and the link engines but keeps their configuration, and resets the
+  byte-stream link channels; level 1 also returns the VCP and link
+  configuration to its power-on values and clears ErrorSinceReset.  The
+  label, the return header and memory survive every level.  The handshake
+  goes once the reset is done.
+* **Stop** (HRM 8.5.4) puts the VCP in 'stopping' and stops the CPU when
+  its current process next deschedules or reaches a timeslice point.
+* **RecoverError** (HRM 8.5.3) clears the handshake and acknowledge state,
+  so that an Error message that was sent but not handshaken goes again
+  after the RecoverError handshake.
+
+### Errors (HRM 8.5)
+
+One record per error code (HRM table 8.9), sent highest priority first:
+#C0 invalid command code, #C1 control link protocol error (wrong length,
+EOP-terminated command, unexpected acknowledge, a command overtaking a
+handshake, a packet for another device with CLink1 not started, anything
+before Start), #C2 CLink1, #80-#83 Link0-3, #01 CPU, #02 VCP, #03 PMI.
+An Error message `#E0, code` goes when every earlier message has been
+acknowledged and every earlier Error message handshaken; ErrorHandshake
+removes the record.  ErrorCode (#1004) holds the latest error.
+
+| Error | CPU | ErrorSinceReset | Reported on CLink0 |
+|---|---|---|---|
+| control link (#Cx) | runs on | no | yes |
+| system (#01-#03, #8x) | stopped, VCP discarding | set | yes |
+| system, StandAloneMode set | reset, rebooted from ROM | set (kept) | no |
+
+The system errors T4 raises are the VCP's (#02, reliable links only) and
+the CPU's (#01): T4's halt-on-error stands for the T9000 halting on an
+error with a null trap-handler (ISM 10.3.3).  T4 links do not fail, so
+#80-#83 and #C2 never occur (`WrongParity` is accepted and ignored), and
+the PMI raises nothing.  With no control link wired and StandAloneMode
+clear a system error is recorded in ErrorCode/ModeStatus but the CPU runs
+on, as described under "Errors" above.
+
+### The CPU under control
+
+The control unit stops a running CPU through `start_process()`, which
+then returns from `mainloop()`; anything that needs the CPU stopped (a
+reset, a reboot) is finished there.  While the CPU is stopped - before a
+control-link boot, or after an error, Stop or Reset - the node keeps
+serving its control links and its virtual links (HRM 8.5.4: Stop leaves
+the links alone; a discarding VCP accepts and drops packets, 11.8.2), and
+Run or Reboot enters `mainloop()` again.  The restarted process starts
+outside any P-process with the PMI as it was (HRM table 8.10).  The
+control unit's own memory accesses (Peek, Poke, Boot, the state block)
+are physical, never translated through a P-process's regions.
+
+**Booting.**  A node waiting to boot serves its control links and its
+byte-stream data links together: the T800 link boot (`handleboot()`) is
+unchanged, and control traffic does not count against the boot timeout.
+A data link put into virtual mode by a CPoke during that wait belongs to
+the VCP and is no longer a boot link.  The usual control-link boot (HRM
+8.6.1) is: Start, CPoke the VCP and link configuration, Boot + BootData,
+Run.
+
+`T4_CTL_DEBUG=1` traces the control unit on stderr.  Not modelled: link
+speeds (CLinkNMode and DSLinkPLL are stored), the cache, and a C104
+controlled over its CLink0.
 
 ## Event channels (ISM 12.2.3, HRM ch.12)
 
@@ -154,8 +393,32 @@ emulator with a message.
 * `tests/test_t9000_vcp_net.c` - two threaded nodes (`-st -sn -2`): node 0
   boots node 1 down byte-stream Link1, both switch Link1 to virtual mode,
   and node 1 echoes messages over virtual link 0.
+* `tests/test_t9000_c104_net.c` - two threaded T9000s and two C104s.
+  Node 0 boots node 1 down a direct byte-stream Link3; the Link1s meet
+  through both switches, which are joined by a group of two cables, using
+  `[node][virtual link]` headers whose first byte is deleted on the way out
+  (figure 7.5b); the Link2s meet through router 2 using global 2-byte labels
+  - node 0 `#000-#0FF`, node 1 `#100-#1FF`, `VCPLink2HdrOffset = #100` -
+  with no deletion (figure 7.5a), read on two links of router 2 that have
+  their own interval table.  Node 1 echoes on three virtual links; node 0
+  uses them one at a time, then all at once from three processes so that
+  packets of two channels meet in the switches.  The map is in
+  `tests/run_t9000_vcp.sh`.
+* `tests/test_t9000_ctl_net.c` - two threaded nodes, node 0's Link2 cabled
+  to node 1's CLink0.  Node 1 is never booted down a data link: node 0
+  labels and identifies it, configures its VCP with CPoke, loads a program
+  with Boot + BootData and starts it with Run; sends it a packet its VCP
+  rejects on a reliable link and receives the VCP error, resets it to
+  level 3 and reads the evidence with CPeek/Peek; resets it to level 2 and
+  reboots it into a program that halts on error (CPU error); stops a
+  running program; and checks the state table, invalid operands and the
+  #C0/#C1 errors, RecoverError re-sending an unhandshaken error message.
+* `tests/test_t9000_ctl_chain.c` - three nodes on a daisy-chained control
+  network (node 0 Link2 - node 1 CLink0, node 1 CLink1 - node 2 CLink0):
+  node 2 is labelled, identified, booted, started and reset through node 1,
+  and its Error message comes back the same way.
 
-Run both with `make -f Makefile.linux test-vcp` or `tests/run_t9000_vcp.sh`
+Run them with `make -f Makefile.linux test-vcp` or `tests/run_t9000_vcp.sh`
 (`T4_BIN` picks the emulator).  They build with `transputer-tcc` and
 `transputer-netload` from the top of the tinycc_transputer tree, and use
 `tests/test_boot.S` (a copy of the compiler tree's test boot stub) and

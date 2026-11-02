@@ -55,7 +55,7 @@ LFLAGS	= -pthread $(HOME)/lib/libnanomsg.a -lm
 FDMSRC  = k_standard.c s_scalbn.c s_scalbnf.c s_ldexp.c s_ldexpf.c \
 	  e_fmod.c e_remainder.c e_sqrt.c w_remainder.c w_sqrt.c
 
-SRC	= $(FDMSRC) curterm.c arithmetic.c fparithmetic.c netcfg.c shlink.c server.c timer_integration.c cpu_state.c t4_fabric.c t9000_vcp.c p.c main.c
+SRC	= $(FDMSRC) curterm.c arithmetic.c fparithmetic.c netcfg.c shlink.c server.c timer_integration.c cpu_state.c t4_fabric.c t9000_vcp.c t9000_ctl.c p.c main.c
 OBJ	= $(SRC:.c=.o)
 
 t4 : $(SRC)

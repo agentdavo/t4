@@ -63,7 +63,7 @@
 #define T9K_CR_VCPLINK0MODE     0x0805u   /* +4n: Mode, MaxHeader, MinHeader, HdrOffset */
 #define T9K_CR_HDRAREABASE      0x0901u
 #define T9K_CR_DEVICEID         0x1001u
-#define T9K_CR_DEVICEREVISION   0x1002u
+#define T9K_CR_DEVICEREVISION   0x1002u   /* #1003-#1006: t9000_ctl.h */
 #define T9K_CR_MEMSTART         0x410Eu
 #define T9K_CR_EXTERNALRCBASE   0x4110u
 #define T9K_CR_CHANWRITELOCK    0x4900u
@@ -123,9 +123,23 @@ int  t9k_link_listening(int link);
 int  t9k_link_tx_pending(int link);
 void t9k_link_rx(int link);
 void t9k_link_tx(int link);
+void t9k_vcp_serve_links(void);         /* CPU stopped (t9000_ctl.c) */
 
 /* Event pins (HRM: EventIn0-3 / EventOut0-3). */
 void t9k_event_in_pin(int n, int level);
 int  t9k_event_out_pin(int n);
+
+/* The configuration bus (HRM 15.1) for either master: the CPU (ldconf,
+ * stconf; by_cpu = 1) or the control unit (CPeek, CPoke), whose writes no
+ * write lock stops (HRM 15.3).  0 = invalid address or refused. */
+int  t9k_cfg_read(uint32_t a, uint32_t *val);
+int  t9k_cfg_write(uint32_t a, uint32_t val, int by_cpu);
+
+/* Signals from the control unit to the VCP (HRM 11.8.2, table 8.10). */
+#define T9K_VCPSIG_STOP         1       /* Stop command */
+#define T9K_VCPSIG_ERROR        2       /* system error: discard until reset */
+#define T9K_VCPSIG_RESET2       3       /* reset 2: channels cleared, configuration kept */
+#define T9K_VCPSIG_RESET1       4       /* reset 1: back to the power-on configuration */
+void t9k_vcp_signal(int sig);
 
 #endif /* T9000_VCP_H */

@@ -47,8 +47,8 @@ FDMSRC  = k_standard.c s_scalbn.c s_scalbnf.c s_ldexp.c s_ldexpf.c \
 FDMOBJ	= k_standard.o s_scalbn.o s_scalbnf.o s_ldexp.o s_ldexpf.o \
 	  e_fmod.o e_remainder.o e_sqrt.o w_remainder.o w_sqrt.o
 
-SRC	= $(FDMSRC) curterm.c arithmetic.c fparithmetic.c netcfg.c shlink.c server.c display_backend_sdl.c timer_integration.c mmio.c debug_config.c t9000_protect.c t9000_pmi.c cpu_state.c t4_fabric.c t9000_vcp.c p.c main.c
-OBJ	= $(FDMOBJ) curterm.o arithmetic.o fparithmetic.o netcfg.o shlink.o server.o display_backend_sdl.o timer_integration.o t9000_protect.o t9000_pmi.o cpu_state.o t4_fabric.o t9000_vcp.o p.o main.o
+SRC	= $(FDMSRC) curterm.c arithmetic.c fparithmetic.c netcfg.c shlink.c server.c display_backend_sdl.c timer_integration.c mmio.c debug_config.c t9000_protect.c t9000_pmi.c cpu_state.c t4_fabric.c t9000_vcp.c t9000_ctl.c p.c main.c
+OBJ	= $(FDMOBJ) curterm.o arithmetic.o fparithmetic.o netcfg.o shlink.o server.o display_backend_sdl.o timer_integration.o t9000_protect.o t9000_pmi.o cpu_state.o t4_fabric.o t9000_vcp.o t9000_ctl.o p.o main.o
 
 # Headers that the single-shot build must also depend on, otherwise editing
 # them silently leaves a stale t4 binary behind.

@@ -1,5 +1,6 @@
 #include "cpu_state.h"
 #include "t9000_vcp.h"
+#include "t9000_ctl.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -57,6 +58,7 @@ void cpu_destroy(cpu_t *c)
         free(c->s_mem);
         free(c->s_CLineTags);
         t9k_vcp_destroy(c);
+        t9k_ctl_destroy(c);
         free(c->s_loopback);
         if (c != &t4_cpu0)
                 free(c);

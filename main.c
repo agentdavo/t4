@@ -54,6 +54,7 @@ typedef intptr_t pid_t;
 #include "cpu_state.h"
 #include "t4_fabric.h"
 #include "t9000_group.h"
+#include "t9000_ctl.h"
 #include "netcfg.h"
 #include "display_backend.h"
 
@@ -110,13 +111,17 @@ static void *t4_node_thread(void *arg)
         init_processor();
         tries = 1;
         while (tries++ < 60 && 0 == linkcomms("boot", TRUE, LTO_BOOT))
-                ;
+                if (t9k_ctl_busy())     /* configuring over CLink0 */
+                        tries = 1;
         if (tries > 60) {
                 printf("-E-EMU414: Node%d failed to get bootstrap code!\n", c->cpu_nodeid);
                 t4_net_request_stop();
                 return NULL;
         }
-        mainloop();
+        /* a T9000 control system restarts a stopped CPU (Run, Reboot) */
+        do
+                mainloop();
+        while (t9k_ctl_after_halt());
         return NULL;
 }
 
@@ -129,6 +134,9 @@ static void t4_spawn_thread_nodes(int n)
                 printf("-E-EMU414: Failed to create in-process link fabric\n");
                 handler(-1);
         }
+        /* before any node opens a link that may end at one */
+        if (t4_fabric_start_routers(t4_fabric) < 0)
+                exit(-1);
         t4_idle_init(&t4_cpu0);
         t4_fabric_set_cpu(t4_fabric, 0, &t4_cpu0);
         pthread_attr_init(&attr);
@@ -155,6 +163,7 @@ static void t4_join_thread_nodes(void)
 {
         int i;
         t4_net_request_stop();
+        t4_fabric_stop_routers(t4_fabric);
         for (i = 1; i <= t4_nworkers; i++) {
                 if (t4_wth[i])
                         pthread_join(t4_wth[i], NULL);
@@ -880,7 +889,8 @@ int main (int argc, char **argv)
                         printf ("-I-EMU414: Reading network configuration from %s...\n", NetConfigName);
                 if (readNetConfig (NetIn) < 0)
                 {
-                        handler (-1);
+                        /* handler() only flags a signal now; stop here */
+                        exit (-1);
                 }
                 if (verbose)
                         printf ("-I-EMU414: Done.\n");
@@ -901,6 +911,10 @@ int main (int argc, char **argv)
                                 handler (-1);
                         }
 #endif
+                        if (!want_threads && netRouterCount ()) {
+                                printf ("-E-EMU414: Router nodes need threaded nodes (-st)\n");
+                                exit (-1);
+                        }
                         sprintf (SpyNet, "SPYNET=%s", NetConfigName);
                         putenv (SpyNet);
                         if (want_threads)
@@ -936,6 +950,13 @@ int main (int argc, char **argv)
                                 sleep (1);
                         }
                 }
+                else if (netRouterCount ())
+                {
+                        /* a node started on its own (-sn without a count)
+                         * would never see the routers of its map */
+                        printf ("-E-EMU414: Router nodes need threaded nodes (-st -sn -N)\n");
+                        exit (-1);
+                }
         }
 
         /* Initialize processor. */
@@ -966,6 +987,8 @@ int main (int argc, char **argv)
                 {
                         if (verbose)
                                 printf ("-I-EMU414: Node%d waiting for bootstrap code... (%d)\n", nodeid < 0 ? 0 : nodeid, temp);
+                        if (t9k_ctl_busy ())    /* configuring over CLink0 */
+                                temp = 1;
                 } while ((temp++ < 60) && (0 == linkcomms ("boot", TRUE, LTO_BOOT)));
                 if (temp > 60)
                 {
@@ -1064,9 +1087,12 @@ int main (int argc, char **argv)
 
 	        }
 
-	while ((WPtr & 0x00000003) != 0x00000000)
-		WPtr++;
-        UpdateWdescReg (WPtr | LoPriority);
+        if (!t9k_ctl_started_cpu ())    /* Run/Reboot set Wdesc and Iptr */
+        {
+	        while ((WPtr & 0x00000003) != 0x00000000)
+		        WPtr++;
+                UpdateWdescReg (WPtr | LoPriority);
+        }
         fprintf(stderr, "-I-EMUBOOT: Entering mainloop WPtr=0x%08X copy=%d\n",
                 WPtr, copy ? 1 : 0);
 
@@ -1133,8 +1159,11 @@ int main (int argc, char **argv)
 	{
 #endif
 
-	/* Now start the emulator. */
-	mainloop ();
+	/* Now start the emulator; a T9000 control system may restart a
+	 * stopped CPU (Run, Reboot). */
+	do
+	        mainloop ();
+	while (t9k_ctl_after_halt ());
         if (want_threads)
                 t4_join_thread_nodes();
 
