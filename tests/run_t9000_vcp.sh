@@ -14,6 +14,8 @@
 #                       receives its error reports
 #   test_t9000_ctl_chain three threaded nodes on a daisy-chained control
 #                       network: node 2 is controlled through node 1
+#   test_t9000_pstack   one node: P-process stack extension on demand and
+#                       device-access-only regions (ISM 9.3, 9.5)
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).
@@ -141,5 +143,8 @@ printf '%s\n' 'Connect HOST to processor 0 link 0' \
 run_test test_t9000_ctl_chain \
     "$TESTS/test_t9000_ctl_chain.c $TESTS/test_t9000_vcp_fn.S" \
     6s SPYNET="$tmp/chain.map" -- -st -sn -3
+
+# The supervisor restarts trapped call/ajw/gajw itself; the node halts.
+run_test test_t9000_pstack "$TESTS/test_t9000_pstack.c" 20s
 
 exit $(( failures > 0 ))

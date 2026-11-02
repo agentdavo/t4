@@ -155,6 +155,9 @@ static int translate_one(uint32_t la, int access, uint32_t *pa_out)
 	if ((access & T9K_ACC_EXEC) && !(d & T9K_DESC_X))
 		return T9K_TRAP_ACCESS;
 	/* reads always ok if region valid (no separate R bit in descriptor) */
+	/* device-access-only (ISM 9.5 bit 3): only device instructions */
+	if ((d & T9K_DESC_DEV) && !(access & T9K_ACC_DEV))
+		return T9K_TRAP_ACCESS;
 
 	offset = la & mask;
 	/* Spec: phys = relocation(bits n..31) | base(bits 0..n-1 of LA). */
@@ -238,7 +241,7 @@ uint32_t t9k_translate(uint32_t la, int access)
 			return pa;
 		return la;
 	}
-	c = translate_one(la, access, &pa);
+	c = translate_one(la, access | t9k_prot.dev_access, &pa);
 	if (c) {
 		if (t9k_prot.debug)
 			fprintf(stderr,
@@ -349,6 +352,29 @@ void t9k_check_priv_op(uint32_t oreg)
 }
 
 /*
+ * ISM 9.3 and 13.2.2 ("Trapping due to non-floating-point errors -
+ * restartable"): in protected mode call, ajw and gajw check that the new
+ * Wptr is a writable location not reserved for a device.  If it is not,
+ * AccessViolation traps with the state as it was before the instruction,
+ * so a supervisor can extend the stack region, copy ps.Eptr into ps.sIptr
+ * and restart the instruction with goprot - stack extension on demand.
+ * ps.Eptr must therefore be the instruction's first byte: restarting at
+ * the opcode byte would lose its prefixes.
+ */
+void t9k_check_wptr(uint32_t new_wptr, uint32_t insn_start)
+{
+	uint32_t pa;
+
+	if (!t9k_in_p() || translate_one(new_wptr, T9K_ACC_WRITE, &pa) == 0)
+		return;
+	if (t9k_prot.debug)
+		fprintf(stderr, "[T9K-PROT] Wptr 0x%08X not writable, instruction at 0x%08X\n",
+			new_wptr, insn_start);
+	IPtr = insn_start;	/* ps.sIptr is undefined here; make it restartable */
+	t9k_p_trap(T9K_TRAP_ACCESS, insn_start);
+}
+
+/*
  * ISM §10.3 / §10.5: a P-process trap resumes the supervisor with Areg =
  * trap reason (Table 10.5) and Breg = error type (Table 10.10); Creg is
  * undefined.  Map the T4 cause codes onto that pair.
@@ -395,6 +421,7 @@ void t9k_p_trap(uint32_t cause, uint32_t fault_la)
 	t9k_prot.last_trap = cause;
 	t9k_prot.last_fault_la = fault_la;
 	t9k_prot.trap_count++;
+	t9k_prot.dev_access = 0;	/* a device instruction is abandoned */
 
 	/* Save P state into PDS (physical) */
 	if (pds) {

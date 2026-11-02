@@ -4312,6 +4312,7 @@ void mainloop (void)
                  * full path. Cached bytes are rechecked before execution, so
                  * self-modifying writes naturally fall back and rebuild. */
                 if (__builtin_expect(rare_hooks && fast_block_enabled && OReg == 0 &&
+                    !t9k_prot.is_p &&   /* no P-mode checks in here */
                     !bootdbg_enabled && !cache_debug_trace_enabled &&
                     !iptr_trace_enabled && !sym_trace_active &&
                     !text_write_trace_enabled && !sk_areg_trace_enabled &&
@@ -4409,6 +4410,7 @@ void mainloop (void)
                  * only one-byte primaries fast leaves nearly all C code on the
                  * diagnostic-heavy legacy path. */
                 if (__builtin_expect(rare_hooks && fast_primary_enabled && OReg == 0 &&
+                    !t9k_prot.is_p &&   /* no P-mode checks in here */
                     !bootdbg_enabled && !cache_debug_trace_enabled &&
                     !iptr_trace_enabled && !sym_trace_active &&
                     !text_write_trace_enabled && !sk_areg_trace_enabled &&
@@ -5348,6 +5350,9 @@ FastDispatch:
 			   IPtr++;
 			   break;
 		case 0x90: /* call  */
+			   /* ISM 9.3: restartable stack-extension trap */
+			   if (unlikely(t9k_prot.is_p))
+				   t9k_check_wptr(index(WPtr, -4), Icache[islot].ip);
 			   IPtr++;
 			   /* Log kernel function calls */
 			   if (rare_hooks && noisy_boot_trace_enabled() &&
@@ -5444,6 +5449,9 @@ FastDispatch:
 			        * No sign-extension needed here - bare 4-bit values 0-15 are positive. */
 			       int32_t delta = (int32_t)OReg;
 			       uint32_t new_wptr = index(WPtr, delta);
+			       /* ISM 9.3: restartable stack-extension trap */
+			       if (unlikely(t9k_prot.is_p))
+				       t9k_check_wptr(new_wptr, Icache[islot].ip);
 			       /* Cache debug tracing for AJW */
 			       if (rare_hooks && cache_debug_trace_enabled &&
 			           IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
@@ -6709,6 +6717,9 @@ DescheduleOutWord:
 		case 0x3c: /* gajw        */
                            /* XXX: proc prio toggle trick of AReg lsb=1       */
                            T4DEBUG(checkWordAligned ("GAJW", AReg));
+			   /* ISM 9.3: restartable stack-extension trap */
+			   if (unlikely(t9k_prot.is_p))
+				   t9k_check_wptr(AReg & ~3u, Icache[islot].ip);
 			   temp = AReg;
                            if (rare_hooks && wptr_trace_enabled) {
                                    printf("[WPtr] GAJW IPtr=0x%08X WPtr=0x%08X→0x%08X\n",
@@ -8118,39 +8129,53 @@ DescheduleOutWord:
                             * device accesses behave exactly like lb/ls/ldnl 0
                             * etc. (ISM table 7.23 says they use the same
                             * registers and, absent reordering, the same
-                            * behavior). */
+                            * behavior).  dev_access lets them into regions a
+                            * P-process may reach only by device instructions
+                            * (ISM 9.5 bit 3). */
+                           t9k_prot.dev_access = T9K_ACC_DEV;
                            AReg = byte (AReg) & 0xFF;
+                           t9k_prot.dev_access = 0;
 		           IPtr++;
 		           break;
 		case 0xf1: /* devsb - device store byte                 (T9000) */
 		           BADCODE(IsT414);
+                           t9k_prot.dev_access = T9K_ACC_DEV;
                            writebyte (AReg, BReg);
+                           t9k_prot.dev_access = 0;
                            AReg = CReg;
                            CReg = 0;
 		           IPtr++;
 		           break;
 		case 0xf2: /* devls - device load sixteen               (T9000) */
 		           BADCODE(IsT414);
+                           t9k_prot.dev_access = T9K_ACC_DEV;
                            AReg = (byte (AReg) & 0xFF)
                                 | ((byte (AReg + 1) & 0xFF) << 8);
+                           t9k_prot.dev_access = 0;
 		           IPtr++;
 		           break;
 		case 0xf3: /* devss - device store sixteen              (T9000) */
 		           BADCODE(IsT414);
+                           t9k_prot.dev_access = T9K_ACC_DEV;
                            writebyte (AReg,     BReg        & 0xFF);
                            writebyte (AReg + 1, (BReg >> 8) & 0xFF);
+                           t9k_prot.dev_access = 0;
                            AReg = CReg;
                            CReg = 0;
 		           IPtr++;
 		           break;
 		case 0xf4: /* devlw - device load word                  (T9000) */
 		           BADCODE(IsT414);
+                           t9k_prot.dev_access = T9K_ACC_DEV;
                            AReg = word (AReg);
+                           t9k_prot.dev_access = 0;
 		           IPtr++;
 		           break;
 		case 0xf5: /* devsw - device store word                 (T9000) */
 		           BADCODE(IsT414);
+                           t9k_prot.dev_access = T9K_ACC_DEV;
                            writeword (AReg, BReg);
+                           t9k_prot.dev_access = 0;
                            AReg = CReg;
                            CReg = 0;
 		           IPtr++;
@@ -8555,6 +8580,9 @@ DescheduleOutWord:
 		           PROFILE(profile[PRO_INSTR]++);
                            break;
                 case 0x106: /* ajw ret */
+			   /* ajw comes first, so the pair starts at its first byte */
+			   if (unlikely(t9k_prot.is_p))
+				   t9k_check_wptr(index(WPtr, Arg0), Icache[islot].ip);
                            WPtr = index (WPtr, Arg0);
                            T4DEBUG(checkWPtr ("AJW", WPtr));
 			   {

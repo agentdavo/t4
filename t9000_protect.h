@@ -35,6 +35,7 @@
 #define T9K_ACC_READ     1
 #define T9K_ACC_WRITE    2
 #define T9K_ACC_EXEC     4
+#define T9K_ACC_DEV      8	/* by a device instruction (ISM 7.14) */
 
 /* Region descriptor helpers */
 #define T9K_NULL_REGION  0x80000000u
@@ -68,6 +69,8 @@ typedef struct t9k_protect_state {
 	uint32_t trap_count;
 	/* Bypass translation for internal PDS/RODS access */
 	int      phys_bypass;
+	/* T9K_ACC_DEV while a device instruction makes its accesses */
+	int      dev_access;
 	/* longjmp back to mainloop on P-trap */
 	int      jmp_valid;
 	jmp_buf  jmp_env;
@@ -86,6 +89,11 @@ int t9k_in_p(void);
  * L-mode or disabled: identity.
  */
 uint32_t t9k_translate(uint32_t la, int access);
+
+/* call, ajw, gajw in P-mode (ISM 9.3): trap, restartably, unless the new
+ * Wptr is writable and not device-only.  insn_start is the address of the
+ * instruction's first (prefix) byte. */
+void t9k_check_wptr(uint32_t new_wptr, uint32_t insn_start);
 
 /* Non-trapping probe (for tests): 0 ok, non-zero trap cause */
 int t9k_probe(uint32_t la, int access, uint32_t *pa_out);
