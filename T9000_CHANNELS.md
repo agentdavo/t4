@@ -377,6 +377,45 @@ IsPprocess) plus bit 28 for T4's HaltOnError.
 `swapgstatus` (OReg -9) is not an ISM instruction and still stops the
 emulator with a message.
 
+## Network timing and C programs on every node
+
+**Booting.**  In a threaded network each node other than 0 normally waits
+for boot code on a link.  `T4_NODE_BTL=n%d.btl` makes node N load its own
+netload image instead (`%d` becomes N), as node 0 does with `-sb`, so every
+node - with routers in between - can run a C program.  The C side is
+`include/t9000.h` in the compiler tree: builtins for the configuration
+space and the VCP (`__stconf`, `__initvlcb`, `__vin`, ...) and helpers that
+bring up virtual links.
+
+**Virtual links per node.**  Their channel words run from `#80000040` to
+MemStart, and T4 (and the compiler's linker) put MemStart at `#80000070`,
+so a node has at most **six** virtual links.  `initvlcb` on a seventh raises
+IntegerError, and channel words from `#80000070` up are the program's own
+code.
+
+**Cycle model.**  With `T4_T9000=1` and `T4_T9K_NET=1|2` (see
+`t9000_group.h`), every link message carries its sender's ready cycle, in a
+slot after the mailbox data in a threaded network.  The model is per node:
+`t9k` is thread-local, as are the TVX and move2d latches and TVX scratch
+buffers, and `T4_T9K_MARKS` lines carry the node (`[T9000-MARK] n3 tag`).
+The VCP keeps per-virtual-link times: a data packet leaves when the previous
+one was acknowledged, an acknowledge when its data arrived, and the CPU
+waits only when the VCP wakes a process.  A C104 adds `T4_T9K_LINKLAT` per
+hop and `T4_T9K_C104LAT` (20 cycles) to route, and serialises each output
+link; a packet's bytes are counted once along a path (wormhole).  Packets
+reach a link in host order, which through a switch is not cycle order: one
+stamped before a packet already queued is not held behind it, but keeps the
+link busy for its bytes.
+
+Measured (transputer/tests/net in the compiler tree): 24 KB over one cable,
+one virtual link 1.36x the raw link time at 9 MB/s and 3.43x at 90 MB/s,
+three links 1.06x and 1.16x; byte stream 1.00x.  Each virtual link waits for
+every 32-byte packet's acknowledge, so through a switch one link per cable
+gets about 54% of a 9 MB/s DS-link.  DeepSeek's shared-expert FFN on 8
+nodes and three C104s (`c104.sh`): 5.7 ms at 9 MB/s, 4.7 ms at 90 MB/s, both
+within 10% of a model that charges every packet its acknowledge round trip;
+the same FFN on an 8-node hypercube of byte-stream links takes 6.7 ms.
+
 ## Testing
 
 * `tests/test_t9000_vcp.c` - single node, with

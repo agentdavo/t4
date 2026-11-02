@@ -125,7 +125,11 @@ extern uint32_t CoreSize;
 #endif
 #endif
 
-#define SCH_SIZE        (MAX_DATA+SCH_DATA)
+/* After the data, at a fixed offset: the cycle stamp the T9000 network
+ * timing (T4_T9K_NET) carries with each message.  Written before the length
+ * word is set and read after it is seen, so ordered with the data. */
+#define SCH_STAMP       (SCH_DATA+MAX_DATA)
+#define SCH_SIZE        (MAX_DATA+SCH_DATA+8)
 
 #ifndef T4CLINEBITS
 #define T4CLINEBITS     (4)

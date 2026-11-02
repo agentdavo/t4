@@ -48,7 +48,14 @@ typedef struct t4_rport {
         int      first, last;   /* output link(s) of the waiting packet; -1: none */
         int      rr;            /* as an output: the input it serves first next */
         int      warned_drop, warned_stuck;
+        uint64_t free_at;       /* as an output: cycle the link is next free */
+        uint64_t last_start;    /* and the latest packet's start (T4_T9K_NET) */
 } t4_rport_t;
+
+/* T9000 network timing (p.c, t9000_group.h) */
+int      t9k_net_timed(void);
+uint64_t t9k_route_packet(uint64_t ready, uint32_t nbytes, uint64_t *out_free,
+                          uint64_t *last);
 
 typedef struct t4_router {
         const net_router_t *cfg;
@@ -392,6 +399,15 @@ static void router_forward(t4_router_t *r, int i, int o)
         if (r->cfg->del >> o & 1u)              /* header deletion, HRM 7.2.1 */
                 skip = (r->cfg->hdr2 >> i & 1u) ? 2 : 1;
         memcpy(out->outbox + SCH_DATA, in->inbox + SCH_DATA + skip, len - skip);
+        if (t9k_net_timed()) {
+                /* the packet's cycle stamp: when it is ready on the output */
+                uint64_t ready;
+
+                memcpy(&ready, in->inbox + SCH_STAMP, 8);
+                ready = t9k_route_packet(ready, len - skip, &out->free_at,
+                                         &out->last_start);
+                memcpy(out->outbox + SCH_STAMP, &ready, 8);
+        }
         mb_set(out->outbox, len - skip);
         t4_wake_node_id(out->peer);
         r->routed++;

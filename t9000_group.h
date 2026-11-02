@@ -211,6 +211,19 @@ typedef struct {
     uint64_t net_wait;        /* cycles spent waiting for link transfers   */
     uint64_t link_free[4];    /* cycle each outgoing link is next free     */
     uint64_t link_in_free[4]; /* NET=2: cycle each incoming link is free   */
+    /* Threaded networks (-st): t9k is per thread, so every node has its own
+     * clock; node is its id there and -1 otherwise.  The VCP times its own
+     * packets: with net_defer set, a received packet does not stall the CPU
+     * (its arrival cycle is left in net_arrival) and an outgoing one leaves
+     * no earlier than net_not_before instead of the CPU's present cycle. */
+    int      node;
+    int      net_defer;
+    uint64_t net_not_before;
+    uint64_t net_arrival;
+    int      c104_lat;        /* cycles a C104 adds to route a packet       */
+    uint64_t link_in_last[4]; /* ready cycle of the latest packet queued    */
+    uint64_t link_out_last[4];
+    int      net_ooo;         /* the send being made is out of host order   */
     /* Decoupled-execution timeline.  Only used when slow_pipelined is set;
      * the default path adds latency blindly, as before, so the documented
      * T9000 numbers are reproduced bit-for-bit. */
@@ -229,10 +242,14 @@ typedef struct {
     uint64_t hist[9];     /* histogram of group sizes 1..8             */
 } t9k_state;
 
-extern t9k_state t9k;
-extern uint32_t tvx_src_fmt;    /* VSETFMT position format (p.c) */
-extern uint32_t quant_fmt;      /* QSETFMT ggml type id (p.c)    */
-extern uint32_t m2dLength;      /* move2dinit row count (p.c)    */
+#ifndef T4_THREAD_LOCAL
+#define T4_THREAD_LOCAL __thread
+#endif
+extern T4_THREAD_LOCAL t9k_state t9k;
+extern t9k_state t9k_proto;     /* the configured model, for node threads */
+extern T4_THREAD_LOCAL uint32_t tvx_src_fmt;    /* VSETFMT position format (p.c) */
+extern T4_THREAD_LOCAL uint32_t quant_fmt;      /* QSETFMT ggml type id (p.c)    */
+extern T4_THREAD_LOCAL uint32_t m2dLength;      /* move2dinit row count (p.c)    */
 
 /* Apply the documented T9000 defaults, then any T4_T9K_* overrides. */
 static inline void t9k_init(void)
@@ -269,6 +286,7 @@ static inline void t9k_init(void)
         { "T4_T9K_LINKMBPS",   9,  offsetof(t9k_state, link_mbps)       },
         { "T4_T9K_MHZ",        50, offsetof(t9k_state, core_mhz)        },
         { "T4_T9K_LINKLAT",    20, offsetof(t9k_state, link_lat)        },
+        { "T4_T9K_C104LAT",    20, offsetof(t9k_state, c104_lat)        },
     };
     size_t k;
     for (k = 0; k < sizeof(tune)/sizeof(tune[0]); k++) {
@@ -341,6 +359,18 @@ static inline void t9k_init(void)
     if (t9k.n_units > T9K_MAX_UNITS) t9k.n_units = T9K_MAX_UNITS;
     if (t9k.n_acc < 1) t9k.n_acc = 1;
     if (t9k.n_acc > T9K_MAX_ACC) t9k.n_acc = T9K_MAX_ACC;
+    t9k.node = -1;
+    t9k_proto = t9k;
+}
+
+/* A node thread of a threaded network: its own copy of the configured
+ * model, so its clock counts its own instructions only. */
+static inline void t9k_thread_init(int node)
+{
+    if (!t9k_proto.enabled)
+        return;
+    t9k = t9k_proto;
+    t9k.node = node;
 }
 
 /* HRM Table 6.4, "Stages in which instructions operate".  Stage numbering is
@@ -1155,35 +1185,94 @@ static inline void t9k_advance_to(uint64_t t)
         t9k.net_wait += t - now;
 }
 
-/* The cycle a packet about to leave on `link` is ready: now, or when the
- * link finishes the packet before it.  The packet carries this. */
+/* The cycle a packet about to leave on `link` is ready: now - or, for the
+ * VCP, net_not_before - or when the link finishes the packet before it.
+ * The packet carries this. */
+/* The VCP's virtual links become ready to send in the order their packets
+ * and acknowledges arrived, which through a switch is host order, not cycle
+ * order.  A packet the VCP has ready before the latest one it sent went
+ * first on the wire: it does not queue behind it, but keeps the link busy
+ * for its bytes (net_ooo carries that to t9k_net_sent). */
 static inline uint64_t t9k_net_ready(int link)
 {
-    uint64_t now = t9k_cycles_so_far();
+    uint64_t now = t9k.net_defer ? t9k.net_not_before : t9k_cycles_so_far();
 
+    t9k.net_ooo = t9k.net_defer && now < t9k.link_out_last[link & 3];
+    if (t9k.net_ooo)
+        return now;
+    t9k.link_out_last[link & 3] = now;
     return now > t9k.link_free[link & 3] ? now : t9k.link_free[link & 3];
 }
 
 static inline void t9k_net_sent(int link, uint64_t ready, uint32_t nbytes)
 {
+    if (t9k.net_ooo) {
+        t9k.net_ooo = 0;
+        t9k.link_free[link & 3] += t9k_link_xfer(nbytes);
+        return;
+    }
     t9k.link_free[link & 3] = ready + t9k_link_xfer(nbytes);
-    if (t9k.net_on == 1)
+    if (t9k.net_on == 1 && !t9k.net_defer)
         t9k_advance_to(t9k.link_free[link & 3]);
 }
 
+/* A packet that left its sender at `ready` arrives once the link is free
+ * and its bytes and one hop have passed.  An `in` waits for that; the VCP
+ * (net_defer) only notes it in net_arrival - it is hardware beside the CPU,
+ * and wakes a process itself when a message is done. */
 static inline void t9k_net_received(int link, uint64_t ready, uint32_t nbytes)
 {
     uint64_t start;
 
-    if (t9k.net_on == 1) {
+    if (t9k.net_on == 1 && !t9k.net_defer) {
         uint64_t now = t9k_cycles_so_far();
         start = ready > now ? ready : now;
-    } else {
+    } else if (ready >= t9k.link_in_last[link & 3]) {
+        t9k.link_in_last[link & 3] = ready;
         start = ready > t9k.link_in_free[link & 3] ? ready
                                                    : t9k.link_in_free[link & 3];
         t9k.link_in_free[link & 3] = start + t9k_link_xfer(nbytes);
+    } else {
+        /* Stamped before a packet already queued here: through a switch,
+         * from another sender, it only reached us later in host time.  On
+         * the wire it went first, so it does not wait behind that packet;
+         * the link is busy for its bytes all the same. */
+        start = ready;
+        t9k.link_in_free[link & 3] += t9k_link_xfer(nbytes);
+    }
+    if (t9k.net_defer) {
+        t9k.net_arrival = start + t9k_link_xfer(nbytes) + (uint64_t)t9k.link_lat;
+        return;
     }
     t9k_advance_to(start + t9k_link_xfer(nbytes) + (uint64_t)t9k.link_lat);
+}
+
+/* An IMS C104 forwarding a packet that left its sender at `ready` (HRM 7.2,
+ * wormhole routing): the header reaches the switch a hop later, takes
+ * c104_lat to route, and the packet leaves once the output link is free.
+ * The bytes follow the header straight through, so a path costs its hops
+ * plus one transfer, not one transfer per hop.  Runs on a router thread,
+ * hence the configured model rather than a node's.  *last is when the
+ * latest packet queued on the output reached the switch: one that reached
+ * it earlier came late only in host time and is not queued behind it (see
+ * t9k_net_received).
+ * Returns the packet's new stamp: the cycle it is ready on the output. */
+static inline uint64_t t9k_c104_hop(uint64_t ready, uint32_t nbytes,
+                                    uint64_t *out_free, uint64_t *last)
+{
+    const t9k_state *c = &t9k_proto;
+    uint64_t mbps = c->link_mbps < 1 ? 1 : (uint64_t)c->link_mbps;
+    uint64_t t = ready + (uint64_t)c->link_lat + (uint64_t)c->c104_lat;
+    uint64_t x = ((uint64_t)nbytes * (uint64_t)c->core_mhz + mbps - 1) / mbps;
+
+    if (t >= *last) {
+        *last = t;
+        if (t < *out_free)
+            t = *out_free;
+        *out_free = t + x;
+    } else
+        *out_free += x;
+    return t;
 }
 
 /* One line of progress: what the machine has cost by the time the guest
@@ -1191,11 +1280,15 @@ static inline void t9k_net_received(int link, uint64_t ready, uint32_t nbytes)
  * only reporting a single total at exit. */
 static inline void t9k_mark(const char *tag)
 {
+    char who[16] = "";
+
     if (!t9k.enabled)
         return;
-    fprintf(stderr, "[T9000-MARK] %-24s instrs=%llu bytes=%llu groups=%llu "
+    if (t9k.node >= 0)          /* threaded network: whose line it is */
+        snprintf(who, sizeof who, "n%d ", t9k.node);
+    fprintf(stderr, "[T9000-MARK] %s%-24s instrs=%llu bytes=%llu groups=%llu "
                     "stall=%llu cycles=%llu (%.1f ms @50MHz)\n",
-            tag,
+            who, tag,
             (unsigned long long)t9k.instrs, (unsigned long long)t9k.bytes,
             (unsigned long long)t9k.groups, (unsigned long long)t9k.stall,
             (unsigned long long)t9k_cycles_so_far(),
@@ -1224,6 +1317,8 @@ static inline void t9k_report(void)
              + t9k.stall + t9k.stall_cycles + t9k.net_wait;
     if (!cycles)
         return;
+    if (t9k.node >= 0)
+        fprintf(stderr, "\n[T9000] node %d:", t9k.node);
     fprintf(stderr, "\n[T9000] instruction grouper model (estimate, no cache/branch effects)\n");
     fprintf(stderr, "[T9000]   instructions issued : %llu\n", (unsigned long long)t9k.instrs);
     /* pfix/nfix are folded into OReg by the fetch loop and never reach the

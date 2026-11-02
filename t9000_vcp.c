@@ -107,6 +107,11 @@ typedef struct t9k_vlink {
         /* link queues: vl.DataQueueLink / vl.AckQueueLink */
         int32_t  dq_next, aq_next;
         uint8_t  in_dq, in_aq, dq_pri, aq_pri;
+
+        /* T4_T9K_NET timing: the earliest cycle the next data packet and
+         * the owed acknowledge may leave; the cycle the buffered packet
+         * arrived */
+        uint64_t t_data, t_ack, t_buf;
 } t9k_vlink_t;
 
 typedef struct t9k_plink {
@@ -142,7 +147,29 @@ typedef struct t9k_vcp {
         int      debug;
         int      nmisc;
         uint32_t misc_addr[NMISC], misc_val[NMISC];
+        uint64_t t_rx;                  /* arrival cycle of the packet in hand */
 } t9k_vcp_t;
+
+/* T4_T9K_NET (p.c, t9000_group.h).  The VCP is hardware beside the CPU, so
+ * its packets carry cycles of their own: a packet leaves when its link and
+ * its virtual link allow, not when the CPU happens to look, and only a
+ * process the VCP wakes waits for the packet that completed its message. */
+int      t9k_net_timed (void);
+void     t9k_net_defer (int on, uint64_t not_before);
+uint64_t t9k_net_arrival (void);
+uint64_t t9k_net_now (void);
+void     t9k_net_wake_at (uint64_t t);
+
+static uint64_t vcp_now (void)
+{
+        return t9k_net_timed () ? t9k_net_now () : 0;
+}
+
+static void vcp_wake_at (uint64_t t)
+{
+        if (t9k_net_timed ())
+                t9k_net_wake_at (t);
+}
 
 #define VDBG(v, ...) \
         do { if ((v)->debug) { fprintf (stderr, "[VCP%d] ", nodeid); \
@@ -567,9 +594,10 @@ static void out_complete (t9k_vcp_t *v, uint32_t n)
         uint32_t w = l->out_wdesc;
 
         l->out_wdesc = NOTPROC;
-        if (l->out_active)
+        if (l->out_active) {
+                vcp_wake_at (v->t_rx);
                 t4_wake (w);
-        else
+        } else
                 l->out_sched = w;
 }
 
@@ -585,9 +613,10 @@ static void in_complete (t9k_vcp_t *v, uint32_t n)
         l->in_vlen = 0;
         VDBG (v, "vl%u input complete, %u bytes%s\n", n, l->in_count,
               l->in_overrun ? " (too long)" : "");
-        if (l->in_active)
+        if (l->in_active) {
+                vcp_wake_at (v->t_rx);
                 t4_wake (w);
-        else
+        } else
                 l->in_sched = w;
 }
 
@@ -607,6 +636,7 @@ static void in_deliver (t9k_vcp_t *v, uint32_t n, u_char *d, uint32_t len, int l
                 l->in_limit -= take;
         }
         l->in_count += len;
+        l->t_ack = v->t_rx;             /* acknowledged once it is in */
         owe_ack (v, n, DPRI(l->in_wdesc));
         if (last)
                 in_complete (v, n);
@@ -650,6 +680,7 @@ static void rx_ack (t9k_vcp_t *v, int link, uint32_t n)
                 return;
         }
         l->out_await_ack = 0;
+        l->t_data = v->t_rx;            /* the next packet may go now */
         if (l->stop_wdesc != NOTPROC) {
                 uint32_t s = l->stop_wdesc;
 
@@ -679,6 +710,7 @@ static void rx_data (t9k_vcp_t *v, int link, uint32_t n, u_char *d, uint32_t len
         if (v->state == VCP_STOPPING)
                 l->in_active = 0;
         if (l->in_stopping) {
+                l->t_ack = v->t_rx;
                 owe_ack (v, n, LoPriority);
                 return;
         }
@@ -697,6 +729,7 @@ static void rx_data (t9k_vcp_t *v, int link, uint32_t n, u_char *d, uint32_t len
                 writebytes_int (l->buf, d, len);
         l->buf_len = (uint8_t)len;
         l->buf_state = last ? 1 : 2;
+        l->t_buf = v->t_rx;
         VDBG (v, "vl%u: %u bytes buffered%s\n", n, len, last ? " (last)" : "");
         if (l->in_alt && l->in_wdesc != NOTPROC) {
                 if (l->in_active)
@@ -765,9 +798,12 @@ void t9k_link_rx (int link)
         if (!Link[link].In.schbuf && Link[link].In.sock < 0)
                 return;
         for (i = 0; i < 16; i++) {
+                t9k_net_defer (t9k_net_timed (), 0);
                 n = channel_recvP (&Link[link].In, pkt, 0);
+                t9k_net_defer (0, 0);
                 if (n < 0)
                         break;
+                v->t_rx = t9k_net_timed () ? t9k_net_arrival () : 0;
                 rx_packet (v, link, pkt, n);
         }
         /* acknowledges and follow-on data packets go out at once */
@@ -852,7 +888,13 @@ void t9k_link_tx (int link)
                         pkt[h + cnt] = last ? T9K_TOK_EOM : T9K_TOK_EOP;
                         len = h + (int)cnt + 1;
                 }
-                if (channel_sendP (&Link[link].Out, pkt, len, 0) < 0)
+                /* T4_T9K_NET: a packet leaves when its virtual link allows -
+                 * the acknowledge once its data arrived, the data once the
+                 * previous packet was acknowledged - and its link is free */
+                t9k_net_defer (t9k_net_timed (), is_ack ? l->t_ack : l->t_data);
+                len = channel_sendP (&Link[link].Out, pkt, len, 0);
+                t9k_net_defer (0, 0);
+                if (len < 0)
                         return;                 /* link busy: stays queued */
                 p->ack_turn[pri] = !is_ack;
                 if (is_ack) {
@@ -1039,6 +1081,7 @@ static void v_out (t9k_vcp_t *v, uint32_t n, uint32_t src, uint32_t len)
         l->out_left = len;
         l->out_prio = (uint8_t)ProcPriority;
         l->out_last = 0;
+        l->t_data = vcp_now ();         /* the first packet goes from here */
         deschedule ();
         VDBG (v, "vl%u out %u bytes from #%08X\n", n, len, src);
         out_queue_data (v, n);
@@ -1072,6 +1115,8 @@ static void v_in (t9k_vcp_t *v, uint32_t n, uint32_t dst, uint32_t max, int kind
                 }
                 l->buf_state = 0;
                 l->buf_len = 0;
+                /* taken now, or when it arrived if that is later */
+                v->t_rx = vcp_now () > l->t_buf ? vcp_now () : l->t_buf;
                 in_deliver (v, n, d, len, last);
         }
         vcp_kick (v, l->link);
@@ -1762,6 +1807,7 @@ static void op_stopch (t9k_vcp_t *v)
                 if (l->buf_state) {
                         /* acknowledge, and so quiesce, the buffered packet */
                         l->buf_state = l->buf_len = 0;
+                        l->t_ack = vcp_now ();
                         owe_ack (v, n, ProcPriority);
                         vcp_kick (v, l->link);
                 }

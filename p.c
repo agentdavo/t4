@@ -195,7 +195,36 @@ uint32_t MemSize     = 1 << 21;
  * base: once the display windows move below MemStart, RAM runs all the way
  * to the top of the address space and the fast path must not be derived
  * from fb_legacy_base (that would wrap and swallow the UART at 0x10000000). */
-t9k_state t9k;
+T4_THREAD_LOCAL t9k_state t9k;  /* per node thread in a threaded network */
+t9k_state t9k_proto;
+
+/* For the C104 router threads (t4_fabric.c), which time packets with the
+ * configured model rather than a node's own. */
+int t9k_net_timed (void)
+{
+        return t9k_proto.enabled && t9k_proto.net_on;
+}
+
+uint64_t t9k_route_packet (uint64_t ready, uint32_t nbytes, uint64_t *out_free,
+                           uint64_t *last)
+{
+        return t9k_c104_hop (ready, nbytes, out_free, last);
+}
+
+/* For the VCP (t9000_vcp.c), which times its own packets: with defer on, a
+ * packet it sends leaves no earlier than not_before, and one it receives
+ * does not stall the CPU but leaves its arrival cycle for t9k_net_arrival.
+ * A process the VCP wakes resumes no earlier than t9k_net_wake_at's cycle. */
+void t9k_net_defer (int on, uint64_t not_before)
+{
+        t9k.net_defer = on;
+        t9k.net_not_before = not_before;
+}
+
+uint64_t t9k_net_arrival (void) { return t9k.net_arrival; }
+uint64_t t9k_net_now (void)     { return t9k_cycles_so_far (); }
+void t9k_net_wake_at (uint64_t t) { t9k_advance_to (t); }
+
 uint32_t ram_fast_limit = FB_LEGACY_DEFAULT;
 uint32_t fb_base        = FB_BASE_DEFAULT;
 uint32_t fb_legacy_base = FB_LEGACY_DEFAULT;
@@ -1571,21 +1600,20 @@ uint32_t word_int (uint32_t);
 #define count2        (t4cpu->s_count2)
 #define count3        (t4cpu->s_count3)
 
-tvx_viewport tvx_vp = {1.0f, 1.0f, 0.0f, 0.0f, 1.0f};
-tvx_light tvx_lit = {{0.0f, 0.0f, 1.0f}, 0.0f, 1.0f};
-uint32_t vec_len;
-uint32_t quant_fmt;
-uint32_t elem_stride;
-uint32_t stride_mask;
-uint32_t tvx_src_fmt;
-uint32_t m2dSourceStride;
-uint32_t m2dDestStride;
-uint32_t m2dLength;
+/* Processor state the instructions latch: per node thread in a threaded
+ * network (-st), where every node runs TVX and move2d at once. */
+T4_THREAD_LOCAL tvx_viewport tvx_vp = {1.0f, 1.0f, 0.0f, 0.0f, 1.0f};
+T4_THREAD_LOCAL tvx_light tvx_lit = {{0.0f, 0.0f, 1.0f}, 0.0f, 1.0f};
+T4_THREAD_LOCAL uint32_t vec_len;
+T4_THREAD_LOCAL uint32_t quant_fmt;
+T4_THREAD_LOCAL uint32_t elem_stride;
+T4_THREAD_LOCAL uint32_t stride_mask;
+T4_THREAD_LOCAL uint32_t tvx_src_fmt;
 #define TVX_STEP(bit, dense) \
         (((stride_mask & (bit)) && elem_stride) ? elem_stride : (dense))
-uint32_t m2dSourceStride;       /* move2d source stride */
-uint32_t m2dDestStride;         /* move2d destination stride */
-uint32_t m2dLength;             /* move2d length (no. of rows) */
+T4_THREAD_LOCAL uint32_t m2dSourceStride;       /* move2d source stride */
+T4_THREAD_LOCAL uint32_t m2dDestStride;         /* move2d destination stride */
+T4_THREAD_LOCAL uint32_t m2dLength;             /* move2d length (no. of rows) */
 
 #define ProcessQEmpty           ((NotProcess_p == FPtrReg[0]) && (NotProcess_p == FPtrReg[1]))
 #define TimerQEmpty             ((NotProcess_p == TPtrLoc[0]) && (NotProcess_p == TPtrLoc[1]))
@@ -1733,9 +1761,9 @@ static int tvx_qfmt_decode_block (int fmt, const uint8_t *raw, float *out)
  * ignored, as VHAD32 ignores a partial group. */
 static void tvx_vqact (uint32_t dst, uint32_t src, int act)
 {
-        static float *x;
-        static uint8_t *y;
-        static size_t xcap, ycap;
+        static T4_THREAD_LOCAL float *x;     /* per node thread */
+        static T4_THREAD_LOCAL uint8_t *y;
+        static T4_THREAD_LOCAL size_t xcap, ycap;
         uint32_t qk = act == TVX_GGML_Q8_K ? QK_K : QK8_0;
         size_t bb = act == TVX_GGML_Q8_K ? sizeof (block_q8_K)
                                          : sizeof (block_q8_0);
@@ -1776,8 +1804,8 @@ static void tvx_vqact (uint32_t dst, uint32_t src, int act)
 static uint32_t tvx_qgemm_int (uint32_t dst, uint32_t aptr, uint32_t wptr,
                                uint32_t nblk)
 {
-        static uint8_t *wbuf, *abuf;
-        static size_t wcap, acap;
+        static T4_THREAD_LOCAL uint8_t *wbuf, *abuf;  /* per node thread */
+        static T4_THREAD_LOCAL size_t wcap, acap;
         int act = tvx_qint_act_type ((int)quant_fmt);
         size_t bsz = (size_t)tvx_gguf_block_bytes ((int)quant_fmt);
         size_t ab = act == TVX_GGML_Q8_K ? sizeof (block_q8_K)
@@ -2690,6 +2718,15 @@ int channel_recvP (Channel *chan, u_char *data, int doWait)
                 {
                         ret = SCHLength(chan);
                         memcpy (data, &chan->schbuf[SCH_DATA], ret);
+                        if (t9k.enabled && t9k.net_on)
+                        {
+                                /* the sender's ready cycle, beside the data
+                                 * and ordered with it by the length word */
+                                uint64_t ready;
+
+                                memcpy (&ready, &chan->schbuf[SCH_STAMP], 8);
+                                t9k_net_received (chan->linkno, ready, (uint32_t)ret);
+                        }
                         SCHSetLength(chan, 0);
                         t4_wake_node_id(chan->peer);
                 }
@@ -2794,6 +2831,13 @@ int channel_sendP (Channel *chan, u_char *data, int ndata, int doWait)
                         }
 #endif
                         memcpy (&chan->schbuf[SCH_DATA], data, ndata);
+                        if (t9k.enabled && t9k.net_on)
+                        {
+                                uint64_t ready = t9k_net_ready (chan->linkno);
+
+                                memcpy (&chan->schbuf[SCH_STAMP], &ready, 8);
+                                t9k_net_sent (chan->linkno, ready, (uint32_t)ndata);
+                        }
                         SCHSetLength(chan, ndata);
                         ret = ndata;
                         t4_wake_node_id(chan->peer);
@@ -9069,8 +9113,8 @@ DescheduleOutWord:
                 case 0x1db: /* iq2xxsdot                                    */
                 case 0x1dc: /* iq3xxsdot                                    */
                            {
-                                static uint8_t raw[128];
-                                static float dec[256];
+                                static T4_THREAD_LOCAL uint8_t raw[128];
+                                static T4_THREAD_LOCAL float dec[256];
                                 float acc;
                                 uint32_t nblk = CReg, b;
                                 uint32_t bsz = (OReg == 0x1da) ? TVX_IQ1M_BYTES
@@ -9114,8 +9158,8 @@ DescheduleOutWord:
                            break;
                 case 0x1de: /* qdot        A=blocks, B=f32 acts, C=nblocks  */
                            {
-                                static uint8_t raw[256];
-                                static float dec[256];
+                                static T4_THREAD_LOCAL uint8_t raw[256];
+                                static T4_THREAD_LOCAL float dec[256];
                                 float acc;
                                 uint32_t nblk = CReg, b;
                                 int bsz = tvx_qfmt_block_bytes ((int)quant_fmt);
@@ -9368,8 +9412,8 @@ DescheduleOutWord:
                            break;
                 case 0x1ef: /* qgemm    A=dst f32[], B=param, C=blocks/row */
                            {
-                                static uint8_t raw[256];
-                                static float dec[256];
+                                static T4_THREAD_LOCAL uint8_t raw[256];
+                                static T4_THREAD_LOCAL float dec[256];
                                 uint32_t aptr = word (BReg);
                                 uint32_t wptr = word (BReg + 4);
                                 uint32_t nblk = CReg, r_, b;
@@ -11143,8 +11187,9 @@ static void uart_direct_track(u_char ch)
 	 * The line is what the guest printed, so filtering to SPLASH_DONE /
 	 * LOGIN / DESKTOP_READY is a grep on the output rather than a rebuild. */
 	{
-		static char mark_buf[160];
-		static size_t mark_len = 0;
+		/* per thread: threaded nodes print lines of their own */
+		static T4_THREAD_LOCAL char mark_buf[160];
+		static T4_THREAD_LOCAL size_t mark_len = 0;
 		static int mark_on = -1;
 		static int record_on = -1;
 

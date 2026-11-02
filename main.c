@@ -103,14 +103,60 @@ static pthread_t t4_wth[1024];
 static cpu_t *t4_wc[1024];
 static int t4_nworkers;
 
+/* T4_NODE_BTL=pattern, e.g. n%d.btl: a threaded node other than 0 loads its
+ * own netload image (the file -sb takes) instead of waiting for boot code on
+ * a link, so every node of a threaded network - C104 routers included - can
+ * run a C program.  "%d" in the pattern becomes the node id.  Returns 1 if
+ * booted, 0 if there is no pattern, -1 on error. */
+static int t4_boot_node_file(int node)
+{
+        const char *pat = getenv("T4_NODE_BTL"), *pc;
+        char path[512];
+        unsigned char buf[256];
+        uint32_t addr = MemStart;
+        FILE *f;
+        int chunk;
+
+        if (!pat || !*pat)
+                return 0;
+        pc = strstr(pat, "%d");
+        if (pc)
+                snprintf(path, sizeof path, "%.*s%d%s", (int)(pc - pat), pat, node, pc + 2);
+        else
+                snprintf(path, sizeof path, "%s", pat);
+        f = fopen(path, "rb");
+        if (!f || getc(f) != 0) {
+                printf("-E-EMU414: Node%d: %s is not a netload image\n", node, path);
+                if (f)
+                        fclose(f);
+                return -1;
+        }
+        while ((chunk = getc(f)) != EOF && chunk != 0) {
+                if (fread(buf, 1, (size_t)chunk, f) != (size_t)chunk)
+                        break;
+                writebytes_int(addr, buf, (uint32_t)chunk);
+                addr += (uint32_t)chunk;
+        }
+        fclose(f);
+        WPtr = (addr + 3u) & ~3u;
+        UpdateWdescReg(WPtr | LoPriority);
+        return 1;
+}
+
 static void *t4_node_thread(void *arg)
 {
         cpu_t *c = arg;
-        int tries;
+        int tries, booted;
         cpu_bind(c);
+        t9k_thread_init(c->cpu_nodeid);         /* T4_T9000: a clock of its own */
         init_processor();
+        booted = t4_boot_node_file(c->cpu_nodeid);
+        if (booted < 0) {
+                t4_net_request_stop();
+                return NULL;
+        }
         tries = 1;
-        while (tries++ < 60 && 0 == linkcomms("boot", TRUE, LTO_BOOT))
+        while (!booted && tries++ < 60 && 0 == linkcomms("boot", TRUE, LTO_BOOT))
                 if (t9k_ctl_busy())     /* configuring over CLink0 */
                         tries = 1;
         if (tries > 60) {
@@ -122,6 +168,7 @@ static void *t4_node_thread(void *arg)
         do
                 mainloop();
         while (t9k_ctl_after_halt());
+        t9k_report();
         return NULL;
 }
 
@@ -139,6 +186,8 @@ static void t4_spawn_thread_nodes(int n)
                 exit(-1);
         t4_idle_init(&t4_cpu0);
         t4_fabric_set_cpu(t4_fabric, 0, &t4_cpu0);
+        if (t9k.enabled)
+                t9k.node = 0;                   /* this thread is node 0 */
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 1024 * 1024);
         t4_nworkers = n - 1;
