@@ -73,9 +73,13 @@ t4 : $(SRC) $(HDR)
 clean	:
 	$(RM) t4 $(OBJ) *.gcda
 
-.PHONY: smoke benchmark coremark
+.PHONY: smoke benchmark coremark test-vcp
 smoke: t4
 	./run-btl-suite.sh
+
+# T9000 channels and VCP (needs transputer-tcc/-netload built in ../..)
+test-vcp: t4
+	./tests/run_t9000_vcp.sh
 
 benchmark: t4
 	SUITE=benchmark ./run-btl-suite.sh

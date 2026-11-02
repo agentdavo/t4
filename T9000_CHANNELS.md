@@ -155,8 +155,12 @@ emulator with a message.
   boots node 1 down byte-stream Link1, both switch Link1 to virtual mode,
   and node 1 echoes messages over virtual link 0.
 
-Both run under `tests/test_runner_with_uart.sh`, which now supports
-per-test emulator environment, arguments, network map and timeout.
+Run both with `make -f Makefile.linux test-vcp` or `tests/run_t9000_vcp.sh`
+(`T4_BIN` picks the emulator).  They build with `transputer-tcc` and
+`transputer-netload` from the top of the tinycc_transputer tree, and use
+`tests/test_boot.S` (a copy of the compiler tree's test boot stub) and
+`tests/test_t9000_vcp_fn.S` (raw-encoded probes).  Each must print exactly
+`S`, `ALL-PASS`, `H` on the UART.
 
 `T4_VCP_DEBUG=1` traces VCP activity on stderr.  `T4_LINK_LOOPBACK` takes
 effect only for a stand-alone node (no `-sn`).
