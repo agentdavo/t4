@@ -44,7 +44,7 @@ char* Secondaries[] = {
 /*70*/ "--70--",        "LDINF",           "FMUL",         "CFLERR",
 /*74*/ "CRCWORD",       "CRCBYTE",         "BITCNT",       "BITREVWORD",
 /*78*/ "BITREVNBITS",   "POP",         "--7A--",       "--7B--",
-/*7C*/ "--7C--",        "--7D--",          "--7E--",       "--7F--",
+/*7C*/ "--7C--",        "--7D--",          "LDMEMSTARTVAL","--7F--",
 
 /*80*/ "FPSTTEST",      "WSUBDB",          "FPLDNLDBI",    "FPCHKERR",
 /*84*/ "FPSTNLDB",      "FPLDTEST",        "FPLDNLSNI",    "FPADD",
@@ -65,6 +65,50 @@ char* Secondaries[] = {
 /*1FF*/ "START"
 };
 #define MAX_SECONDARIES 0xaf
+
+
+/* IMS T9000 secondaries above the T800 range (ISM appendix B, table B.3) */
+char* T9kOps[] = {
+/*B0*/ "SETTIMESLICE","--B1--",        "--B2--",       "--B3--",
+/*B4*/ "--B4--",      "--B5--",        "LDFLAGS",      "STFLAGS",
+/*B8*/ "XBWORD",      "LBX",           "CB",           "CBU",
+/*BC*/ "INSPHDR",     "READBFR",       "LDCONF",       "STCONF",
+/*C0*/ "LDCNT",       "SSUB",          "LDTH",         "LDCHSTATUS",
+/*C4*/ "INTDIS",      "INTENB",        "--C6--",       "CIR",
+/*C8*/ "SS",          "CHANTYPE",      "LS",           "FPSETERR",
+/*CC*/ "CIRU",        "--CD--",        "--CE--",       "FPREM",
+/*D0*/ "FPRN",        "FPDIVBY2",      "FPMULBY2",     "FPSQRT",
+/*D4*/ "FPRP",        "FPRM",          "FPRZ",         "FPR32TOR64",
+/*D8*/ "FPR64TOR32",  "FPEXPDEC32",    "FPEXPINC32",   "FPABS",
+/*DC*/ "FPCLRERR",    "FPADDDBSN",     "FPCHKI32",     "FPCHKI64",
+/*E0*/ "--E0--",      "--E1--",        "--E2--",       "--E3--",
+/*E4*/ "--E4--",      "--E5--",        "--E6--",       "--E7--",
+/*E8*/ "--E8--",      "--E9--",        "--EA--",       "--EB--",
+/*EC*/ "--EC--",      "--ED--",        "--EE--",       "--EF--",
+/*F0*/ "DEVLB",       "DEVSB",         "DEVLS",        "DEVSS",
+/*F4*/ "DEVLW",       "DEVSW",         "--F6--",       "--F7--",
+/*F8*/ "XSWORD",      "LSX",           "CS",           "CSU"
+};
+#define MIN_T9KOPS 0xb0
+#define MAX_T9KOPS 0xfb
+
+/* IMS T9000 negative-prefix secondaries, indexed by -OReg (table B.4) */
+char* T9kNegOps[] = {
+/*-00*/ "--N00--",    "FPSTALL",       "FPLDALL",      "STSHADOW",
+/*-04*/ "LDSHADOW",   "TRET",          "GOPROT",       "SELTH",
+/*-08*/ "SYSCALL",    "--N09--",       "--N0A--",      "WAIT",
+/*-0C*/ "SIGNAL",     "TIMESLICE",     "INSERTQUEUE",  "SWAPTIMER",
+/*-10*/ "SWAPQUEUE",  "--N11--",       "STOPCH",       "VOUT",
+/*-14*/ "VIN",        "--N15--",       "--N16--",      "SWAPBFR",
+/*-18*/ "SETHDR",     "SETCHMODE",     "INITVLCB",     "WRITEHDR",
+/*-1C*/ "READHDR",    "DISG",          "ENBG",         "GRANT",
+/*-20*/ "STMOVE2DINIT","CAUSEERROR",   "RESTART",      "UNMKRC",
+/*-24*/ "MKRC",       "IRDSQ",         "ERDSQ",        "STRESPTR",
+/*-28*/ "LDRESPTR",   "--N29--",       "--N2A--",      "--N2B--",
+/*-2C*/ "DEVMOVE",    "ICL",           "FDCL",         "ICA",
+/*-30*/ "FDCA"
+};
+#define MAX_T9KNEGOPS 0x30
 
 
 char* FpuEntries[] = {

@@ -55,10 +55,13 @@ extern void t4_wake (uint32_t wdesc);
 #define CURWDESC        (WdescReg)
 #define UNDEFINED       0xdeadbeefu     /* p.c Undefined_p */
 
+/* VCP states (HRM 11.8).  RUNNING and above take packets off the links;
+ * DISCARDING drops everything it receives and sends nothing. */
 #define VCP_RESETTING   0
 #define VCP_WAITING     1
 #define VCP_RUNNING     2
 #define VCP_STOPPING    3
+#define VCP_DISCARDING  4
 
 #define MAX_VLINKS      65536u          /* 16-bit headers */
 
@@ -116,6 +119,7 @@ typedef struct t9k_plink {
 typedef struct t9k_event {
         uint8_t  in_pin, out_pin;
         uint8_t  in_taken;              /* current EventIn high acknowledged */
+        uint8_t  out_done;              /* output acknowledged while deactivated */
         uint8_t  rc_mode;
 } t9k_event_t;
 
@@ -506,7 +510,7 @@ int t9k_link_tx_pending (int link)
         t9k_vcp_t *v = t4cpu->s_vcp;
         t9k_plink_t *p;
 
-        if (!v || v->state < VCP_RUNNING)
+        if (!v || v->state < VCP_RUNNING || v->state == VCP_DISCARDING)
                 return 0;
         p = &v->plink[link];
         return p->dq_head[0] >= 0 || p->dq_head[1] >= 0 ||
@@ -606,11 +610,28 @@ static void in_deliver (t9k_vcp_t *v, uint32_t n, u_char *d, uint32_t len, int l
                 in_complete (v, n);
 }
 
+/* A non-attributable soft error (HRM 11.9): the packet is discarded and the
+ * first one is recorded in VCPStatus (HRM 11.7.2).  Unless the link's
+ * LocalizeError bit is set it is signalled to the control system, which on
+ * a reliable link halts the VCP: with no control system to restart it, the
+ * VCP goes into the 'discarding' state (HRM 11.8.2, 13.5.1) until reset. */
 static void vcp_error (t9k_vcp_t *v, int link, uint32_t code, uint32_t hdr)
 {
+        static const char *const what[] = {
+                "header out of range", "header too short",
+                "short non-terminal packet", "packet too long"
+        };
+
         if (!(v->status & 1u))
                 v->status = 1u | (code << 1) | ((uint32_t)link << 4) | (hdr << 16);
-        VDBG (v, "link%d: packet error %u (header %u)\n", link, code, hdr);
+        VDBG (v, "link%d: %s (header %u)\n", link, what[code & 3u], hdr);
+        if (v->plink[link].vmode & T9K_VLM_LOCALIZEERROR)
+                return;
+        if (v->state != VCP_DISCARDING)
+                printf ("-E-EMU9000: Node%d VCP error on Link%d: %s (header %u); "
+                        "VCP discarding until reset\n",
+                        nodeid < 0 ? 0 : nodeid, link, what[code & 3u], hdr);
+        v->state = VCP_DISCARDING;
 }
 
 static void rx_ack (t9k_vcp_t *v, int link, uint32_t n)
@@ -618,7 +639,8 @@ static void rx_ack (t9k_vcp_t *v, int link, uint32_t n)
         t9k_vlink_t *l = vl_get (v, n);
 
         if (!l->out_await_ack) {
-                vcp_error (v, link, ERR_RANGE, n);
+                /* not one of the HRM 11.9 error classes: nothing to ack */
+                VDBG (v, "link%d: acknowledge for idle vl%u ignored\n", link, n);
                 return;
         }
         l->out_await_ack = 0;
@@ -643,7 +665,9 @@ static void rx_data (t9k_vcp_t *v, int link, uint32_t n, u_char *d, uint32_t len
         t9k_vlink_t *l = vl_get (v, n);
 
         if (!l->inited) {
-                vcp_error (v, link, ERR_RANGE, n);
+                /* undefined in the HRM; refuse rather than write through a
+                 * buffer pointer software never set */
+                VDBG (v, "link%d: packet for uninitialised vl%u dropped\n", link, n);
                 return;
         }
         if (v->state == VCP_STOPPING)
@@ -659,7 +683,8 @@ static void rx_data (t9k_vcp_t *v, int link, uint32_t n, u_char *d, uint32_t len
         if (l->buf_state) {
                 /* the sender must wait for an acknowledge before sending
                  * another packet on this channel */
-                vcp_error (v, link, ERR_LONGPKT, n);
+                VDBG (v, "link%d: unsolicited packet for vl%u with its buffer full\n",
+                      link, n);
                 return;
         }
         if (len)
@@ -687,8 +712,12 @@ static void rx_packet (t9k_vcp_t *v, int link, u_char *pkt, int n)
         uint32_t hdr, vln;
         int dl, tok;
 
+        p->ds_status |= 0x20u;                  /* LinkStatus.TokenReceived */
+        if (v->state == VCP_DISCARDING)
+                return;                         /* accepted and dropped */
         if (n < hl + 1) {
-                vcp_error (v, link, n < hl ? ERR_SHORTHDR : ERR_SHORTPKT, 0);
+                /* terminated before the header was complete */
+                vcp_error (v, link, ERR_SHORTHDR, n > 1 ? pkt[0] : 0u);
                 return;
         }
         hdr = pkt[0] | (hl == 2 ? (uint32_t)pkt[1] << 8 : 0u);
@@ -705,6 +734,11 @@ static void rx_packet (t9k_vcp_t *v, int link, u_char *pkt, int n)
         }
         if (dl > (int)T9K_MAX_PACKET) {
                 vcp_error (v, link, ERR_LONGPKT, hdr);
+                return;
+        }
+        if (tok == T9K_TOK_EOP && dl > 0 && dl < (int)T9K_MAX_PACKET) {
+                /* only the last packet of a message may be short */
+                vcp_error (v, link, ERR_SHORTPKT, hdr);
                 return;
         }
         if (dl == 0 && tok == T9K_TOK_EOP)
@@ -760,7 +794,8 @@ void t9k_link_tx (int link)
         u_char pkt[T9K_MAX_HEADER_LEN + T9K_MAX_PACKET + 1];
         int guard;
 
-        if (!v || v->state < VCP_RUNNING || !t9k_link_virtual (link))
+        if (!v || v->state < VCP_RUNNING || v->state == VCP_DISCARDING ||
+            !t9k_link_virtual (link))
                 return;
         p = &v->plink[link];
         if (!link_connected (link)) {
@@ -885,11 +920,56 @@ static void ev_set_out (t9k_vcp_t *v, int n, int level)
                 t9k_event_in_pin (n ^ 1, level);
 }
 
+/* An input event channel is ready (EventIn high, not yet acknowledged, and
+ * activated): complete the waiting input, ready the ALT, or claim the
+ * resource.  Also run when a channel holding such an event is activated. */
+static void ev_in_event (t9k_vcp_t *v, int n)
+{
+        uint32_t iw;
+
+        if (!ev_in_ready (v, n))
+                return;
+        iw = word (evin_addr (n));
+        if (iw == T9K_RESCHAN_P) {
+                writeword (evin_addr (n), NOTPROC);     /* queued */
+                rc_claim (v, evin_addr (n));
+        } else if (!IS_SPECIAL(iw)) {
+                if (is_alt_state (word (WSLOT(DWPTR(iw), W_POINTER)))) {
+                        alt_ready (iw);
+                } else {
+                        writeword (evin_addr (n), NOTPROC);
+                        ev_take (v, n);
+                        t4_wake (iw);
+                }
+        }
+}
+
+/* setchmode has activated event channel n: carry out what was held back. */
+static void ev_activate (t9k_vcp_t *v, int n, int input)
+{
+        uint32_t w;
+
+        if (input) {
+                ev_in_event (v, n);
+                return;
+        }
+        w = word (evout_addr (n));
+        if (IS_SPECIAL(w))
+                return;
+        if (v->ev[n].out_done) {                /* acknowledged meanwhile */
+                v->ev[n].out_done = 0;
+                writeword (evout_addr (n), NOTPROC);
+                t4_wake (w);
+        } else if (!v->ev[n].out_pin) {
+                ev_set_out (v, n, 1);           /* the request held back */
+        }
+}
+
 void t9k_event_in_pin (int n, int level)
 {
         t9k_vcp_t *v = vcp_get ();
         int old;
-        uint32_t ow, iw;
+        uint32_t ow;
 
         if (n < 0 || n > 3)
                 return;
@@ -900,27 +980,18 @@ void t9k_event_in_pin (int n, int level)
                 /* output channel: the external device acknowledges */
                 ow = word (evout_addr (n));
                 if (!IS_SPECIAL(ow) && v->ev[n].out_pin) {
-                        writeword (evout_addr (n), NOTPROC);
+                        int act = ev_active_out (n);
+
+                        if (act)
+                                writeword (evout_addr (n), NOTPROC);
+                        else
+                                v->ev[n].out_done = 1;  /* pending (HRM 11.3.1) */
                         ev_set_out (v, n, 0);
-                        if (ev_active_out (n))
+                        if (act)
                                 t4_wake (ow);
                         return;
                 }
-                if (!ev_active_in (n))
-                        return;
-                iw = word (evin_addr (n));
-                if (iw == T9K_RESCHAN_P) {
-                        writeword (evin_addr (n), NOTPROC);     /* queued */
-                        rc_claim (v, evin_addr (n));
-                } else if (!IS_SPECIAL(iw)) {
-                        if (is_alt_state (word (WSLOT(DWPTR(iw), W_POINTER)))) {
-                                alt_ready (iw);
-                        } else {
-                                writeword (evin_addr (n), NOTPROC);
-                                ev_take (v, n);
-                                t4_wake (iw);
-                        }
-                }
+                ev_in_event (v, n);
         } else if (old && !level) {
                 if (v->ev[n].in_taken) {
                         v->ev[n].in_taken = 0;
@@ -1144,6 +1215,7 @@ uint32_t t9k_ext_resetch (uint32_t chan)
                         ret = w;
                 writeword (chan, NOTPROC);
                 v->ev[idx].in_taken = 0;
+                v->ev[idx].out_done = 0;
                 ev_set_out (v, (int)idx, 0);
         } else {
                 int_error (v, "resetch", chan);
@@ -1639,8 +1711,10 @@ static void op_setchmode (t9k_vcp_t *v)
         }
         case K_EV_IN:
         case K_EV_OUT:
-                /* activation lives in the reverse channel word */
+                /* activation lives in the reverse channel word (HRM 12.2) */
                 writeword (chan ^ 4u, on ? NOTPROC : T9K_DEACTIVATED_P);
+                if (on)
+                        ev_activate (v, (int)idx, k == K_EV_IN);
                 break;
         case K_BS_IN:
         case K_BS_OUT: {
@@ -1936,7 +2010,7 @@ static int conf_write (t9k_vcp_t *v, uint32_t a, uint32_t val)
                         if (val & 1u)           /* ResetLink */
                                 p->ds_status = 0;
                         if (val & 2u)           /* StartLink */
-                                p->ds_status |= 0x22u;
+                                p->ds_status |= 0x2u;   /* LinkStarted */
                         if (val & 4u)           /* ResetOutput */
                                 p->ds_status = (p->ds_status & ~0x2u) | 0x4u;
                         return 1;

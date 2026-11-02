@@ -1597,6 +1597,7 @@ uint32_t m2dLength;             /* move2d length (no. of rows) */
  * words are event channel words there. */
 #define ClearInterrupt          (t4cpu->s_sh.wdesc = NotProcess_p)
 #define ReadInterrupt           (NotProcess_p != GetDescWPtr(t4cpu->s_sh.wdesc))
+void t4_wake (uint32_t wdesc);
 static void shadow_save (void);
 static void shadow_resume (void);
 static void shadow_transfer (uint32_t from, uint32_t to, uint32_t ptr, int store);
@@ -3587,6 +3588,14 @@ char *mnemonic(u_char icode, uint32_t oreg, uint32_t fpuentry, int onlymnemo)
                         mnemo = Combinations[oreg - MIN_COMBINATIONS];
                 else if (MIN_TVX <= oreg && oreg <= MAX_TVX)
                         mnemo = TvxOps[oreg - MIN_TVX];
+                else if (MIN_T9KOPS <= oreg && oreg <= MAX_T9KOPS)
+                        mnemo = T9kOps[oreg - MIN_T9KOPS];
+                else if (oreg >= (uint32_t)-MAX_T9KNEGOPS)
+                        mnemo = T9kNegOps[(uint32_t)-oreg];
+                else if (oreg == 0xFFFFFFC0u)
+                        mnemo = "NOP";
+                else if (oreg == 0xFFFFFF7Cu)
+                        mnemo = "LDPRODID";
 
                 if (mnemo == NULL)
                 {
@@ -4050,7 +4059,10 @@ void mainloop (void)
 	}
 
 	/* Open UART log file — use timestamped name to avoid conflicts
-	 * with concurrent T4 instances (e.g., test runners). */
+	 * with concurrent T4 instances (e.g., test runners).  Once per
+	 * process: a threaded node starting its mainloop later would
+	 * otherwise truncate what node 0 has already logged. */
+	if (!uart_log_file)
 	{
 		const char *uart_log_env = getenv("T4_UART_LOG");
 		char uart_log_auto[64];
@@ -5818,7 +5830,10 @@ OprOut:                    if (__builtin_expect (T9K_EXTCHAN(BReg), 0))
                                                         }
 #endif
 							writeword (index (otherWPtr, State_s), Ready_p);
-							schedule (otherWdesc);
+							/* ISM 8.7.3: only a Waiting ALT is descheduled;
+							 * an Enabling one is running or queued. */
+							if (Waiting_p == altState)
+								t4_wake (otherWdesc);
 						}
           				}
 					else
@@ -5923,7 +5938,10 @@ DescheduleOut:
 						{
 							/* The alt has not already been rescheduled. */
 							writeword (index (otherWPtr, State_s), Ready_p);
-							schedule (otherWdesc);
+							/* ISM 8.7.3: only a Waiting ALT is descheduled;
+							 * an Enabling one is running or queued. */
+							if (Waiting_p == altState)
+								t4_wake (otherWdesc);
 						}
           				}
 					else
@@ -6023,7 +6041,10 @@ DescheduleOutByte:
 #endif
 							/* The alt has not already been rescheduled. */
 							writeword (index (otherWPtr, State_s), Ready_p);
-							schedule (otherWdesc);
+							/* ISM 8.7.3: only a Waiting ALT is descheduled;
+							 * an Enabling one is running or queued. */
+							if (Waiting_p == altState)
+								t4_wake (otherWdesc);
 						}
           				}
 					else
