@@ -205,10 +205,9 @@ int t9k_net_timed (void)
         return t9k_proto.enabled && t9k_proto.net_on;
 }
 
-uint64_t t9k_route_packet (uint64_t ready, uint32_t nbytes, uint64_t *out_free,
-                           uint64_t *last)
+uint64_t t9k_route_packet (uint64_t ready, uint32_t nbytes, t9k_tl_t *out)
 {
-        return t9k_c104_hop (ready, nbytes, out_free, last);
+        return t9k_c104_hop (ready, nbytes, out);
 }
 
 /* For the VCP (t9000_vcp.c), which times its own packets: with defer on, a
@@ -229,8 +228,8 @@ uint64_t t9k_net_head (unsigned hl)
         return t9k.net_start + t9k_link_xfer (hl) + (uint64_t)t9k.link_lat;
 }
 
-/* When the packet just sent on link has left. */
-uint64_t t9k_net_link_free (int link) { return t9k.link_free[link & 3]; }
+/* When the VCP's packet just sent has left. */
+uint64_t t9k_net_sent_end (void) { return t9k.net_sent_end; }
 uint64_t t9k_net_now (void)     { return t9k_cycles_so_far (); }
 
 /* Processes the VCP holds while the CPU runs another (t9k_net_wake, near
@@ -2849,7 +2848,7 @@ int channel_sendP (Channel *chan, u_char *data, int ndata, int doWait)
                         memcpy (&chan->schbuf[SCH_DATA], data, ndata);
                         if (t9k.enabled && t9k.net_on)
                         {
-                                uint64_t ready = t9k_net_ready (chan->linkno);
+                                uint64_t ready = t9k_net_ready (chan->linkno, (uint32_t)ndata);
 
                                 memcpy (&chan->schbuf[SCH_STAMP], &ready, 8);
                                 t9k_net_sent (chan->linkno, ready, (uint32_t)ndata);
@@ -2862,7 +2861,7 @@ int channel_sendP (Channel *chan, u_char *data, int ndata, int doWait)
         else if (t9k.enabled && t9k.net_on)
         {
                 u_char tbuf[8 + MAX_DATA];
-                uint64_t ready = t9k_net_ready (chan->linkno);
+                uint64_t ready = t9k_net_ready (chan->linkno, (uint32_t)ndata);
 
                 memcpy (tbuf, &ready, 8);
                 memcpy (tbuf + 8, data, ndata);

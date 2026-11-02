@@ -1,4 +1,5 @@
 #include "t4_fabric.h"
+#include "t9000_tl.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,14 +49,12 @@ typedef struct t4_rport {
         int      first, last;   /* output link(s) of the waiting packet; -1: none */
         int      rr;            /* as an output: the input it serves first next */
         int      warned_drop, warned_stuck;
-        uint64_t free_at;       /* as an output: cycle the link is next free */
-        uint64_t last_start;    /* and the latest packet's start (T4_T9K_NET) */
+        t9k_tl_t out_tl;        /* as an output: its transfers (T4_T9K_NET) */
 } t4_rport_t;
 
 /* T9000 network timing (p.c, t9000_group.h) */
 int      t9k_net_timed(void);
-uint64_t t9k_route_packet(uint64_t ready, uint32_t nbytes, uint64_t *out_free,
-                          uint64_t *last);
+uint64_t t9k_route_packet(uint64_t ready, uint32_t nbytes, t9k_tl_t *out);
 
 typedef struct t4_router {
         const net_router_t *cfg;
@@ -404,8 +403,7 @@ static void router_forward(t4_router_t *r, int i, int o)
                 uint64_t ready;
 
                 memcpy(&ready, in->inbox + SCH_STAMP, 8);
-                ready = t9k_route_packet(ready, len - skip, &out->free_at,
-                                         &out->last_start);
+                ready = t9k_route_packet(ready, len - skip, &out->out_tl);
                 memcpy(out->outbox + SCH_STAMP, &ready, 8);
         }
         mb_set(out->outbox, len - skip);
@@ -414,14 +412,24 @@ static void router_forward(t4_router_t *r, int i, int o)
         router_take(r, i);
 }
 
+/* The cycle stamp of the packet waiting on input i. */
+static uint64_t router_stamp(t4_router_t *r, int i)
+{
+        uint64_t t;
+
+        memcpy(&t, r->port[i].inbox + SCH_STAMP, 8);
+        return t;
+}
+
 /* One pass of the crossbar: route new arrivals, then give each free output
  * to one of the packets waiting for it.  Each output arbitrates round robin
  * from the input after the one it served last, so every input waiting for
- * an output gets it within nlinks packets.  Returns whether anything
- * moved. */
+ * an output gets it within nlinks packets.  On a timed network the packet
+ * that reached the switch first - the earliest stamp - goes first, as on
+ * the wire; round robin breaks ties.  Returns whether anything moved. */
 static int router_step(t4_router_t *r)
 {
-        int n = r->nlinks, moved = 0, k, i, o;
+        int n = r->nlinks, moved = 0, k, i, o, timed = t9k_net_timed();
 
         for (i = 0; i < n; i++) {
                 t4_rport_t *in = &r->port[i];
@@ -435,6 +443,9 @@ static int router_step(t4_router_t *r)
         for (o = 0; o < n; o++) {
                 t4_rport_t *out = &r->port[o];
 
+                int best = -1;
+                uint64_t bt = 0;
+
                 if (!out->outbox || mb_len(out->outbox))
                         continue;
                 for (k = 0; k < n; k++) {
@@ -443,11 +454,20 @@ static int router_step(t4_router_t *r)
                         i = (out->rr + k) % n;
                         in = &r->port[i];
                         if (in->first <= o && o <= in->last) {
-                                router_forward(r, i, o);
-                                out->rr = (i + 1) % n;
-                                moved = 1;
-                                break;
+                                uint64_t t = timed ? router_stamp(r, i) : 0;
+
+                                if (best < 0 || t < bt) {
+                                        best = i;
+                                        bt = t;
+                                }
+                                if (!timed)
+                                        break;
                         }
+                }
+                if (best >= 0) {
+                        router_forward(r, best, o);
+                        out->rr = (best + 1) % n;
+                        moved = 1;
                 }
         }
         return moved;

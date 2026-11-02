@@ -429,10 +429,15 @@ while it runs another process, the woken one joins the queue when the CPU's
 clock reaches the cycle its transfer finished, so a node computes while its
 VCP moves data (`ffn_cube.c -DOVERLAP`).  A C104 adds `T4_T9K_LINKLAT` per
 hop and `T4_T9K_C104LAT` (20 cycles) to route, and serialises each output
-link; a packet's bytes are counted once along a path (wormhole).  Packets
-reach a link in host order, which through a switch is not cycle order: one
-stamped before a packet already queued is not held behind it, but keeps the
-link busy for its bytes.
+link; a packet's bytes are counted once along a path (wormhole), and an
+output goes to the waiting packet that reached the switch first.  Packets
+reach a link in host order, which through a switch is not cycle order, so
+each link keeps its last 16 transfers (`t9000_tl.h`): a packet stamped
+before ones already placed takes the first gap at or after its stamp.
+In-order traffic is timed as before.  This replaced a rule that charged a
+late packet's bytes to every later one, which let host thread timing swing
+the 8-node C104 FFN between 5.13 and 5.65 ms; it now repeats to within
+0.2%.
 
 Measured (transputer/tests/net in the compiler tree): 24 KB over one cable,
 one virtual link 1.06x the raw link time at 9 MB/s and 2.42x at 90 MB/s,

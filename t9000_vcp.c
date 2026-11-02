@@ -168,7 +168,7 @@ int      t9k_net_timed (void);
 void     t9k_net_defer (int on, uint64_t not_before);
 uint64_t t9k_net_arrival (void);
 uint64_t t9k_net_head (unsigned hl);
-uint64_t t9k_net_link_free (int link);
+uint64_t t9k_net_sent_end (void);
 uint64_t t9k_net_now (void);
 void     t9k_net_wake (uint32_t wdesc, uint64_t t);
 
@@ -640,11 +640,11 @@ static void out_complete (t9k_vcp_t *v, uint32_t n)
                 l->out_sched = w;
 }
 
-/* A VXFER output is done for its group once its last packet has left on
- * `link`: the buffer is free then.  The VCP takes the final acknowledge
+/* A VXFER output is done for its group once its last packet has left -
+ * just now: the buffer is free then.  The VCP takes the final acknowledge
  * itself (rx_ack), and the link's next message waits for it as any next
  * packet does, so only the process stops waiting for the round trip. */
-static void out_post (t9k_vcp_t *v, uint32_t n, int link)
+static void out_post (t9k_vcp_t *v, uint32_t n)
 {
         t9k_vlink_t *l = &v->vl[n];
         uint32_t w = l->out_wdesc;
@@ -653,7 +653,7 @@ static void out_post (t9k_vcp_t *v, uint32_t n, int link)
         l->out_grp = 0;
         l->out_posted = 1;
         l->out_wdesc = NOTPROC;
-        v->t_rx = t9k_net_timed () ? t9k_net_link_free (link) : 0;
+        v->t_rx = t9k_net_timed () ? t9k_net_sent_end () : 0;
         if (grp_done (v, w)) {
                 vcp_wake (w, v->t_rx);
         }
@@ -1006,7 +1006,7 @@ void t9k_link_tx (int link)
                         l->out_await_ack = 1;
                         l->out_last = (uint8_t)last;
                         if (last && l->out_grp)
-                                out_post (v, (uint32_t)n, link);
+                                out_post (v, (uint32_t)n);
                 }
                 VDBG (v, "link%d tx vl%d %s %u bytes\n", link, n,
                       is_ack ? "ack" : (last ? "EOM" : "EOP"), cnt);

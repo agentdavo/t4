@@ -98,6 +98,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "t9000_tl.h"
 
 /* Size of the on-chip workspace cache, in words.  A reference to a workspace
  * location below this can use the instruction operand as a direct cache
@@ -218,7 +219,7 @@ typedef struct {
     int      link_lat;        /* cycles per packet hop (header + router)   */
     uint64_t net_wait;        /* cycles spent waiting for link transfers   */
     uint64_t link_free[4];    /* cycle each outgoing link is next free     */
-    uint64_t link_in_free[4]; /* NET=2: cycle each incoming link is free   */
+    t9k_tl_t link_in_tl[4];   /* NET=2: each incoming link's transfers     */
     /* Threaded networks (-st): t9k is per thread, so every node has its own
      * clock; node is its id there and -1 otherwise.  The VCP times its own
      * packets: with net_defer set, a received packet does not stall the CPU
@@ -230,9 +231,8 @@ typedef struct {
     uint64_t net_arrival;
     uint64_t net_start;       /* when that packet started arriving          */
     int      c104_lat;        /* cycles a C104 adds to route a packet       */
-    uint64_t link_in_last[4]; /* ready cycle of the latest packet queued    */
-    uint64_t link_out_last[4];
-    int      net_ooo;         /* the send being made is out of host order   */
+    t9k_tl_t link_out_tl[4];  /* the VCP's transfers on each outgoing link  */
+    uint64_t net_sent_end;    /* when the VCP's latest packet has left      */
     /* Processes the VCP finished a transfer for while the CPU was running
      * another one: each joins the queue once the CPU's clock reaches the
      * cycle its transfer was done (t9k_net_release), so the CPU keeps
@@ -1244,35 +1244,37 @@ static inline void t9k_advance_to(uint64_t t)
         t9k.net_wait += t - now;
 }
 
-/* The cycle a packet about to leave on `link` is ready: now - or, for the
- * VCP, net_not_before - or when the link finishes the packet before it.
- * The packet carries this. */
-/* The VCP's virtual links become ready to send in the order their packets
- * and acknowledges arrived, which through a switch is host order, not cycle
- * order.  A packet the VCP has ready before the latest one it sent went
- * first on the wire: it does not queue behind it, but keeps the link busy
- * for its bytes (net_ooo carries that to t9k_net_sent). */
-static inline uint64_t t9k_net_ready(int link)
+/* The cycle a packet of nbytes about to leave on `link` is ready: now, or
+ * when the link finishes the packet before it.  The packet carries this.
+ * The VCP's packets are ready from net_not_before, and its virtual links
+ * become ready to send in the order their packets and acknowledges arrived,
+ * which through a switch is host order, not cycle order: one ready before
+ * packets it already sent takes the first gap on the link (t9000_tl.h). */
+static inline uint64_t t9k_net_ready(int link, uint32_t nbytes)
 {
-    uint64_t now = t9k.net_defer ? t9k.net_not_before : t9k_cycles_so_far();
+    uint64_t now;
 
-    t9k.net_ooo = t9k.net_defer && now < t9k.link_out_last[link & 3];
-    if (t9k.net_ooo)
-        return now;
-    t9k.link_out_last[link & 3] = now;
+    if (t9k.net_defer)
+        return t9k_tl_fit(&t9k.link_out_tl[link & 3], t9k.net_not_before,
+                          t9k_link_xfer(nbytes));
+    now = t9k_cycles_so_far();
     return now > t9k.link_free[link & 3] ? now : t9k.link_free[link & 3];
 }
 
 static inline void t9k_net_sent(int link, uint64_t ready, uint32_t nbytes)
 {
-    if (t9k.net_ooo) {
-        t9k.net_ooo = 0;
-        t9k.link_free[link & 3] += t9k_link_xfer(nbytes);
+    uint64_t end = ready + t9k_link_xfer(nbytes);
+
+    if (t9k.net_defer) {
+        t9k_tl_add(&t9k.link_out_tl[link & 3], ready, t9k_link_xfer(nbytes));
+        t9k.net_sent_end = end;
+        if (end > t9k.link_free[link & 3])
+            t9k.link_free[link & 3] = end;
         return;
     }
-    t9k.link_free[link & 3] = ready + t9k_link_xfer(nbytes);
-    if (t9k.net_on == 1 && !t9k.net_defer)
-        t9k_advance_to(t9k.link_free[link & 3]);
+    t9k.link_free[link & 3] = end;
+    if (t9k.net_on == 1)
+        t9k_advance_to(end);
 }
 
 /* A packet that left its sender at `ready` arrives once the link is free
@@ -1286,18 +1288,12 @@ static inline void t9k_net_received(int link, uint64_t ready, uint32_t nbytes)
     if (t9k.net_on == 1 && !t9k.net_defer) {
         uint64_t now = t9k_cycles_so_far();
         start = ready > now ? ready : now;
-    } else if (ready >= t9k.link_in_last[link & 3]) {
-        t9k.link_in_last[link & 3] = ready;
-        start = ready > t9k.link_in_free[link & 3] ? ready
-                                                   : t9k.link_in_free[link & 3];
-        t9k.link_in_free[link & 3] = start + t9k_link_xfer(nbytes);
     } else {
-        /* Stamped before a packet already queued here: through a switch,
-         * from another sender, it only reached us later in host time.  On
-         * the wire it went first, so it does not wait behind that packet;
-         * the link is busy for its bytes all the same. */
-        start = ready;
-        t9k.link_in_free[link & 3] += t9k_link_xfer(nbytes);
+        /* One stamped before packets already placed here came through a
+         * switch from another sender and only reached us later in host
+         * time: it takes the first gap at or after its stamp. */
+        start = t9k_tl_place(&t9k.link_in_tl[link & 3], ready,
+                             t9k_link_xfer(nbytes));
     }
     if (t9k.net_defer) {
         t9k.net_start = start;
@@ -1312,27 +1308,19 @@ static inline void t9k_net_received(int link, uint64_t ready, uint32_t nbytes)
  * c104_lat to route, and the packet leaves once the output link is free.
  * The bytes follow the header straight through, so a path costs its hops
  * plus one transfer, not one transfer per hop.  Runs on a router thread,
- * hence the configured model rather than a node's.  *last is when the
- * latest packet queued on the output reached the switch: one that reached
- * it earlier came late only in host time and is not queued behind it (see
- * t9k_net_received).
+ * hence the configured model rather than a node's.  `out` is the output
+ * link's record: a packet that reached the switch before ones already
+ * placed came late only in host time and takes the first gap (t9000_tl.h).
  * Returns the packet's new stamp: the cycle it is ready on the output. */
 static inline uint64_t t9k_c104_hop(uint64_t ready, uint32_t nbytes,
-                                    uint64_t *out_free, uint64_t *last)
+                                    t9k_tl_t *out)
 {
     const t9k_state *c = &t9k_proto;
     uint64_t mbps = c->link_mbps < 1 ? 1 : (uint64_t)c->link_mbps;
     uint64_t t = ready + (uint64_t)c->link_lat + (uint64_t)c->c104_lat;
     uint64_t x = ((uint64_t)nbytes * (uint64_t)c->core_mhz + mbps - 1) / mbps;
 
-    if (t >= *last) {
-        *last = t;
-        if (t < *out_free)
-            t = *out_free;
-        *out_free = t + x;
-    } else
-        *out_free += x;
-    return t;
+    return t9k_tl_place(out, t, x);
 }
 
 /* One line of progress: what the machine has cost by the time the guest
