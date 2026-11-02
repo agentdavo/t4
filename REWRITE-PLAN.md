@@ -28,10 +28,14 @@ Everything is in one function (`mainloop`) with global state.
 | 5. FPU | Not started | FPU execution remains in the legacy path. |
 | 6. Debug | Partial | `debug_config.c` is built, but most tracing and symbol logic remains in `p.c`. |
 
-The standalone smoke suite currently passes 2/2. Dhrystone is correct but the
-rebuilt emulator is about 13.5x slower than the shipped reference binary, so
-recovering that regression precedes the Phase 4 cut-over. See `T4_PERF.md` for
-the measured baseline.
+The standalone smoke suite currently passes 2/2. Dhrystone is correct. The
+2026-11-02 hot-path fixes recovered most of the regression against the shipped
+reference binary (once ~13.5x on the July host, ~3x on the November one), but
+the rebuild is still ~1.45x slower than the 2023 source (~1.8x slower than the
+shipped binary). What remains is the hot loop's own structure - guest
+registers live in the `cpu_t` and are reloaded after every store - which a
+Phase 4 `cpu_run()` holding them in locals would address. See `T4_PERF.md` for the measurements and the
+remaining causes.
 
 ## Goals
 

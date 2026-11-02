@@ -35,7 +35,9 @@ CC += $(DBG-FLAGS) $(OPT-FLAGS) $(LD-FLAGS)
 # For a well-optimised version compiled with gcc on a Sun use:
 # CFLAGS = -O2 -DSUN -finline -finline-functions -fexpensive-optimizations
 # For a reasonably optimised version for NetBSD.
-CFLAGS = -I. -Wall -DCURTERM=1 -I$(HOME)/include \
+# -ffp-contract=off: TVX defines every multiply and add as a separate binary32
+# rounding; clang fuses them into FMAs on arm64 by default.
+CFLAGS = -I. -Wall -pthread -ffp-contract=off -DCURTERM=1 -I$(HOME)/include \
         -DT4NANOMSG=1 \
         -DT4SHLINKS=1 \
         -DT4COMBINATIONS=1 \
@@ -45,7 +47,7 @@ CFLAGS = -I. -Wall -DCURTERM=1 -I$(HOME)/include \
 # CFLAGS = -O2 -Wall -DSUN
 
 # Put any additional libraries here.
-LFLAGS	= $(HOME)/lib/libnanomsg.a -lm
+LFLAGS	= -pthread $(HOME)/lib/libnanomsg.a -lm
 
 #
 # https://github.com/JuliaMath/openlibm
@@ -53,7 +55,7 @@ LFLAGS	= $(HOME)/lib/libnanomsg.a -lm
 FDMSRC  = k_standard.c s_scalbn.c s_scalbnf.c s_ldexp.c s_ldexpf.c \
 	  e_fmod.c e_remainder.c e_sqrt.c w_remainder.c w_sqrt.c
 
-SRC	= $(FDMSRC) curterm.c arithmetic.c fparithmetic.c netcfg.c shlink.c server.c p.c main.c
+SRC	= $(FDMSRC) curterm.c arithmetic.c fparithmetic.c netcfg.c shlink.c server.c timer_integration.c cpu_state.c t4_fabric.c t9000_vcp.c p.c main.c
 OBJ	= $(SRC:.c=.o)
 
 t4 : $(SRC)

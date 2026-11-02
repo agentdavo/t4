@@ -48,10 +48,8 @@ void handler (int);
 
 #define INT(x)  ((int32_t)x)
 
-extern uint32_t t4_carry;
-extern uint32_t t4_overflow;
-extern uint32_t t4_normlen;
-extern uint32_t t4_carry64;
+#include "processor.h"
+#include "cpu_state.h"
 
 #define HAVE_UINT64     1
 

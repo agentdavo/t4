@@ -16,13 +16,16 @@ STRIP = strip
 
 # Release build: -O3, no debug overhead. Use T4_OPT=-Ofast only for explicit
 # experiments; the emulator has strict floating-point and old-C aliasing code.
+# -ffp-contract=off: TVX defines every multiply and add as a separate binary32
+# rounding, and -march=native would otherwise fuse them into FMAs (the vendored
+# IQ1_M Q8_K kernel moves by an ulp).
 T4_OPT ?= -O3
-CFLAGS = -I. $(T4_OPT) -march=native -fomit-frame-pointer -Wall \
+CFLAGS = -I. $(T4_OPT) -march=native -ffp-contract=off -fomit-frame-pointer -Wall -pthread \
 	-DCURTERM=1 -DT4SHLINKS=1 -DT4COMBINATIONS=1 -DT4RELEASE=1 -DNDEBUG \
 	-DT4_SDL_FB $(shell pkg-config --cflags sdl2) $(shell pkg-config --cflags libpng)
 
 # Debug build flags (use with: make -f Makefile.linux debug=yes t4)
-CFLAGS_DEBUG = -I. -O2 -fomit-frame-pointer -Wall -g \
+CFLAGS_DEBUG = -I. -O2 -ffp-contract=off -fomit-frame-pointer -Wall -g -pthread \
 	-DCURTERM=1 -DT4SHLINKS=1 -DT4COMBINATIONS=1 -DEMUDEBUG \
 	-DT4_SDL_FB $(shell pkg-config --cflags sdl2) $(shell pkg-config --cflags libpng)
 
@@ -31,7 +34,21 @@ CFLAGS := $(CFLAGS_DEBUG)
 STRIP := :
 endif
 
-LFLAGS = -lm $(shell pkg-config --libs sdl2) $(shell pkg-config --libs libpng)
+LFLAGS = -pthread -lm $(shell pkg-config --libs sdl2) $(shell pkg-config --libs libpng)
+
+#
+# nanomsg provides the ipc:// link transport, which is what lets nodes of a
+# multi-transputer network talk over sockets.  Without -DT4NANOMSG every nn_*
+# call in p.c is a stub returning EINVAL, so the first inter-node message dies
+# with "channel_sendP: Failed to send 1 bytes ... (Invalid argument)" and only
+# shared-memory links (-sl) work.  Detected rather than assumed, so the build
+# still succeeds on a host without the library.
+#
+T4_NANOMSG := $(shell pkg-config --exists nanomsg && echo yes)
+ifeq ($(T4_NANOMSG),yes)
+CFLAGS  += -DT4NANOMSG=1
+LFLAGS  += -lnanomsg
+endif
 
 #
 # https://github.com/JuliaMath/openlibm
@@ -41,10 +58,14 @@ FDMSRC  = k_standard.c s_scalbn.c s_scalbnf.c s_ldexp.c s_ldexpf.c \
 FDMOBJ	= k_standard.o s_scalbn.o s_scalbnf.o s_ldexp.o s_ldexpf.o \
 	  e_fmod.o e_remainder.o e_sqrt.o w_remainder.o w_sqrt.o
 
-SRC	= $(FDMSRC) curterm.c arithmetic.c fparithmetic.c netcfg.c shlink.c server.c display_backend_sdl.c timer_integration.c debug_config.c t9000_pmi.c t9000_protect.c p.c main.c
-OBJ	= $(FDMOBJ) curterm.o arithmetic.o fparithmetic.o netcfg.o shlink.o server.o display_backend_sdl.o timer_integration.o debug_config.o t9000_pmi.o t9000_protect.o p.o main.o
+SRC	= $(FDMSRC) curterm.c arithmetic.c fparithmetic.c netcfg.c shlink.c server.c display_backend_sdl.c timer_integration.c debug_config.c t9000_pmi.c t9000_protect.c cpu_state.c t4_fabric.c t9000_vcp.c p.c main.c
+OBJ	= $(FDMOBJ) curterm.o arithmetic.o fparithmetic.o netcfg.o shlink.o server.o display_backend_sdl.o timer_integration.o debug_config.o t9000_pmi.o t9000_protect.o t9000_vcp.o p.o main.o
 
-t4 : $(SRC)
+# The single-shot build must also depend on the headers, otherwise editing
+# one (t9000_group.h, the TVX semantics) silently leaves a stale t4 behind.
+HDR	= $(wildcard *.h)
+
+t4 : $(SRC) $(HDR)
 	$(CC) $(CFLAGS) $(SRC) $(LFLAGS) -o t4
 	$(STRIP) t4
 	ls -l t4

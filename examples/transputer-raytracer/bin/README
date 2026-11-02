@@ -5,13 +5,63 @@ Files:
 
         raytraceN.map   map file for N processors
         raytraceN.btl   boot file for N processors
+        testall.sh      run every arrangement and check the rendered image
+        multi.sh        run one arrangement interactively
 
-To run the examples, eg. for 3 processors:
+Quick check that everything works:
+
+        ./testall.sh --max 8          # shared-memory links
+        ./testall.sh --ipc            # every arrangement over ipc:// (use this at N>=8)
+        ./testall.sh --threads --max 4  # in-process pthreads (`t4 -st -sn -N`)
+
+The raytracer is deterministic, so the image it produces must be identical
+whatever the arrangement.  pic/rayM.ppm are the reference renders, and
+testall.sh compares against them byte for byte - which makes it a real test
+of the link fabric, the chain bootstrap and the task farm, not a smoke test.
+
+To run one arrangement by hand, eg. 3 processors:
 
         export SPYNET=raytrace3.map
-        t4 -s8 -sn 1 -si &
-        t4 -s8 -sn 2 -si &
-        t4 -s8 -sn 0 -sb raytrace3.btl
-        pkill -9 t4
+        t4 -s8 -sl -sn 1 -si &          # node 1 FIRST - see below
+        sleep 1
+        t4 -s8 -sl -sn 2 -si &
+        t4 -s8 -sl -sn 0 -sb raytrace3.btl
 
-The shell script multi.sh/multi.bat can be used to run the examples.
+The shell script multi.sh/multi.bat does this for you.
+
+
+Two rules the obvious version of the above gets wrong
+-----------------------------------------------------
+
+1.  Node 1 must be started first, and given time.
+
+    With shared-memory links, node 1 CREATES the shared segment and every
+    other node attaches to it.  A node that starts before the segment exists
+    does not retry - it exits immediately and silently.  Starting all the
+    workers in one loop is a race that kills node 2 as soon as there are
+    three or more processors.
+
+2.  A killed run leaves the segment behind, and poisons the next one.
+
+    The segment is SysV shared memory keyed on the map file, and it refuses
+    to be created twice ("SHMLinks already exists").  If a run is interrupted
+    before it can clean up, the next run of that same size fails at startup.
+    Check with `ipcs -m` and remove the leftover with `ipcrm -m <shmid>`;
+    testall.sh does this automatically.
+
+
+Link transports
+---------------
+
+-sl selects shared-memory links, which only work between processes on one
+machine.  Without -sl the emulator uses ipc:// sockets instead, which need
+t4 to have been built with nanomsg available - Makefile.linux detects it via
+pkg-config.  If it was not, every inter-node message fails with
+
+        channel_sendP: Failed to send 1 bytes on Link2Out (Invalid argument)
+
+and -sl is the only option.
+
+`t4 -sn -N` is a third way: it makes this process node 0 of an N-node
+network and spawns the other N-1 emulators itself.  Convenient interactively,
+less so from a script, because the children are not yours to clean up.

@@ -27,6 +27,9 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#ifndef T4_PROCESSOR_H
+#define T4_PROCESSOR_H
+
 #define INLINE
 
 #include <stdint.h>
@@ -79,6 +82,7 @@ extern uint32_t CoreSize;
 
 
 #define LTO_BOOT       1000
+#define LTO_IDLE       5
 #define LTO_COMM       0
 #define LTO_HI         0
 #define LTO_POLL       0
@@ -121,11 +125,16 @@ typedef struct _Channel_ {
         uint32_t LinkAddress; /* the address of the Channel */
         uint32_t Address;
         uint32_t Length;
-        int  Link;
+        int  CtrlByte;        /* boot-protocol state, per channel */
+        int  linkno;
+        int  peer;            /* node at the other end, or -1 */
         int  sock;
         char url[MAX_CHANNEL_URL];
         u_char *schbuf;
         uint64_t IOBytes;
+        uint32_t DBuffReg;    /* link data buffer; only testhardchan sees it */
+        int  npend, pendoff;  /* In: bytes of the last packet the in that  */
+        u_char pend[MAX_DATA];/* took it did not want, kept for the next */
 } Channel;
 
 typedef struct _LinkIface_ {
@@ -198,4 +207,6 @@ void close_channels(void);
 int  linkcomms     (char *where, int doBoot, int timeOut);
 void init_memory   (void);
 void init_processor(void);
+
+#endif /* T4_PROCESSOR_H */
 

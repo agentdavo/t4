@@ -54,6 +54,9 @@
 
 typedef struct t9k_protect_state {
 	int      enabled;       /* master switch (T4_PROTECT) */
+	/* t9k_translate() can change an address: enabled, and P-mode or a
+	 * region relocate_only() would use.  Kept by t9k_update_active(). */
+	int      active;
 	int      is_p;          /* 1 = P-process mode */
 	int      debug;
 	uint32_t region[4];     /* RegionReg0..3 */
@@ -99,6 +102,11 @@ void t9k_leave_p(void);
 
 /* Phase 10: install region descriptors without changing IPtr/WPtr/is_p. */
 void t9k_load_rods(const uint32_t rods[4]);
+
+/* Resume an interrupted P-process from the shadow registers (ISM 13.3):
+ * RegionReg0-3, PstateReg and WdescStubReg come back with it. */
+void t9k_resume_p(const uint32_t region[4], uint32_t pstate,
+		  uint32_t wdesc_stub, uint32_t supervisor_iptr);
 
 /* syscall in P -> trap to supervisor; in L -> soft note (THDS not fully modelled) */
 void t9k_syscall(void);

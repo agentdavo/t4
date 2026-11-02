@@ -9,7 +9,8 @@ python3 tests/mk_hello_p.py >/dev/null
 export T4_PROTECT=1
 export T4_PROTECT_DEBUG="${T4_PROTECT_DEBUG:-0}"
 # RESULT @ 0x80000270 must become trap cause 3 (T9K_TRAP_SYSCALL)
-export T4_WATCH=0x80000270,1,0x800001b0,2
+# RESULT+4/+8 must hold the ISM resume pair: t.Scall (8), et.NoError (0)
+export T4_WATCH=0x80000270,1,0x80000274,2,0x800001b0,2
 
 LOG=$(mktemp)
 # short run — guest spins after store; timeout dumps T4_WATCH via handler
@@ -35,6 +36,13 @@ if ! grep -q '\[WATCH\] 0x80000270: 00000003' "$LOG"; then
   exit 1
 fi
 
-echo "PASS: hello_p goprot→syscall→trap cause 3, RESULT=0x00000003"
+if ! grep -q '\[WATCH\] 0x80000274: 00000008 00000000' "$LOG"; then
+  echo "FAIL: supervisor did not resume with A=t.Scall, B=et.NoError"
+  grep WATCH "$LOG"
+  rm -f "$LOG"
+  exit 1
+fi
+
+echo "PASS: hello_p goprot→syscall→trap cause 3, RESULT=0x00000003, A=t.Scall B=et.NoError"
 grep -E 'goprot|syscall|P-trap|WATCH|resume' "$LOG" || true
 rm -f "$LOG"

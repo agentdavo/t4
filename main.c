@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
 #ifdef _MSC_VER
 #include <io.h>
 #include <fcntl.h>
@@ -46,9 +47,12 @@
 typedef intptr_t pid_t;
 #else
 #include <unistd.h>
+#include <pthread.h>
 #endif
 #include "t4debug.h"
 #include "processor.h"
+#include "cpu_state.h"
+#include "t4_fabric.h"
 #include "t9000_group.h"
 #include "netcfg.h"
 #include "display_backend.h"
@@ -89,13 +93,83 @@ extern void t4net_poll_rx(void);
 #define TRUE  0x0001
 #define FALSE 0x0000
 
+void handler (int);
+
 int verbose     = FALSE;
-int serve       = FALSE;
 int analyse     = FALSE;
+int want_threads = FALSE;
+static pthread_t t4_wth[1024];
+static cpu_t *t4_wc[1024];
+static int t4_nworkers;
+
+static void *t4_node_thread(void *arg)
+{
+        cpu_t *c = arg;
+        int tries;
+        cpu_bind(c);
+        init_processor();
+        tries = 1;
+        while (tries++ < 60 && 0 == linkcomms("boot", TRUE, LTO_BOOT))
+                ;
+        if (tries > 60) {
+                printf("-E-EMU414: Node%d failed to get bootstrap code!\n", c->cpu_nodeid);
+                t4_net_request_stop();
+                return NULL;
+        }
+        mainloop();
+        return NULL;
+}
+
+static void t4_spawn_thread_nodes(int n)
+{
+        int i;
+        pthread_attr_t attr;
+
+        if (!t4_fabric_create(n)) {
+                printf("-E-EMU414: Failed to create in-process link fabric\n");
+                handler(-1);
+        }
+        t4_idle_init(&t4_cpu0);
+        t4_fabric_set_cpu(t4_fabric, 0, &t4_cpu0);
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 1024 * 1024);
+        t4_nworkers = n - 1;
+        for (i = 1; i < n; i++) {
+                t4_wc[i] = cpu_create(i, 0);
+                if (!t4_wc[i]) {
+                        printf("-E-EMU414: Failed to allocate node %d\n", i);
+                        handler(-1);
+                }
+                t4_idle_init(t4_wc[i]);
+                t4_fabric_set_cpu(t4_fabric, i, t4_wc[i]);
+                if (pthread_create(&t4_wth[i], &attr, t4_node_thread, t4_wc[i]) != 0) {
+                        printf("-E-EMU414: Failed to start processor %d thread\n", i);
+                        handler(-1);
+                }
+                printf("-I-EMU414: Started processor %d (thread)\n", i);
+        }
+        pthread_attr_destroy(&attr);
+}
+
+static void t4_join_thread_nodes(void)
+{
+        int i;
+        t4_net_request_stop();
+        for (i = 1; i <= t4_nworkers; i++) {
+                if (t4_wth[i])
+                        pthread_join(t4_wth[i], NULL);
+                if (t4_wc[i]) {
+                        t4_idle_destroy(t4_wc[i]);
+                        cpu_destroy(t4_wc[i]);
+                        t4_wc[i] = NULL;
+                }
+        }
+        t4_idle_destroy(&t4_cpu0);
+        t4_fabric_destroy(t4_fabric);
+}
 int copy        = FALSE;
 int exitonerror = false;
 int peeksize    = 8;
-int nodeid      = -1;
 int nxputers    = 0;
 pid_t xputers[1024 + 1];
 
@@ -120,19 +194,26 @@ extern int32_t quitstatus;
 
 char CommandLineAll[256]  = "\0";
 char CommandLineMost[256] = "\0";
+
+/* Append to one of the 256-byte command-line strings above, truncating.
+ * Unbounded strcat overflowed them on a long path to t4 or a boot file,
+ * and glibc's fortified build aborts on that before main loop starts. */
+static void cmdline_cat (char *dst, const char *src)
+{
+        size_t used = strlen (dst);
+
+        if (used < sizeof CommandLineAll - 1)
+                strncat (dst, src, sizeof CommandLineAll - 1 - used);
+}
+
 char NetConfigName[256] = "\0";
 char ProfileName[256] = "\0";
 
 FILE *CopyIn;
 FILE *InpFile, *OutFile;
 
-extern u_char *core;
-extern u_char *mem;
-extern u_char *CLineTags;
-extern uint32_t IPtr, WPtr;
 extern int t4_sd_boot_enabled (void);
-extern uint32_t AReg, BReg, CReg;
-extern uint32_t ProcPriority;
+void handler (int);
 
 /* Profile flag. */
 int profiling = false;
@@ -245,6 +326,9 @@ void main(void)
 int main (int argc, char **argv)
 #endif
 {
+	cpu_bind(&t4_cpu0);
+	t4_cpu0.cpu_nodeid = -1;
+	t4_cpu0.cpu_serve = FALSE;
 	static char CopyFileName[256];
         static char InpFileName[256], OutFileName[256];
         char IBoardSize[32], SpyNet[256];
@@ -344,6 +428,7 @@ int main (int argc, char **argv)
                 printf("    -sl                  Use SHM (shared memory) links.\n");
                 printf("    -sm #bits            Memory size in address bits, 16..31 (default 21, 2Mbyte).\n");
                 printf("    -sn id               Node ID. (If id < 0, start SHM network with -id nodes).\n");
+                printf("    -st                  Threaded nodes (with -sn -N): one pthread per transputer.\n");
 #ifdef T4PROFILE
                 printf("    -su                  Instruction profiling.\n");
 #endif
@@ -392,8 +477,8 @@ int main (int argc, char **argv)
 	/* Build full command line string for server to return on request. */
 	for (arg=0;arg<argc;arg++)
 	{
-		if (arg>0) strcat(CommandLineAll, " ");
-		strcat(CommandLineAll, argv[arg]);
+		if (arg>0) cmdline_cat (CommandLineAll, " ");
+		cmdline_cat (CommandLineAll, argv[arg]);
 	}
 #ifdef EMUDEBUG
         if (emudebug)
@@ -408,8 +493,8 @@ int main (int argc, char **argv)
 			{
 				case '4': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else
                                           {
@@ -429,8 +514,8 @@ int main (int argc, char **argv)
 					  }
 					  else if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else
                                           {
@@ -442,15 +527,15 @@ int main (int argc, char **argv)
 					  break;
 				case 'a': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else analyse=TRUE;
 					  break;
 				case 'b': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else
 					  {
@@ -463,14 +548,15 @@ int main (int argc, char **argv)
 						strcpy (CopyFileName, argv[arg]);
 						reset=TRUE;
 						serve=TRUE;
-						verbose=TRUE;
+						if (!want_threads)
+							verbose=TRUE;
 						copy=TRUE;
 					  }
 					  break;
 				case 'c': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else
 					  {
@@ -486,38 +572,45 @@ int main (int argc, char **argv)
 					  break;
 				case 'e': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else exitonerror=true;
 					  break;
 #ifndef NDEBUG
 				case 'g': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else memnotinit=true;
 					  break;
 #endif
 				case 'i': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else verbose=TRUE;
 					  break;
 				case 'l': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else shlinks=TRUE;
 					  break;
+				case 't': if (argv[arg][3]!='\0')
+					  {
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
+					  }
+					  else want_threads=TRUE;
+					  break;
 				case 'm': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
                                           else
                                           {
@@ -541,8 +634,8 @@ int main (int argc, char **argv)
 					  break;
 				case 'n': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
                                           else
                                           {
@@ -567,7 +660,8 @@ int main (int argc, char **argv)
 							        handler (-1);
                                                         }
                                                         nodeid = 0;
-                                                        shlinks = TRUE;
+                                                        if (!want_threads)
+                                                                shlinks = TRUE;
                                                 }
 						if ((nodeid < 0) || (nodeid > 1024))
 						{
@@ -578,15 +672,15 @@ int main (int argc, char **argv)
 					  break;
 				case 'r': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else reset=TRUE;
 					  break;
 				case 'p': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else
 					  {
@@ -610,24 +704,24 @@ int main (int argc, char **argv)
 					  break;
 				case 's': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else serve=TRUE;
 					  break;
 #ifdef T4PROFILE
 				case 'u': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else profiling=true;
 					  break;
 #endif
                                 case 'v': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else
 					  {
@@ -650,8 +744,8 @@ int main (int argc, char **argv)
 #ifdef EMUDEBUG
 				case 'w': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else
 					  {
@@ -666,8 +760,8 @@ int main (int argc, char **argv)
 					  break;
 				case 'x': if (argv[arg][3]!='\0')
 					  {
-						strcat (CommandLineMost, argv[arg]);
-						strcat (CommandLineMost, " ");
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
 					  }
 					  else
 					  {
@@ -690,27 +784,19 @@ int main (int argc, char **argv)
 					  }
 					  break;
 #endif
-				default : strcat(CommandLineMost, argv[arg]);
-					  strcat (CommandLineMost, " ");
+				default : cmdline_cat (CommandLineMost, argv[arg]);
+					  cmdline_cat (CommandLineMost, " ");
 					  break;
 			}
 		}
 		else
 		{
-			strcat(CommandLineMost, argv[arg]);
-			strcat (CommandLineMost, " ");
+			cmdline_cat (CommandLineMost, argv[arg]);
+			cmdline_cat (CommandLineMost, " ");
 		}
 	}
 	if (strlen(CommandLineMost))
 		CommandLineMost[strlen(CommandLineMost)-1] = '\0';
-
-        /* Allocate internal memory. */
-	core = calloc (1, CoreSize);
-	if (core == NULL)
-	{
-		printf ("\nFailed to allocate internal memory!\n");
-		exit (-1);
-	}
 
         /* Recalculate external memory settings, when membits set. */
         if (membits)
@@ -718,16 +804,12 @@ int main (int argc, char **argv)
                 MemSize     = 1U << membits;
                 MemByteMask = MemSize - 1;
                 MemWordMask = MemByteMask & (~3U);
-                /* Keep the display windows out of the RAM range if it is
-                 * large enough to swallow them. */
                 t4_relocate_mmio_for_ram (MemSize);
         }
 
-        /* Set IBOARDSIZE to MemSize. */
         sprintf (IBoardSize, "IBOARDSIZE=#%X", MemSize);
         putenv (IBoardSize);
 
-        /* Allocate external memory. */
 	{
 		const char *e = getenv ("T4_T9000");
 		if (e && *e && *e != '0') {
@@ -737,17 +819,10 @@ int main (int argc, char **argv)
 			        "(estimate; see transputer/t4/t9000_group.h)\n");
 		}
 	}
-	mem = calloc (1, MemSize);
-	if (mem == NULL)
-	{
-		printf ("\nFailed to allocate %dK of external memory!\n", MemSize / 1024);
-		exit (-1);
-	}
         CLineTagsSize = ((MemSize >> T4CLINEBITS) >> 3);
-	CLineTags = calloc (1, CLineTagsSize);
-	if (CLineTags == NULL)
+	if (cpu_setup_ram(&t4_cpu0) < 0)
 	{
-		printf ("\nFailed to allocate %dK of cached memory!\n", CLineTagsSize / 1024);
+		printf ("\nFailed to allocate emulator memory!\n");
 		exit (-1);
 	}
 
@@ -813,6 +888,24 @@ int main (int argc, char **argv)
 
                 if (nxputers)
                 {
+                        char *te = getenv("T4_THREADS");
+                        if (te && *te && *te != '0')
+                                want_threads = TRUE;
+                        if (want_threads && shlinks) {
+                                printf ("-E-EMU414: -st cannot be combined with -sl\n");
+                                handler (-1);
+                        }
+#if !defined(__linux__) && !defined(__APPLE__)
+                        if (want_threads) {
+                                printf ("-E-EMU414: -st is not supported on this OS\n");
+                                handler (-1);
+                        }
+#endif
+                        sprintf (SpyNet, "SPYNET=%s", NetConfigName);
+                        putenv (SpyNet);
+                        if (want_threads)
+                                t4_spawn_thread_nodes (nxputers);
+                        else {
                         char *cmdargs[8];
                         char snid[8];
                         int  i;
@@ -820,8 +913,6 @@ int main (int argc, char **argv)
                         for (i = 1; i < 1025; i++)
                                 xputers[i] = -1;
 
-                        sprintf (SpyNet, "SPYNET=%s", NetConfigName);
-                        putenv (SpyNet);
                         for (i = 1; i < nxputers; i++)
                         {
                                 sprintf (snid, "%d", i);
@@ -843,6 +934,7 @@ int main (int argc, char **argv)
                         }
                         if (nxputers > 2)
                                 sleep (1);
+                        }
                 }
         }
 
@@ -1043,6 +1135,8 @@ int main (int argc, char **argv)
 
 	/* Now start the emulator. */
 	mainloop ();
+        if (want_threads)
+                t4_join_thread_nodes();
 
 #if __profile__
 	/* METROWERKS PROFILER. */
@@ -1121,7 +1215,45 @@ int main (int argc, char **argv)
 
 void mmio_early_printk_report(void);
 
+/* Deferred-exit flag.  See the note in handler(). */
+volatile sig_atomic_t t4_sig_pending = 0;
+
+/* SIGINT/SIGTERM.
+ *
+ * This used to do all of its reporting - t9k_report(), fprintf(), fflush(),
+ * then exit() - directly in the handler.  None of those are async-signal-safe,
+ * and the emulator writes UART output through stdio continuously, so a signal
+ * arriving while the main loop held the stdio lock deadlocked the handler on
+ * the lock it was already holding.  The process then ignored SIGTERM forever:
+ * `timeout 8s t4 ...` left emulators alive for hours, which silently stalled
+ * the UART test runner and starved every other job on the machine.
+ *
+ * Now the handler only records the signal - the one thing that is safe - and
+ * the interpreter loop performs the report and exits at its next instruction
+ * boundary.  A second signal escalates to _exit(), which is async-signal-safe,
+ * so an emulator wedged outside the loop can still be killed.
+ *
+ * timeout(1) delivers one kill twice, back to back: to the child and to its
+ * process group.  Escalating on that duplicate lost the final report
+ * (FINAL_STATE, T4_WATCH) on most timed-out runs, so a second signal only
+ * escalates once the loop has had a couple of seconds to service the first.
+ * time() is async-signal-safe. */
+static time_t t4_sig_first;
+
 void handler (int signal)
+{
+	time_t now = time (NULL);
+
+	if (t4_sig_pending) {
+		if (now - t4_sig_first >= 2)
+			_exit (-1);
+		return;
+	}
+	t4_sig_first = now;
+	t4_sig_pending = signal;
+}
+
+void t4_signal_exit (int signal)
 {
 #ifdef __MWERKS__
 	DialogPtr dialog;

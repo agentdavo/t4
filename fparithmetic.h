@@ -1,3 +1,5 @@
+#ifndef T4_FPARITHMETIC_H
+#define T4_FPARITHMETIC_H
 /*
  * fparithmetic.h
  *
@@ -144,4 +146,6 @@ void       fp_chki64sn (fpreal32_t);
 fpreal32_t fp_rtoi32sn (fpreal32_t);
 uint32_t   fp_stnli32sn (fpreal32_t);
 fpreal32_t fp_i32tor32 (uint32_t);
+
+#endif /* T4_FPARITHMETIC_H */
 

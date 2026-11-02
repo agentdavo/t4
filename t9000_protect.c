@@ -9,13 +9,27 @@
 #include <string.h>
 
 /* CPU regs live in p.c */
-extern uint32_t IPtr, WPtr, AReg, BReg, CReg, OReg, XReg, EReg;
-extern uint32_t WdescReg;
+#include "cpu_state.h"
 extern uint32_t word_int(uint32_t);
 extern void writeword_int(uint32_t, uint32_t);
 extern void UpdateWdescReg(uint32_t);
 
 t9k_protect_state_t t9k_prot;
+
+/* Recompute t9k_prot.active after enabled, is_p or region[] change.  With
+ * it clear every memory access skips t9k_translate(), which in L-mode with
+ * no usable region would hand the address back unchanged anyway. */
+static void t9k_update_active(void)
+{
+	int i, live = 0;
+
+	for (i = 0; i < 4; i++) {
+		uint32_t d = t9k_prot.region[i];
+		if (d != T9K_NULL_REGION && d != 0u)
+			live = 1;
+	}
+	t9k_prot.active = t9k_prot.enabled && (t9k_prot.is_p || live);
+}
 
 void t9k_protect_init(void)
 {
@@ -29,6 +43,7 @@ void t9k_protect_init(void)
 		t9k_prot.enabled = 0;
 	else
 		t9k_prot.enabled = 1;
+	t9k_update_active();
 	e = getenv("T4_PROTECT_DEBUG");
 	t9k_prot.debug = (e && *e && e[0] != '0');
 	if (t9k_prot.debug)
@@ -262,6 +277,51 @@ int t9k_is_privileged_op(uint32_t oreg)
 	case 0x51: /* taltwt */
 	case 0x54: /* sttimer */
 	case T9K_OP_GOPROT: /* goprot itself is privileged */
+	/* the rest of ISM 9.2: channels, VCP, configuration, scheduling */
+	case 0x12: /* resetch */
+	case 0x2A: /* testpranal */
+	case 0x7E: /* ldmemstartval */
+	case 0xB0: /* settimeslice */
+	case 0xBC: /* insphdr */
+	case 0xBD: /* readbfr */
+	case 0xBE: /* ldconf */
+	case 0xBF: /* stconf */
+	case 0xC0: /* ldcnt */
+	case 0xC2: /* ldth */
+	case 0xC3: /* ldchstatus */
+	case 0xC4: /* intdis */
+	case 0xC5: /* intenb */
+	case 0xC9: /* chantype */
+	case 0xFFFFFFFDu: /* stshadow */
+	case 0xFFFFFFFCu: /* ldshadow */
+	case 0xFFFFFFFBu: /* tret */
+	case 0xFFFFFFF9u: /* selth */
+	case 0xFFFFFFF5u: /* wait */
+	case 0xFFFFFFF4u: /* signal */
+	case 0xFFFFFFF2u: /* insertqueue */
+	case 0xFFFFFFF1u: /* swaptimer */
+	case 0xFFFFFFF0u: /* swapqueue */
+	case 0xFFFFFFEEu: /* stopch */
+	case 0xFFFFFFEDu: /* vout */
+	case 0xFFFFFFECu: /* vin */
+	case 0xFFFFFFE9u: /* swapbfr */
+	case 0xFFFFFFE8u: /* sethdr */
+	case 0xFFFFFFE7u: /* setchmode */
+	case 0xFFFFFFE6u: /* initvlcb */
+	case 0xFFFFFFE5u: /* writehdr */
+	case 0xFFFFFFE4u: /* readhdr */
+	case 0xFFFFFFE3u: /* disg */
+	case 0xFFFFFFE2u: /* enbg */
+	case 0xFFFFFFE1u: /* grant */
+	case 0xFFFFFFDEu: /* restart */
+	case 0xFFFFFFDDu: /* unmkrc */
+	case 0xFFFFFFDCu: /* mkrc */
+	case 0xFFFFFFDBu: /* irdsq */
+	case 0xFFFFFFDAu: /* erdsq */
+	case 0xFFFFFFD9u: /* stresptr */
+	case 0xFFFFFFD8u: /* ldresptr */
+	case 0xFFFFFFD3u: /* icl */
+	case 0xFFFFFFD2u: /* fdcl */
 		return 1;
 	default:
 		return 0;
@@ -287,10 +347,44 @@ void t9k_check_priv_op(uint32_t oreg)
 	}
 }
 
+/*
+ * ISM §10.3 / §10.5: a P-process trap resumes the supervisor with Areg =
+ * trap reason (Table 10.5) and Breg = error type (Table 10.10); Creg is
+ * undefined.  Map the T4 cause codes onto that pair.
+ */
+static void t9k_ism_reason(uint32_t cause, uint32_t *reason, uint32_t *etype)
+{
+	*etype = 0x00;				/* et.NoError */
+	switch (cause) {
+	case T9K_TRAP_SYSCALL:
+		*reason = 0x08;			/* t.Scall */
+		break;
+	case T9K_TRAP_TIMESLICE:
+		*reason = 0x06;			/* t.Time */
+		break;
+	case T9K_TRAP_BREAKPOINT:
+		*reason = 0x02;			/* t.Break */
+		break;
+	case T9K_TRAP_ACCESS:
+		*reason = 0x00;			/* t.Error */
+		*etype = 0x04;			/* et.AccessViolation */
+		break;
+	case T9K_TRAP_PRIV:
+		*reason = 0x00;			/* t.Error */
+		*etype = 0x01;			/* et.PrivInstruction */
+		break;
+	default:
+		*reason = 0x00;			/* t.Error */
+		*etype = 0x05;			/* et.IntegerError */
+		break;
+	}
+}
+
 void t9k_p_trap(uint32_t cause, uint32_t fault_la)
 {
 	uint32_t pds = t9k_prot.pstate_reg;
 	uint32_t stub = t9k_prot.wdesc_stub;
+	uint32_t reason, etype;
 
 	if (!t9k_prot.is_p) {
 		fprintf(stderr, "[T9K-PROT] trap while not in P (cause=%u)\n", cause);
@@ -318,6 +412,7 @@ void t9k_p_trap(uint32_t cause, uint32_t fault_la)
 
 	/* Restore supervisor L-process */
 	t9k_prot.is_p = 0;
+	t9k_update_active();
 	if (stub && stub != NotProcess_p) {
 		UpdateWdescReg(stub);
 		/* IPtr after goprot was stashed */
@@ -326,10 +421,16 @@ void t9k_p_trap(uint32_t cause, uint32_t fault_la)
 		IPtr = t9k_prot.supervisor_iptr;
 	}
 
+	/* PDS.cntl low 16 above keeps the T4 cause for kernels built to read
+	 * it there; ISM supervisors read the reason from the registers. */
+	t9k_ism_reason(cause, &reason, &etype);
+	AReg = reason;
+	BReg = etype;
+
 	if (t9k_prot.debug)
 		fprintf(stderr,
-			"[T9K-PROT] P-trap cause=%u la=0x%08X -> L IPtr=0x%08X WPtr=0x%08X\n",
-			cause, fault_la, IPtr, WPtr);
+			"[T9K-PROT] P-trap cause=%u la=0x%08X -> L IPtr=0x%08X WPtr=0x%08X A=0x%02X B=0x%02X\n",
+			cause, fault_la, IPtr, WPtr, reason, etype);
 
 	if (t9k_prot.jmp_valid)
 		longjmp(t9k_prot.jmp_env, 1);
@@ -346,6 +447,7 @@ void t9k_leave_p(void)
 	 */
 	if (t9k_prot.is_p) {
 		t9k_prot.is_p = 0;
+		t9k_update_active();
 		if (t9k_prot.debug)
 			fprintf(stderr,
 				"[T9K-PROT] leave_p IPtr=0x%08X WPtr=0x%08X traps=%u\n",
@@ -361,10 +463,27 @@ void t9k_load_rods(const uint32_t rods[4])
 		return;
 	for (i = 0; i < 4; i++)
 		t9k_prot.region[i] = rods[i];
+	t9k_update_active();
 	if (t9k_prot.debug)
 		fprintf(stderr,
 			"[T9K-PROT] load_rods R0=%08X R1=%08X R2=%08X R3=%08X is_p=%d\n",
 			rods[0], rods[1], rods[2], rods[3], t9k_prot.is_p);
+}
+
+void t9k_resume_p(const uint32_t region[4], uint32_t pstate,
+		  uint32_t wdesc_stub, uint32_t supervisor_iptr)
+{
+	int i;
+
+	for (i = 0; i < 4; i++)
+		t9k_prot.region[i] = region[i];
+	t9k_prot.pstate_reg = pstate;
+	t9k_prot.wdesc_stub = wdesc_stub;
+	t9k_prot.supervisor_iptr = supervisor_iptr;
+	t9k_prot.is_p = t9k_prot.enabled;
+	t9k_update_active();
+	if (t9k_prot.debug)
+		fprintf(stderr, "[T9K-PROT] resume interrupted P IPtr=0x%08X\n", IPtr);
 }
 
 void t9k_goprot(uint32_t pds_phys, uint32_t rods_phys)
@@ -407,6 +526,7 @@ void t9k_goprot(uint32_t pds_phys, uint32_t rods_phys)
 	XReg = t9k_phys_word(pds_phys + 4 * T9K_PS_SXREG);
 
 	t9k_prot.is_p = 1;
+	t9k_update_active();
 
 	if (t9k_prot.debug)
 		fprintf(stderr,

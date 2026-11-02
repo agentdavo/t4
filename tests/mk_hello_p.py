@@ -201,15 +201,24 @@ def build() -> tuple[bytes, dict]:
     s += ld_abs(addr(OFF_RODS))
     s += rev()  # A=PDS, B=RODS
     s += opr_neg(-6)  # goprot
-    # After P-trap: load PDS.cntl, store to RESULT, halt.
+    # After P-trap the ISM resume ABI gives A=t.reason, B=et.type.  Park
+    # both in the workspace first (ld_abs pushes two words), then store
+    # them to RESULT+4 and RESULT+8.
+    s += stl(0) + stl(1)
+    s += ldl(0) + ld_abs(addr(OFF_RESULT + 4))
+    s += pfix_digits(0, 0xE)  # stnl 0 → mem[RESULT+4]=reason
+    s += ldl(1) + ld_abs(addr(OFF_RESULT + 8))
+    s += pfix_digits(0, 0xE)  # stnl 0 → mem[RESULT+8]=etype
+    # Load PDS.cntl, store to RESULT, halt.
     # ld_abs PDS; ldnl 0 → A=cntl; ld_abs RESULT → A=RESULT B=cntl; stnl 0.
     s += ld_abs(addr(OFF_PDS))
     s += pfix_digits(0, 0x3)  # ldnl 0 (primary)
     s += ld_abs(addr(OFF_RESULT))
     s += pfix_digits(0, 0xE)  # stnl 0 → mem[RESULT]=cntl
-    # Spin in-place (j -1): stays in RAM so T4_WATCH on timeout works.
-    # nfix 0; j 0xF → OReg = -1.
-    s += bytes([0x60, 0x0F])
+    # Spin in-place (j -2, back onto the nfix): stays in RAM so T4_WATCH on
+    # timeout works.  nfix 0; j 0xE → OReg = -2.  (j -1 lands on the j with
+    # OReg cleared, i.e. j 15, and runs off into the P code.)
+    s += bytes([0x60, 0x0E])
 
     sup = bytes(s)
 

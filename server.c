@@ -70,6 +70,7 @@
 #include <time.h>
 #include "t4debug.h"
 #include "processor.h"
+#include "cpu_state.h"
 #include "server.h"
 
 /* Signal handler. */
@@ -1516,7 +1517,6 @@ void sp_core (void)
 	uint32_t length;
 	extern int peeksize;
 	extern int analyse;
-	extern u_char *core;
 
 	offset = ToServerBuffer[3] + (ToServerBuffer[4]<<8);
 	offset = offset + (ToServerBuffer[5]<<16) + (ToServerBuffer[6]<<24);

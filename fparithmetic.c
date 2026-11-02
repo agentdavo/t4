@@ -123,8 +123,7 @@ static fpreal64_t DRemByZero_NaN;
 static fpreal64_t DRemInvalidQuot_NaN;
 
 extern int emudebug;
-extern int FP_Error;
-extern int RoundingMode;
+#include "cpu_state.h"
 extern void fp_pushdb (fpreal64_t);
 extern void fp_pushsn (fpreal32_t);
 extern void handler (int);

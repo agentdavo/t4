@@ -14,9 +14,9 @@
 /* Timer thread state */
 typedef struct {
     /* Pointers to p.c globals — set during init */
-    _Atomic uint32_t *ClockReg;   /* ClockReg[2] in p.c */
-    _Atomic int      *timeslice;  /* timeslice in p.c */
-    _Atomic int      *Timers;     /* TimersGo flag in p.c */
+    _Atomic uint32_t *pClockReg;
+    _Atomic int      *ptimeslice;
+    _Atomic int      *pTimers;
     int                TimersGo_val; /* Value that means "timers running" */
 
     /* Thread control */

@@ -16,10 +16,10 @@ char* Secondaries[] = {
 /*18*/  "STHF",         "NORM",            "LDIV",         "LDPI",
 /*1C*/  "STLF",         "XDBLE",           "LDPRI",        "REM",
 
-/*20*/ "RET",           "LEND",            "LDTIMER",      "--23--",
-/*24*/ "TESTLDE",       "TESTLDD",         "--26--",       "TESTSTE",
+/*20*/ "RET",           "LEND",            "LDTIMER",      "TESTLDS",
+/*24*/ "TESTLDE",       "TESTLDD",         "TESTSTS",      "TESTSTE",
 /*28*/ "TESTSTD",       "TESTERR",         "TESTPRANAL",   "TIN",
-/*2C*/ "DIV",           "--2D--",          "DIST",         "DISC",
+/*2C*/ "DIV",           "TESTHARDCHAN",    "DIST",         "DISC",
 
 /*30*/ "DISS",          "LMUL",            "NOT",          "XOR",
 /*34*/ "BCNT",          "LSHR",            "LSHL",         "LSUM",
@@ -43,7 +43,7 @@ char* Secondaries[] = {
 
 /*70*/ "--70--",        "LDINF",           "FMUL",         "CFLERR",
 /*74*/ "CRCWORD",       "CRCBYTE",         "BITCNT",       "BITREVWORD",
-/*78*/ "BITREVNBITS",   "--79--",          "--7A--",       "--7B--",
+/*78*/ "BITREVNBITS",   "POP",         "--7A--",       "--7B--",
 /*7C*/ "--7C--",        "--7D--",          "--7E--",       "--7F--",
 
 /*80*/ "FPSTTEST",      "WSUBDB",          "FPLDNLDBI",    "FPCHKERR",
@@ -108,7 +108,8 @@ char* TvxOps[] = {
 /*1E8*/ "FSINCOSB",    "VSETSTRIDE", "FTCULL",     "TSKIN",
 /*1EC*/ "VSETFMT",     "FTSETLIT",   "FLITB",      "QGEMM",
 /*1F0*/ "VBLEND8",     "VFILL",      "VFILL2D",    "CSUM",
-/*1F4*/ "VBLEND2D",    "STVXSTATE",  "CSUMCPY"
+/*1F4*/ "VBLEND2D",    "STVXSTATE",  "CSUMCPY",    "VQ8K",
+/*1F8*/ "VQ80",        "VCVT"
 };
 #define MIN_TVX 0x1c0
-#define MAX_TVX 0x1f6
+#define MAX_TVX 0x1f9

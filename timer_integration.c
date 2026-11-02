@@ -6,6 +6,7 @@
  * without the main loop needing to call update_time().
  */
 #include "timer_integration.h"
+#include "t4_fabric.h"
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
@@ -34,24 +35,41 @@ static int timer_thread_fn(void *arg)
 
         if (elapsed_us <= 0) continue;
 
-        /* Only update if timers are running */
-        if (tb->Timers && *tb->Timers == tb->TimersGo_val) {
-            /* High-priority: 1μs resolution */
-            tb->ClockReg[0] += (uint32_t)elapsed_us;
-
-            /* Low-priority: 64μs resolution */
-            lo_accum += (int)elapsed_us;
-            if (lo_accum >= 64) {
-                tb->ClockReg[1] += (uint32_t)(lo_accum / 64);
-                lo_accum &= 63;
+        /* Only update ClockReg if timers are running; timeslice always. */
+        {
+            int n = 0, i;
+            cpu_t *nodes[1];
+            cpu_t **list = nodes;
+            nodes[0] = NULL;
+            if (t4_fabric && t4_fabric->cpus) {
+                list = t4_fabric->cpus;
+                n = t4_fabric->nnodes;
+            } else if (tb->pClockReg) {
+                if (tb->pTimers && *tb->pTimers == tb->TimersGo_val) {
+                    tb->pClockReg[0] += (uint32_t)elapsed_us;
+                    lo_accum += (int)elapsed_us;
+                    if (lo_accum >= 64) {
+                        tb->pClockReg[1] += (uint32_t)(lo_accum / 64);
+                        lo_accum &= 63;
+                    }
+                }
+                ts_accum += (int)elapsed_us;
+                if (ts_accum >= 1024 && tb->ptimeslice) {
+                    *tb->ptimeslice += ts_accum / 1024;
+                    ts_accum &= 1023;
+                }
+                n = 0;
             }
-        }
-
-        /* Timeslice counter: increment every ~1024μs */
-        ts_accum += (int)elapsed_us;
-        if (ts_accum >= 1024) {
-            *tb->timeslice += ts_accum / 1024;
-            ts_accum &= 1023;
+            for (i = 0; i < n; i++) {
+                cpu_t *c = list[i];
+                if (!c)
+                    continue;
+                if (c->s_Timers == tb->TimersGo_val) {
+                    c->s_ClockReg[0] += (uint32_t)elapsed_us;
+                    c->s_ClockReg[1] += (uint32_t)(elapsed_us / 64);
+                }
+                c->s_timeslice += (int)(elapsed_us / 1024);
+            }
         }
     }
 

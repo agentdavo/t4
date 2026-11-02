@@ -39,6 +39,14 @@
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
+
+/* For the few helpers on every instruction's path.  mainloop() is far past
+ * GCC's inlining growth limits, so plain `inline` no longer gets them in. */
+#ifdef _MSC_VER
+#define HOT_INLINE      __forceinline
+#else
+#define HOT_INLINE      inline __attribute__((always_inline))
+#endif
 #include "t4debug.h"
 
 /*
@@ -61,6 +69,9 @@
 #if defined(__linux__)
 #include <sched.h>
 #endif
+#ifndef _MSC_VER
+#include <pthread.h>
+#endif
 #endif
 #include "timer_integration.h"
 #include "debug.h"
@@ -75,26 +86,6 @@ static int dcache_enabled = 0; /* set via T4_DCACHE=1 */
 #ifndef EMUDEBUG
 static int fast_primary_enabled = -1;
 static int fast_block_enabled = -1;
-
-#define T4_FAST_BLOCK_BITS 15
-#define T4_FAST_BLOCK_SIZE (1U << T4_FAST_BLOCK_BITS)
-#define T4_FAST_BLOCK_MASK (T4_FAST_BLOCK_SIZE - 1U)
-/* P3: larger basic-block cache for straight-line primary ops */
-#define T4_FAST_BLOCK_MAX_INSNS 32
-
-typedef struct t4_fast_op {
-        u_char op;
-        u_char imm;
-} t4_fast_op_t;
-
-typedef struct t4_fast_block {
-        uint32_t tag;
-        u_char len;
-        u_char bytes[T4_FAST_BLOCK_MAX_INSNS];
-        t4_fast_op_t ops[T4_FAST_BLOCK_MAX_INSNS];
-} t4_fast_block_t;
-
-static t4_fast_block_t fast_blocks[T4_FAST_BLOCK_SIZE];
 
 static INLINE int t4_fast_block_op(uint32_t op)
 {
@@ -167,16 +158,20 @@ int shlink_free (void){return EINVAL;}
 #endif
 
 #include "processor.h"
+#include "cpu_state.h"
+#include "t4_fabric.h"
 #include "display_backend.h"
 #include "arithmetic.h"
 #include "server.h"
 #include "opcodes.h"
 #include "tvx.h"
 #include "tvx_vec.h"
+#include "tvx_q8k.h"
 #include "tvx_gfx.h"
 #include "t9000_group.h"
 #include "t9000_protect.h"
 #include "t9000_pmi.h"
+#include "t9000_vcp.h"
 #ifdef __MWERKS__
 #include "mac_input.h"
 #endif
@@ -191,11 +186,9 @@ int Txxx = 414;
 uint32_t MemStart    = 0x80000048;
 
 /* Memory space. */
-u_char *core;
 uint32_t CoreSize    = 2 * 1024;
 uint32_t ExtMemStart = 0x80000800;
 
-u_char   *mem;
 uint32_t MemSize     = 1 << 21;
 /* Upper bound of the plain-RAM fast path.  Distinct from the framebuffer
  * base: once the display windows move below MemStart, RAM runs all the way
@@ -1566,75 +1559,57 @@ void vga_update(void)
 
 uint32_t word_int (uint32_t);
 
-/* Registers. */
-uint32_t IPtr;
-uint32_t WPtr;
-uint32_t AReg;
-uint32_t BReg;
-uint32_t CReg;
-uint32_t OReg;
-
-uint32_t XReg;
-
-uint32_t WdescReg;
-
-uint32_t DReg;                  /* undocumented DReg/EReg */
-uint32_t EReg;
-
-#define FP_UNKNOWN       0
-#define FP_REAL32       32
-#define FP_REAL64       64
-
-typedef struct _REAL {
-        uint32_t length;        /* FP_REAL32 or FP_REAL64 */
-        uint32_t rsvd;
-        union {
-                fpreal32_t  sn;
-                fpreal64_t  db;
-        } u;
-} REAL;
-
 #define SN(reg)   (reg.u.sn)
 #define DB(reg)   (reg.u.db)
 
-REAL  FAReg;
-REAL  FBReg;
-REAL  FCReg;
-REAL  FARegSave;
-REAL  FBRegSave;
-REAL  FCRegSave;
-int   FP_Error;                 /* not preserved over descheduling */
-int   RoundingMode;             /* current rounding mode */
-int   ResetRounding;            /* reset rounding mode ? */
+#define Instruction   (t4cpu->s_Instruction)
+#define Icode         (t4cpu->s_Icode)
+#define Idata         (t4cpu->s_Idata)
+#define loop          (t4cpu->s_loop)
+#define count1        (t4cpu->s_count1)
+#define count2        (t4cpu->s_count2)
+#define count3        (t4cpu->s_count3)
 
-uint32_t vec_len;               /* TVX vector length (VSETLEN) */
-uint32_t quant_fmt;             /* TVX GGUF type id (QSETFMT)  */
-tvx_viewport tvx_vp = {1.0f, 1.0f, 0.0f, 0.0f, 1.0f}; /* FTSETVP */
-uint32_t elem_stride;           /* TVX-GFX stride latch (VSETSTRIDE)  */
-uint32_t stride_mask;           /* bit0 = A stream, bit1 = B      */
-uint32_t tvx_src_fmt;           /* VSETFMT: 0=f32, 1=bf16, 2=f16  */
-tvx_light tvx_lit = {{0.0f, 0.0f, 1.0f}, 0.0f, 1.0f}; /* FTSETLIT */
+tvx_viewport tvx_vp = {1.0f, 1.0f, 0.0f, 0.0f, 1.0f};
+tvx_light tvx_lit = {{0.0f, 0.0f, 1.0f}, 0.0f, 1.0f};
+uint32_t vec_len;
+uint32_t quant_fmt;
+uint32_t elem_stride;
+uint32_t stride_mask;
+uint32_t tvx_src_fmt;
+uint32_t m2dSourceStride;
+uint32_t m2dDestStride;
+uint32_t m2dLength;
 #define TVX_STEP(bit, dense) \
         (((stride_mask & (bit)) && elem_stride) ? elem_stride : (dense))
 uint32_t m2dSourceStride;       /* move2d source stride */
 uint32_t m2dDestStride;         /* move2d destination stride */
 uint32_t m2dLength;             /* move2d length (no. of rows) */
 
-/* Other registers. */
-_Atomic uint32_t ClockReg[2];
-uint32_t TNextReg[2];
-uint32_t TPtrLoc[2];            /* XXX 0x80000024 0x80000028 */
-
-uint32_t FPtrReg[2];
-uint32_t BPtrReg[2];
-
 #define ProcessQEmpty           ((NotProcess_p == FPtrReg[0]) && (NotProcess_p == FPtrReg[1]))
 #define TimerQEmpty             ((NotProcess_p == TPtrLoc[0]) && (NotProcess_p == TPtrLoc[1]))
 
-uint32_t STATUSReg;             /* Processor flags: GotoSNPBit, HaltOnError, Error */
 
-#define ClearInterrupt          writeword (0x8000002C, IdleProcess_p)
-#define ReadInterrupt           (word (0x8000002C) != IdleProcess_p)
+
+/* The interrupted low-priority process lives in the T9000 shadow registers
+ * (ISM 13.3).  interrupt() also mirrors it into the T800 save area at
+ * #8000002C.. for T800 code, until the T9000 channel space is used: those
+ * words are event channel words there. */
+#define ClearInterrupt          (t4cpu->s_sh.wdesc = NotProcess_p)
+#define ReadInterrupt           (NotProcess_p != GetDescWPtr(t4cpu->s_sh.wdesc))
+static void shadow_save (void);
+static void shadow_resume (void);
+static void shadow_transfer (uint32_t from, uint32_t to, uint32_t ptr, int store);
+
+/* T9000 StatusReg bits (ISM table 5.5) that T4 models.  Bit 28 is unused by
+ * the T9000 and carries T4's HaltOnError, which it has no equivalent of. */
+#define SB_FPERROR      (1u << 2)
+#define SB_INTOV        (1u << 6)
+#define SB_TSDIS        (1u << 25)
+#define SB_ISP          (1u << 27)
+#define SB_T4HALT       (1u << 28)
+static uint32_t t9k_status_pack (uint32_t raw, int fp_error, int tsdis, int is_p);
+static uint32_t t9k_status_raw (uint32_t sb);
 
 #define GotoSNPBit              0x00000001
 #define HaltOnErrorFlag         0x00000080
@@ -1673,10 +1648,14 @@ uint32_t STATUSReg;             /* Processor flags: GotoSNPBit, HaltOnError, Err
 #define BytesRead(addr,len)     (WordsRead(addr,len)*BytesPerWord)
 
 #ifdef NDEBUG
-#define writeword(a,x)  writeword_int(a,x)
-#define writebyte(a,x)  writebyte_int(a,x)
-#define byte(a)         byte_int(a)
-#define word(a)         word_int(a)
+static HOT_INLINE uint32_t word_fast (uint32_t ptr);
+static HOT_INLINE void     writeword_fast (uint32_t ptr, uint32_t value);
+static HOT_INLINE u_char   byte_fast (uint32_t ptr);
+static HOT_INLINE void     writebyte_fast (uint32_t ptr, u_char value);
+#define writeword(a,x)  writeword_fast(a,x)
+#define writebyte(a,x)  writebyte_fast(a,x)
+#define byte(a)         byte_fast(a)
+#define word(a)         word_fast(a)
 #endif
 
 /* TVX-GFX position fetch: component j of an xyz vertex at base, in the
@@ -1701,19 +1680,142 @@ static float tvx_fetch_pos (uint32_t base, uint32_t j)
 }
 #define TVX_POS_DENSE() (tvx_src_fmt ? 6u : 12u)
 
+/* QDOT and QGEMM also take unquantised weights - F32 (ggml type 0), F16 (1)
+ * and BF16 (30) - in blocks of 32 elements, so a router or a small float
+ * projection needs no instruction of its own.  Everything else is a GGUF
+ * block format. */
+static int tvx_qfmt_block_bytes (int fmt)
+{
+        switch (fmt) {
+        case 0:  return 32 * 4;
+        case 1:
+        case 30: return 32 * 2;
+        default: return tvx_gguf_block_bytes (fmt);
+        }
+}
+
+static int tvx_qfmt_decode_block (int fmt, const uint8_t *raw, float *out)
+{
+        int i;
+
+        switch (fmt) {
+        case 0:
+                for (i = 0; i < 32; i++)
+                        out[i] = tvx_bits_to_float ((uint32_t)raw[4*i]
+                                 | (uint32_t)raw[4*i + 1] << 8
+                                 | (uint32_t)raw[4*i + 2] << 16
+                                 | (uint32_t)raw[4*i + 3] << 24);
+                return 32;
+        case 1:
+        case 30:
+                for (i = 0; i < 32; i++) {
+                        uint32_t h = (uint32_t)raw[2*i]
+                                   | (uint32_t)raw[2*i + 1] << 8;
+                        out[i] = tvx_bits_to_float (fmt == 1
+                                 ? tvx_f16_to_f32 (h) : tvx_bf16_to_f32 (h));
+                }
+                return 32;
+        default:
+                return tvx_gguf_decode_block (fmt, raw, out);
+        }
+}
+
+/* VSETFMT 3: QGEMM activations are already quantised, in the format llama.cpp
+ * pairs the QSETFMT weights with - block_q8_K (VQ8K) for the K- and i-quants,
+ * block_q8_0 (VQ80) for q4_0, q5_0, q8_0, iq4_nl and mxfp4. */
+#define TVX_FMT_QACT 3u
+
+/* VQ8K / VQ80: quantise VSETLEN activations (f32, bf16 or f16 per VSETFMT)
+ * with llama.cpp's quantize_row_q8_K_ref (256 per block) or
+ * quantize_row_q8_0_ref (32 per block).  A trailing partial block is
+ * ignored, as VHAD32 ignores a partial group. */
+static void tvx_vqact (uint32_t dst, uint32_t src, int act)
+{
+        static float *x;
+        static uint8_t *y;
+        static size_t xcap, ycap;
+        uint32_t qk = act == TVX_GGML_Q8_K ? QK_K : QK8_0;
+        size_t bb = act == TVX_GGML_Q8_K ? sizeof (block_q8_K)
+                                         : sizeof (block_q8_0);
+        uint32_t nb = vec_len / qk, n = nb * qk, i;
+
+        if (nb == 0)
+                return;
+        if (n > xcap) {
+                float *p = realloc (x, (size_t)n * sizeof *x);
+                if (!p)
+                        return;
+                x = p;
+                xcap = n;
+        }
+        if (nb * bb > ycap) {
+                uint8_t *p = realloc (y, nb * bb);
+                if (!p)
+                        return;
+                y = p;
+                ycap = nb * bb;
+        }
+        for (i = 0; i < n; i++)
+                x[i] = tvx_fetch_pos (src, i);
+        memset (y, 0, nb * bb);         /* bsums of an all-zero Q8_K block */
+        if (act == TVX_GGML_Q8_K)
+                tvx_quantize_row_q8_K (x, (block_q8_K *)y, n);
+        else
+                tvx_quantize_row_q8_0 (x, (block_q8_0 *)y, n);
+        for (i = 0; i < nb * (uint32_t)bb; i++)
+                writebyte_int (dst + i, y[i]);
+}
+
+/* QGEMM with quantised activations: each row is llama.cpp's generic integer
+ * dot (tvx_q8k.h) of nblk weight blocks against the same nblk activation
+ * blocks, so the activations are read once for every row.  Returns the
+ * number of rows written - 0 when the QSETFMT format has no integer kernel
+ * (q4_1 and q5_1, whose partner is Q8_1, and the float formats). */
+static uint32_t tvx_qgemm_int (uint32_t dst, uint32_t aptr, uint32_t wptr,
+                               uint32_t nblk)
+{
+        static uint8_t *wbuf, *abuf;
+        static size_t wcap, acap;
+        int act = tvx_qint_act_type ((int)quant_fmt);
+        size_t bsz = (size_t)tvx_gguf_block_bytes ((int)quant_fmt);
+        size_t ab = act == TVX_GGML_Q8_K ? sizeof (block_q8_K)
+                                         : sizeof (block_q8_0);
+        uint32_t ne = act == TVX_GGML_Q8_K ? QK_K : QK8_0;
+        size_t wn = nblk * bsz, an = nblk * ab, i;
+        uint32_t r;
+        fpreal32_t out;
+
+        if (act == 0 || bsz == 0 || nblk == 0)
+                return 0;
+        if (wn > wcap) {
+                uint8_t *p = realloc (wbuf, wn);
+                if (!p)
+                        return 0;
+                wbuf = p;
+                wcap = wn;
+        }
+        if (an > acap) {
+                uint8_t *p = realloc (abuf, an);
+                if (!p)
+                        return 0;
+                abuf = p;
+                acap = an;
+        }
+        for (i = 0; i < an; i++)
+                abuf[i] = byte (aptr + i);
+        for (r = 0; r < vec_len; r++) {
+                uint32_t rp = wptr + r * (uint32_t)wn;
+
+                for (i = 0; i < wn; i++)
+                        wbuf[i] = byte (rp + i);
+                tvx_qint_vec_dot ((int)quant_fmt, (int)(nblk * ne), &out.fp,
+                                  wbuf, abuf);
+                writereal32 (dst + 4 * r, out);
+        }
+        return vec_len;
+}
+
 /* Internal variables. */
-u_char Instruction;
-u_char Icode;
-u_char Idata;
-_Atomic int Timers;
-int  TimerEnableHi = 1;
-int  TimerEnableLo = 1;
-uint32_t t4_overflow;
-uint32_t t4_carry;
-uint32_t t4_normlen;
-uint32_t t4_carry64;            /* shl64 shifted out bit */
-uint32_t ProcPriority;
-volatile uint64_t heartbeat_counter = 0;
 
 static int noisy_boot_trace_enabled(void)
 {
@@ -1773,29 +1875,13 @@ static int runtime_diagnostics_requested(void)
 	}
 	return 0;
 }
-int EnableJ0BreakFlag = 0;
+
 /* Product identity for LDDEVID instruction.
  * Real hardware: T414=0, T800-20=5, T805=6.
  * T806 is our custom 200MHz variant. Use ID 0x806 (distinguishable). */
 static uint32_t ProductIdentity = 0x00000000;
 #define TimersGo   1
 #define TimersStop 0
-int loop;
-int count1;
-int count2;
-int count3;
-_Atomic int timeslice;
-/* T9000 settimeslice / intdis / intenb state (ISM 13.6).  Gating is applied
- * at the D_check timeslice decision; high-priority interrupt delivery (link
- * comms) is NOT deferred - the emulated kernel does not rely on that. */
-int TimesliceDisabled = 0;
-int IntsDisabled = 0;
-/* T9000 trap-handler register (ISM 10.2).  Minimal model: selth/ldth
- * maintain the pointer; L-trap delivery itself is not modelled, so the
- * status-bit exchange between old and new THDS is omitted. */
-uint32_t ThReg = 0x80000000u;   /* NotProcess.p */
-int delayCount1 = 5;
-int speed_multiplier = 1;  /* T800=1, T806=10 (200MHz/20MHz) */
 int32_t quit = FALSE;
 int32_t quitstatus;
 
@@ -1804,6 +1890,7 @@ void handler (int);
 
 u_char *SharedLinks;
 u_char *SharedEvents;
+#define SHLINK_EXTRA        1024
 
 #define StrPrio(p)      ((p) ? "Lo" : "Hi")
 
@@ -1831,9 +1918,7 @@ static void handle_j0_break(void)
 
 /* External variables. */
 extern int analyse;
-extern int nodeid;
 extern int verbose;
-extern int serve;
 extern int exitonerror;
 extern int FromServerLen;
 extern int emudebug;
@@ -1843,57 +1928,25 @@ extern int msgdebug;
 extern int cachedebug;
 extern char NetConfigName[256];
 
-LinkIface Link[4];
-
 /* Macros. */
 #define index(a,b)		((a)+(BytesPerWord*(b)))
 
 /* Profile information. */
 uint32_t instrprof[0x400];
-/*
-        #00 - #FF       primary instr.
-        #100 - #2FF     secondary instr. OReg
-        #300 - #3FF     fpentry
-*/
 uint32_t combinedprof[0x400][0x400];
-
-typedef struct _InstrSlot {
-        uint32_t IPtr;
-        uint32_t NextIPtr;
-        uint32_t OReg;
-        u_char   Icode;
-        u_char   rsvd[1];
-        u_short  Pcode;
-#ifdef EMUDEBUG
-        u_char Instruction;
-#endif
-} InstrSlot;
-
-typedef struct _ArgSlot {
-        uint32_t _Arg0, _Arg1;
-} ArgSlot;
 
 #define Arg0            Acache[islot]._Arg0
 #define Arg1            Acache[islot]._Arg1
 
-#define IC_NOADDR       0xDEADBEEFU
-#ifndef T4CACHEBITS
-#define T4CACHEBITS     (14)
-#endif
-#define MAX_ICACHE      (1<<T4CACHEBITS)
 #define OprCombined(x,y)(((x) == 0xf0)&&((y)>0xff)&&((y)<0x17c))
-InstrSlot Icache[MAX_ICACHE+1];
-ArgSlot  Acache[MAX_ICACHE];
-
-u_char *CLineTags;
 #define CLINE_SIZE      ((uint32_t)(1 << T4CLINEBITS))
 
-static uint32_t IHASH(uint32_t a)
+static HOT_INLINE uint32_t IHASH(uint32_t a)
 {
         return a & (MAX_ICACHE-1);
 }
 
-static u_char IsCached(uint32_t a)
+static HOT_INLINE u_char IsCached(uint32_t a)
 {
         a &= MemByteMask; a >>= T4CLINEBITS;
         return CLineTags[a >> 3] & (1 << (a & 7));
@@ -1924,8 +1977,8 @@ static uint32_t InvalidateAddr (uint32_t a)
                 a &= ~(CLINE_SIZE - 1);
                 for (i = 0; i < CLINE_SIZE; a++, i++) {
                         uint32_t x = IHASH(a);
-                        if (a == Icache[x].IPtr)
-                                Icache[x].IPtr = IC_NOADDR;
+                        if (a == Icache[x].ip)
+                                Icache[x].ip = IC_NOADDR;
                 }
                 return a;
         }
@@ -1934,15 +1987,25 @@ static uint32_t InvalidateAddr (uint32_t a)
 
 static void InvalidateRange (uint32_t a, uint32_t n)
 {
-        uint32_t ha;
+        uint64_t lines;
 #ifdef T4_SDL_FB
         /* FB/MMIO memory never contains code — skip icache invalidation */
         if (a >= FB_BASE && (a + n) <= FB_LIMIT)
                 return;
 #endif
 
-        ha = a + n;
-        while (a < ha)
+        /* Count the lines the range covers rather than comparing against
+         * its end address.  With 32-bit `a + n`, a store into the top line
+         * of the address space stepped `a` round to 0, every later line
+         * start stayed below the end, and the loop - and so the instruction
+         * - never finished.  The SIGTERM check between instructions was
+         * never reached either: c-testsuite 00207's runaway Wptr kept
+         * `timeout 10 t4` alive for hours.  A range that wraps now also
+         * invalidates its wrapped part, where it used to invalidate none. */
+        if (n == 0)
+                return;
+        lines = ((uint64_t)(a & (CLINE_SIZE - 1)) + n + CLINE_SIZE - 1) >> T4CLINEBITS;
+        while (lines--)
                 a = InvalidateAddr (a);
 }
 
@@ -1952,8 +2015,8 @@ static void InvalidateRange (uint32_t a, uint32_t n)
 
 static void InvalidateSlot (uint32_t x, uint32_t a)
 {
-        if (a == Icache[x].IPtr)
-                Icache[x].IPtr = IC_NOADDR;
+        if (a == Icache[x].ip)
+                Icache[x].ip = IC_NOADDR;
 }
 
 static void InvalidateRange (uint32_t a, uint32_t n)
@@ -1975,6 +2038,98 @@ Again:  if (x + n > MAX_ICACHE)
 }
 
 #endif
+
+/* T4_WATCH_ADDR as writeword_int() last read it; 0 until then.  The inline
+ * fast paths below defer to the *_int versions unless it is known unset. */
+static uint32_t ram_watch_addr;
+
+/* On-chip core that is plain RAM: everything below ExtMemStart except the
+ * Link0 channel words, which the slow paths treat as MMIO in some
+ * configurations. */
+#define CORE_RAM_ADDR(p) \
+        ((uint32_t)((p) - MostNeg) < (uint32_t)(ExtMemStart - MostNeg) && \
+         ((p) & ~3u) != LINK0_IN && ((p) & ~3u) != LINK0_OUT)
+
+/* [a, a+n) lies wholly in the external-RAM window of the fast paths.
+ * ExtMemAddr() alone is a signed compare that also takes the positive MMIO
+ * addresses (UART, SD, virtio). */
+#define EXT_RAM_RANGE(a,n) \
+        ((uint32_t)((a) - ExtMemStart) < (uint32_t)(ram_fast_limit - ExtMemStart) && \
+         (uint32_t)(n) <= (uint32_t)(ram_fast_limit - (a)))
+
+#ifdef NDEBUG
+/* Inline fast paths for plain RAM - external memory and the on-chip core -
+ * in front of the out-of-line accessors.  Everything else (MMIO, T9000
+ * address translation, the framebuffer windows, the Link0 channel words, a
+ * T4_WATCH_ADDR watchpoint) takes the *_int slow path unchanged.  Returns
+ * the backing array for ptr, or NULL for the slow path. */
+static HOT_INLINE u_char *ram_fast_base (uint32_t ptr)
+{
+        if (unlikely((t9k_prot.active && !t9k_prot.phys_bypass) ||
+                     ram_watch_addr != 0xFFFFFFFF))
+                return NULL;
+        if (likely((uint32_t)(ptr - ExtMemStart) < (uint32_t)(ram_fast_limit - ExtMemStart))) {
+#ifdef T4_SDL_FB
+                if (unlikely(fb_addr_in_range(ptr)))
+                        return NULL;
+#endif
+                return mem;
+        }
+        if (CORE_RAM_ADDR(ptr))
+                return core;
+        return NULL;
+}
+
+static HOT_INLINE uint32_t word_fast (uint32_t ptr)
+{
+        u_char *base = ram_fast_base (ptr);
+
+        if (likely(base != NULL))
+                return *(uint32_t *)(base + (MemWordMask & ptr));
+        return word_int (ptr);
+}
+
+static HOT_INLINE void writeword_fast (uint32_t ptr, uint32_t value)
+{
+        u_char *base = ram_fast_base (ptr);
+
+        if (likely(base != NULL)) {
+                *(uint32_t *)(base + (MemWordMask & ptr)) = value;
+                /* The store is word-aligned, so it touches only ptr's
+                 * icache line; skip the call when no code is cached there. */
+                if (unlikely(IsCached (ptr)))
+                        InvalidateRange (ptr & ~3u, 4);
+                return;
+        }
+        writeword_int (ptr, value);
+}
+
+static HOT_INLINE u_char byte_fast (uint32_t ptr)
+{
+        u_char *base = ram_fast_base (ptr);
+
+        if (likely(base != NULL))
+                return base[MemByteMask & ptr];
+        return byte_int (ptr);
+}
+
+static HOT_INLINE void writebyte_fast (uint32_t ptr, u_char value)
+{
+        u_char *base = ram_fast_base (ptr);
+
+        if (likely(base != NULL)) {
+                base[MemByteMask & ptr] = value;
+                if (unlikely(IsCached (ptr)))
+                        INVALIDATE_ADDR (ptr);
+                return;
+        }
+        writebyte_int (ptr, value);
+}
+#endif
+
+#include <signal.h>
+extern volatile sig_atomic_t t4_sig_pending;
+extern void t4_signal_exit (int);
 
 #define NO_ICODE        0x400
 
@@ -2013,6 +2168,14 @@ static struct {
 #define T9K_COMBINED_BASE   0x100
 #define T9K_COMBINED_COUNT  ((int)(sizeof combined / sizeof combined[0]) - 1)
 static u_char combinations[0x400 * 0x400];
+
+static void t4_fill_combinations(void)
+{
+        int i;
+        memset(combinations, 0, sizeof(combinations));
+        for (i = 0; NO_ICODE != combined[i].code0; i++)
+                combinations[(combined[i].code0 << 10) + combined[i].code1] = (u_char)(1 + i);
+}
 
 /* Support functions. */
 
@@ -2359,8 +2522,6 @@ static void t9k_fp_load_reg (uint32_t ptr, REAL *r, int length)
 }
 
 
-struct timeval LastTOD;         /* Time-of-day */
-
 /* Update time-of-day. */
 void update_tod (struct timeval *tp)
 {
@@ -2384,30 +2545,49 @@ void update_tod (struct timeval *tp)
 #define C_BOOT  2
 
 static uint32_t BootLink = 0;
-static int CtrlByte = C_UNKNOWN;
+/*
+ * Boot-protocol state.
+ *
+ * This used to be one file-scope `CtrlByte` shared by every link channel.
+ * The state machine reads a control byte, then treats following bytes as
+ * payload until chan->Length runs out - so it only sets chan->Address =
+ * MemStart on the packet's *first* call.  With one global, a channel that
+ * entered handleboot() while the variable was still set from another
+ * channel's packet skipped that initialisation entirely and ran with
+ * chan->Address = 0: `UpdateWdescReg(0 | ProcPriority)` gave WPtr = 0, IPtr
+ * was never moved off 0, and the node wild-jumped to address 0 the moment it
+ * started executing.
+ *
+ * This was found while chasing the 16-node boot failure and is NOT its
+ * cause - that turned out to be the Link0In read shim, see word_int().
+ * It is a latent bug on its own account, so it is fixed here: the state
+ * belongs to the channel, and now lives in Channel.
+ */
+
+int channel_sendP (Channel *chan, u_char *data, int ndata, int doWait);
 
 int handleboot (Channel *chan, u_char *data, int ndata)
 {
         uint32_t address, value;
         Channel *outchan;
 
-        EMUDBG2 ("-I-EMUDBG: Handle boot, control byte = %d.\n", CtrlByte);
+        EMUDBG2 ("-I-EMUDBG: Handle boot, control byte = %d.\n", chan->CtrlByte);
 
-        if (C_UNKNOWN == CtrlByte)
+        if (C_UNKNOWN == chan->CtrlByte)
         {
-                CtrlByte = data[0];
+                chan->CtrlByte = data[0];
                 chan->Address = MemStart;
-                if (C_POKE == CtrlByte)
+                if (C_POKE == chan->CtrlByte)
                         chan->Length = 8;
-                else if (C_PEEK == CtrlByte)
+                else if (C_PEEK == chan->CtrlByte)
                         chan->Length = 4;
                 else
                 {
-                        chan->Length = CtrlByte;
-                        CtrlByte = C_BOOT;
+                        chan->Length = chan->CtrlByte;
+                        chan->CtrlByte = C_BOOT;
                         BootLink = chan->LinkAddress;
                 }
-                EMUDBG2 ("-I-EMUDBG: Control byte #%02X.\n", CtrlByte);
+                EMUDBG2 ("-I-EMUDBG: Control byte #%02X.\n", chan->CtrlByte);
                 data++; ndata--;
         }
         if (chan->Length)
@@ -2420,13 +2600,13 @@ int handleboot (Channel *chan, u_char *data, int ndata)
         }
         if (0 == chan->Length)
         {
-                switch (CtrlByte)
+                switch (chan->CtrlByte)
                 {
                         case C_POKE:
                                 address = word_int (MemStart);
                                 value   = word_int (MemStart + 4);
                                 writeword_int (address, value);
-                                CtrlByte = C_UNKNOWN;
+                                chan->CtrlByte = C_UNKNOWN;
                                 break;
                         case C_PEEK:
                                 address = word_int (MemStart);
@@ -2435,18 +2615,18 @@ int handleboot (Channel *chan, u_char *data, int ndata)
                                 data[1] = value & 255; value >>= 8;
                                 data[2] = value & 255; value >>= 8;
                                 data[3] = value & 255;
-                                outchan = &Link[chan->Link].Out;
-                                ndata = nn_send (outchan->sock, data, ndata, 0);
-                                if (4 != ndata)
+                                outchan = &Link[chan->linkno].Out;
+                                ndata = 4;
+                                if (channel_sendP (outchan, data, ndata, TRUE) != 4)
                                 {
-                                        printf ("-E-EMU414: Failed to send %d bytes on Link%dOut (%s) @ handleboot()\n", ndata, outchan->Link, nn_strerror (nn_errno ()));
+                                        printf ("-E-EMU414: Failed to send %d bytes on Link%dOut @ handleboot()\n", ndata, outchan->linkno);
                                         handler (-1);
                                 }
-                                CtrlByte = C_UNKNOWN;
+                                chan->CtrlByte = C_UNKNOWN;
                                 break;
                         case C_BOOT:
                                 UpdateWdescReg (chan->Address | ProcPriority);
-                                CtrlByte = C_UNKNOWN;
+                                chan->CtrlByte = C_UNKNOWN;
                                 return 0;
                 }
         }
@@ -2458,8 +2638,13 @@ int channel_ready (Channel *chan)
         struct nn_pollfd pfd[1];
         int ret;
 
-        EMUDBG2 ("-I-EMUDBG: ChannelReady. Link%dIn ready ?\n", chan->Link);
+        EMUDBG2 ("-I-EMUDBG: ChannelReady. Link%dIn ready ?\n", chan->linkno);
 
+        if (chan->npend)        /* left over from the last packet */
+        {
+                ret = 1;
+                goto Exit;
+        }
         if (chan->schbuf)
         {
                 ret = 0 != SCHLength(chan);
@@ -2470,18 +2655,18 @@ int channel_ready (Channel *chan)
         pfd[0].events = NN_POLLIN;
         pfd[0].revents = 0;
 
-        EMUDBG2 ("-I-EMUDBG: Polling Link%dIn.\n", chan->Link);
+        EMUDBG2 ("-I-EMUDBG: Polling Link%dIn.\n", chan->linkno);
 
         ret = nn_poll (pfd, 1, LTO_POLL);
         if (-1 == ret) /* error */
         {
-                printf ("-E-EMU414: Failed polling Link%dIn (%s)\n", chan->Link, nn_strerror (nn_errno ()));
+                printf ("-E-EMU414: Failed polling Link%dIn (%s)\n", chan->linkno, nn_strerror (nn_errno ()));
                 handler (-1);
         }
 Exit:
         if (0 == ret) /* timeout */
         {
-                MSGDBG2 ("-I-EMUDBG: Link%dIn timeout.\n", chan->Link);
+                MSGDBG2 ("-I-EMUDBG: Link%dIn timeout.\n", chan->linkno);
                 return 1;
         }
 
@@ -2504,6 +2689,23 @@ int channel_recvP (Channel *chan, u_char *data, int doWait)
                         ret = SCHLength(chan);
                         memcpy (data, &chan->schbuf[SCH_DATA], ret);
                         SCHLength(chan) = 0;
+                        t4_wake_node_id(chan->peer);
+                }
+        }
+        else if (t9k.enabled && t9k.net_on)
+        {
+                /* T4_T9K_NET: each packet leads with its sender's ready
+                 * cycle (see t9k_net_received) */
+                u_char tbuf[8 + MAX_DATA];
+                uint64_t ready;
+
+                ret = nn_recv (chan->sock, tbuf, sizeof tbuf, doWait ? 0 : NN_DONTWAIT);
+                if (ret >= 8)
+                {
+                        memcpy (&ready, tbuf, 8);
+                        ret -= 8;
+                        memcpy (data, tbuf + 8, ret);
+                        t9k_net_received (chan->linkno, ready, (uint32_t)ret);
                 }
         }
         else
@@ -2514,21 +2716,43 @@ int channel_recvP (Channel *chan, u_char *data, int doWait)
                         return -1;
 
                 printf ("-E-EMU414: channel_recvP: Receive failed on Link%dIn (%s)\n",
-                        chan->Link,
+                        chan->linkno,
                         nn_strerror (nn_errno ()));
                 handler (-1);
         }
         MSGDBG4 ("-I-EMUDBG: channel_recvP: Received %d bytes on Link%dIn (#%08X).\n",
                 ret,
-                chan->Link,
+                chan->linkno,
                 chan->LinkAddress);
         return ret;
 }
 
 int channel_recvmemP (Channel *chan, u_char *data, int doMemWrite, int doWait)
 {
-        int ret;
+        int ret, n;
         u_char *buf;
+
+        /* A link is a byte stream: an in takes exactly the bytes it asked
+         * for, wherever the sender's packets happen to break.  The part of a
+         * packet past the end of the in waits in pend for the next in -
+         * delivering the whole packet would write past the in's buffer. */
+        if (doMemWrite && (chan->npend || chan->Length < MAX_DATA))
+        {
+                if (0 == chan->npend)
+                {
+                        ret = channel_recvP (chan, chan->pend, doWait);
+                        if (ret < 0)
+                                return ret;
+                        chan->npend = ret;
+                        chan->pendoff = 0;
+                }
+                n = chan->npend < (int)chan->Length ? chan->npend
+                                                    : (int)chan->Length;
+                writebytes_int (chan->Address, chan->pend + chan->pendoff, n);
+                chan->pendoff += n; chan->npend -= n;
+                chan->Address += n; chan->Length -= n;
+                return n;
+        }
 
         buf = doMemWrite ? memrange (chan->Address, data, MAX_DATA) : data;
         ret = channel_recvP (chan, buf, doWait);
@@ -2570,6 +2794,21 @@ int channel_sendP (Channel *chan, u_char *data, int ndata, int doWait)
                         memcpy (&chan->schbuf[SCH_DATA], data, ndata);
                         SCHLength(chan) = ndata;
                         ret = ndata;
+                        t4_wake_node_id(chan->peer);
+                }
+        }
+        else if (t9k.enabled && t9k.net_on)
+        {
+                u_char tbuf[8 + MAX_DATA];
+                uint64_t ready = t9k_net_ready (chan->linkno);
+
+                memcpy (tbuf, &ready, 8);
+                memcpy (tbuf + 8, data, ndata);
+                ret = nn_send (chan->sock, tbuf, 8 + ndata, doWait ? 0 : NN_DONTWAIT);
+                if (ret == 8 + ndata)
+                {
+                        ret = ndata;
+                        t9k_net_sent (chan->linkno, ready, (uint32_t)ndata);
                 }
         }
         else
@@ -2581,7 +2820,7 @@ int channel_sendP (Channel *chan, u_char *data, int ndata, int doWait)
                         return -1;
 
                 printf ("-E-EMU414: channel_sendP: Send failed on Link%dOut (%s).\n",
-                        chan->Link,
+                        chan->linkno,
                         nn_strerror (nn_errno ()));
                 handler (-1);
         }
@@ -2589,13 +2828,13 @@ int channel_sendP (Channel *chan, u_char *data, int ndata, int doWait)
         {
                 printf ("-E-EMU414: channel_sendP: Failed to send %d bytes on Link%dOut (%s).\n",
                         ndata,
-                        chan->Link,
+                        chan->linkno,
                         nn_strerror (nn_errno ()));
                 handler (-1);
         }
         MSGDBG4 ("-I-EMUDBG: channel_sendP: Sent %d bytes on Link%dOut (#%08X).\n",
                 ndata,
-                chan->Link,
+                chan->linkno,
                 chan->LinkAddress);
         return ndata;
 }
@@ -2695,6 +2934,7 @@ void alt_channel(Channel *chan)
 }
 
 #define SCH_POLL        50
+#define SCH_POLL_IDLE   1000
 
 int linkcomms (char *where, int doBoot, int timeOut)
 {
@@ -2702,6 +2942,7 @@ int linkcomms (char *where, int doBoot, int timeOut)
         int npfd;
         uint32_t linkWdesc;
         Channel *channels[8];
+        int vlk[8];             /* >= 0: VCP link (T9000 virtual mode) */
         u_char data[MAX_DATA];
         int ndata;
         int i, ret;
@@ -2712,8 +2953,10 @@ int linkcomms (char *where, int doBoot, int timeOut)
         chnames[0] = '\0';
 #endif
 
-        if (nodeid < 0)
+        if (nodeid < 0 && !t4cpu->s_loopback)
                 return 0;
+        for (i = 0; i < 8; i++)
+                vlk[i] = -1;
 
         MSGDBG2 ("-I-EMUDBG: Link comms %s.\n", where);
         npfd = 0;
@@ -2723,8 +2966,36 @@ int linkcomms (char *where, int doBoot, int timeOut)
                 if ((0 == i) && serve) /* skip Host link */
                         continue;
 
+                if (!doBoot && t9k_link_virtual (i))
+                {
+                        /* T9000 virtual-channel mode: the link carries VCP
+                         * packets, which may arrive at any time. */
+                        if (t9k_link_listening (i) &&
+                            (Link[i].In.schbuf || Link[i].In.sock >= 0))
+                        {
+                                pfd[npfd].fd = Link[i].In.sock;
+                                pfd[npfd].events = NN_POLLIN;
+                                pfd[npfd].revents = 0;
+                                vlk[npfd] = i;
+                                channels[npfd++] = &Link[i].In;
+                        }
+                        if (t9k_link_tx_pending (i) &&
+                            (Link[i].Out.schbuf || Link[i].Out.sock >= 0))
+                        {
+                                pfd[npfd].fd = Link[i].Out.sock;
+                                pfd[npfd].events = NN_POLLOUT;
+                                pfd[npfd].revents = 0;
+                                vlk[npfd] = i;
+                                channels[npfd++] = &Link[i].Out;
+                                poll = FALSE;
+                        }
+                        continue;
+                }
+
                 linkWdesc = word (Link[i].In.LinkAddress);
-                if (doBoot || (linkWdesc != NotProcess_p))
+                /* IdleProcess_p has WPtr == NotProcess_p.  Polling it and
+                 * then schedule()'ing the result enqueues MinInt. */
+                if (doBoot || (GetDescWPtr(linkWdesc) != NotProcess_p))
                 {
                         /* Select only BootLink */
                         if (doBoot && BootLink)
@@ -2749,7 +3020,7 @@ int linkcomms (char *where, int doBoot, int timeOut)
                         continue;
 
                 linkWdesc = word (Link[i].Out.LinkAddress);
-                if ((linkWdesc != NotProcess_p) && Link[i].Out.Length)
+                if ((GetDescWPtr(linkWdesc) != NotProcess_p) && Link[i].Out.Length)
                 {
                         pfd[npfd].fd = Link[i].Out.sock;
                         pfd[npfd].events = NN_POLLOUT;
@@ -2768,7 +3039,17 @@ int linkcomms (char *where, int doBoot, int timeOut)
         if (0 == npfd)
         {
                 MSGDBG ("-I-EMUDBG: No active channels.\n");
-                return 0;
+                /* Not a deadlock: a sender may still be about to fill a
+                 * buffer.  Returning 0 here is what fired "stopped no
+                 * Link/Process/Timer activity" the moment idle polling
+                 * dropped below a second. */
+                if (doBoot)
+                        return 0;
+                if (timeOut)
+                        usleep (timeOut * 1000);
+                /* A stand-alone node (T4_LINK_LOOPBACK) has nobody
+                 * outside it to send. */
+                return nodeid >= 0;
         }
 #ifdef EMUDEBUG
         if (msgdebug || emudebug)
@@ -2779,7 +3060,17 @@ int linkcomms (char *where, int doBoot, int timeOut)
                         poll ? " (poll)" : "");
         }
 #endif
-        if (channels[0]->schbuf) /* shared channels? */
+        /* Bytes left over from a packet are ready without the transport. */
+        ret = 0;
+        for (i = 0; i < npfd; i++)
+                if ((pfd[i].events & NN_POLLIN) && channels[i]->npend)
+                {
+                        pfd[i].revents = NN_POLLIN;
+                        ret++;
+                }
+        if (ret)
+                ;
+        else if (channels[0]->schbuf) /* shared channels? */
         {
                 timeOut *= 1000;
                 do
@@ -2802,8 +3093,17 @@ int linkcomms (char *where, int doBoot, int timeOut)
                                 break;
                         if (timeOut)
                         {
-                                usleep (SCH_POLL); timeOut -= SCH_POLL;
-                                if (timeOut < 0) timeOut = 0;
+                                if (t4cpu && t4cpu->idle) {
+                                        int ms = timeOut / 1000;
+                                        if (ms < 1) ms = 1;
+                                        t4_node_idle_wait(t4cpu, ms);
+                                        timeOut = 0;
+                                        continue;
+                                } else {
+                                        int slice = (timeOut >= SCH_POLL_IDLE) ? SCH_POLL_IDLE : SCH_POLL;
+                                        usleep (slice); timeOut -= slice;
+                                        if (timeOut < 0) timeOut = 0;
+                                }
                         }
                 } while ((0 == ret) && (timeOut));
         }
@@ -2814,7 +3114,7 @@ int linkcomms (char *where, int doBoot, int timeOut)
         if (0 == ret) /* timeout */
         {
                 MSGDBG ("-I-EMUDBG: Comms timeout.\n");
-                return doBoot ? 0 : 1;
+                return (doBoot || nodeid < 0) ? 0 : 1;
         }
         if (-1 == ret) /* error */
         {
@@ -2829,6 +3129,15 @@ int linkcomms (char *where, int doBoot, int timeOut)
                 ndata = 0;
                 if (0 == pfd[i].revents)
                         continue;
+
+                if (vlk[i] >= 0)
+                {
+                        if (pfd[i].revents & NN_POLLIN)
+                                t9k_link_rx (vlk[i]);
+                        else
+                                t9k_link_tx (vlk[i]);
+                        continue;
+                }
 
                 if (pfd[i].revents & NN_POLLIN)
                 {
@@ -2848,7 +3157,7 @@ int linkcomms (char *where, int doBoot, int timeOut)
                         }
 #ifdef EMUDEBUG
                         else if (msgdebug || emudebug)
-                                printf ("-I-EMUDBG: Polled on Link%dIn (#%08X).\n", channels[i]->Link, channels[i]->LinkAddress);
+                                printf ("-I-EMUDBG: Polled on Link%dIn (#%08X).\n", channels[i]->linkno, channels[i]->LinkAddress);
 #endif
                 }
                 else if (pfd[i].revents & NN_POLLOUT)
@@ -2956,8 +3265,46 @@ Channel *reset_channel (uint32_t addr)
 
         chan->Address = MostNeg;
         chan->Length  = 0;
+        chan->CtrlByte = C_UNKNOWN;   /* a reset abandons any part-read packet */
 
         return chan;
+}
+
+/* Single-node link loopback for exercising links without a network:
+ * T4_LINK_LOOPBACK="1-2,3" wires Link1Out to Link2In and Link2Out to
+ * Link1In, and Link3Out back to Link3In.  Each link In gets a one-packet
+ * mailbox, as in the in-process fabric. */
+static int t4_loopback_peer[4] = { -1, -1, -1, -1 };
+
+static void init_link_loopback (void)
+{
+        const char *e = getenv ("T4_LINK_LOOPBACK");
+        int i, a, b, n;
+
+        for (i = 0; i < 4; i++)
+                t4_loopback_peer[i] = -1;
+        if (nodeid >= 0 || !e || !*e)
+                return;
+        while (*e)
+        {
+                if (1 == sscanf (e, "%d%n", &a, &n) && a >= 0 && a < 4)
+                {
+                        e += n;
+                        b = a;
+                        if ('-' == *e && 1 == sscanf (e + 1, "%d%n", &b, &n) && b >= 0 && b < 4)
+                                e += 1 + n;
+                        t4_loopback_peer[a] = b;
+                        t4_loopback_peer[b] = a;
+                }
+                while (*e && ',' != *e)
+                        e++;
+                if (',' == *e)
+                        e++;
+        }
+        if (!t4cpu->s_loopback)
+                t4cpu->s_loopback = calloc (4, SCH_SIZE);
+        if (!t4cpu->s_loopback)
+                handler (-1);
 }
 
 /* Open a link channel */
@@ -2974,16 +3321,44 @@ void open_channel (uint32_t addr)
         theLink = TheLink(addr);
 
         chan->LinkAddress = addr;
-        chan->Link = theLink;
+        chan->linkno = theLink;
         chan->url[0] = '\0';
         chan->sock = -1;
         chan->schbuf = NULL;
         chan->IOBytes = 0;
+        chan->CtrlByte = C_UNKNOWN;
+        chan->peer = -1;
+        chan->npend = 0;
+        chan->pendoff = 0;
 
         if (serve && 0 == theLink) /* host link */
                 return;
+        if (nodeid < 0 && t4cpu->s_loopback)
+        {
+                /* T4_LINK_LOOPBACK: a cable from LinkaOut to LinkbIn */
+                int other = t4_loopback_peer[theLink];
+
+                if (other >= 0)
+                        chan->schbuf = t4cpu->s_loopback +
+                                       (chanIn ? theLink : other) * SCH_SIZE;
+                return;
+        }
         if (nodeid < 0) /* no Node ID */
                 return;
+
+        if (t4_fabric) {
+                if (chanIn) {
+                        nodeBase = t4_fabric->base + (nodeid * 8 * SCH_SIZE);
+                        chan->schbuf = nodeBase + (4 + theLink) * SCH_SIZE;
+                        if (0 == connectedNetLink(nodeid, theLink, &othernode, &otherlink))
+                                chan->peer = othernode;
+                } else if (0 == connectedNetLink(nodeid, theLink, &othernode, &otherlink)) {
+                        nodeBase = t4_fabric->base + (othernode * 8 * SCH_SIZE);
+                        chan->schbuf = nodeBase + (4 + otherlink) * SCH_SIZE;
+                        chan->peer = othernode;
+                }
+                return;
+        }
 
         if (sharedLinks ())
         {
@@ -2996,12 +3371,12 @@ void open_channel (uint32_t addr)
                 {
                         if ((1 == nodeid) || (0 == maxnode))
                         {
-                                SharedLinks = shlink_alloc (NetConfigName, sharedSize + 1024);
+                                SharedLinks = shlink_alloc (NetConfigName, sharedSize + SHLINK_EXTRA);
                                 if (SharedLinks)
-                                        memset (SharedLinks, 0, sharedSize + 1024);
+                                        memset (SharedLinks, 0, sharedSize + SHLINK_EXTRA);
                         }
                         else
-                                SharedLinks = shlink_attach (NetConfigName, sharedSize + 1024);
+                                SharedLinks = shlink_attach (NetConfigName, sharedSize + SHLINK_EXTRA);
                         if (NULL == SharedLinks)
                                 handler (-1);
                         SharedEvents = SharedLinks + sharedSize;
@@ -3010,6 +3385,8 @@ void open_channel (uint32_t addr)
                 {
                         nodeBase = SharedLinks + (nodeid * 8 * SCH_SIZE);
                         chan->schbuf = nodeBase + (4 + theLink) * SCH_SIZE;
+                        if (0 == connectedNetLink(nodeid, theLink, &othernode, &otherlink))
+                                chan->peer = othernode;
                         if (verbose)
                                 printf ("-I-EMU414: Link%dIn  at #%08lX %d:%d.\n",
                                         theLink,
@@ -3020,6 +3397,7 @@ void open_channel (uint32_t addr)
                 {
                         nodeBase = SharedLinks + (othernode * 8 * SCH_SIZE);
                         chan->schbuf = nodeBase + (4 + otherlink) * SCH_SIZE;
+                        chan->peer = othernode;
                         if (verbose)
                                 printf ("-I-EMU414: Link%dIn  at #%08lX %d:%d.\n",
                                         theLink,
@@ -3246,11 +3624,18 @@ void init_processor (void)
 
         for (i = 0; i < MAX_ICACHE+1; i++)
         {
-                Icache[i].IPtr  = IC_NOADDR;
+                Icache[i].ip  = IC_NOADDR;
                 Icache[i].Pcode = 0x3ff;
         }
 
-        SharedLinks = NULL;
+        if (!t4_fabric)
+                SharedLinks = NULL;
+
+        FPtrReg[0] = FPtrReg[1] = NotProcess_p;
+        BPtrReg[0] = BPtrReg[1] = NotProcess_p;
+
+        t9k_vcp_reset_node ();
+        init_link_loopback ();
 
         /* M.Bruestle 15.2.2012 */
         open_channel (Link0In);
@@ -3296,9 +3681,10 @@ void init_processor (void)
                                 combinedprof[i][j] = 0;
                 }
 #endif
-        memset (combinations, 0, sizeof(combinations));
-        for (i = 0; NO_ICODE != combined[i].code0; i++)
-                combinations[(combined[i].code0 << 10) + combined[i].code1] = 1 + i;
+        {
+                static pthread_once_t once = PTHREAD_ONCE_INIT;
+                pthread_once(&once, t4_fill_combinations);
+        }
 }
 
 #define FLAG(x,y)       ((x) ? (y) : '-')
@@ -3362,8 +3748,129 @@ u_short ProfileCode (u_char instrCode, uint32_t oprCode)
         return ret;
 }
 
+/* Next heartbeat_counter value at which run_insn_hooks() is due; 0 makes
+ * the first instruction resolve the hooks' settings. */
+static uint64_t insn_hook_next;
+
+/* mainloop()'s instruction-count hooks, kept out of the per-instruction
+ * path: only called once heartbeat_counter reaches insn_hook_next. */
+static void run_insn_hooks (void)
+{
+	static uint64_t smp_every = 0, smp_next = 0;
+	static uint64_t rec_every = 0;   /* 0 = unresolved, ~0 = off */
+	static uint64_t rec_next = 0;
+	/* T4_IPTR_SAMPLE=N: every N instructions, record IPtr into a ring;
+	 * dumped at exit as a sorted histogram (hot-loop profiler). */
+	{
+		if (__builtin_expect(smp_every == 0, 0)) {
+			extern void t4_iptr_sample_dump(void);
+			const char *e = getenv("T4_IPTR_SAMPLE");
+			smp_every = (e && *e) ? strtoull(e, NULL, 0) : ~0ULL;
+			if (smp_every == 0)
+				smp_every = ~0ULL;
+			if (smp_every != ~0ULL)
+				atexit(t4_iptr_sample_dump);
+			smp_next = smp_every;
+		}
+		if (__builtin_expect(heartbeat_counter >= smp_next, 0)
+		    && smp_every != ~0ULL) {
+			extern uint32_t iptr_samples[8192];
+			extern uint32_t iptr_sample_n;
+			smp_next = heartbeat_counter + smp_every;
+			iptr_samples[iptr_sample_n & 8191u] = IPtr;
+			wptr_samples[iptr_sample_n & 8191u] = WPtr;
+			iptr_sample_n++;
+			if (iptr_sample_n == 0)
+				iptr_sample_n = 8192; /* saturate wrap flag */
+			if ((iptr_sample_n & 2047u) == 0) {
+				uint32_t k;
+				const char *dw;
+				fprintf(stderr,
+					"[LIVE-FRAME] IPtr=0x%08X WPtr=0x%08X\n",
+					IPtr, WPtr);
+				for (k = 0; k < 32; k++)
+					fprintf(stderr, "W%-2u 0x%08X\n", k,
+						word_int(WPtr + 4u * k));
+				/* last write-watch hits (see writeword_int) */
+				{
+					extern uint32_t watch_ring[128][3];
+					extern uint32_t watch_ring_n;
+					uint32_t nback = watch_ring_n < 16u
+					    ? watch_ring_n : 16u;
+					for (k = 0; k < nback; k++) {
+						uint32_t idx =
+						    (watch_ring_n - nback + k)
+						    & 127u;
+						fprintf(stderr,
+							"WW val=0x%08X "
+							"IPtr=0x%08X hb=%u\n",
+							watch_ring[idx][0],
+							watch_ring[idx][1],
+							watch_ring[idx][2]);
+					}
+				}
+				/* T4_DUMP_WORDS=a[:n],b[:m],...: print n words
+				 * starting at each address (default 1) */
+				dw = getenv("T4_DUMP_WORDS");
+				while (dw && *dw) {
+					char *end;
+					uint32_t a = (uint32_t)
+					    strtoul(dw, &end, 0);
+					uint32_t cnt = 1, j;
+					if (end && *end == ':')
+						cnt = (uint32_t)
+						    strtoul(end + 1, NULL, 0);
+					if (cnt > 256)
+						cnt = 256;
+					for (j = 0; j < cnt; j++)
+						fprintf(stderr,
+							"M 0x%08X 0x%08X\n",
+							a + 4*j,
+							word_int(a + 4*j));
+					dw = strchr(dw, ',');
+					if (dw)
+						dw++;
+				}
+				fflush(stderr);
+			}
+		}
+	}
+	/* headless framebuffer video capture (see t4_fb_record_poll) */
+	{
+		if (__builtin_expect(rec_every == 0, 0)) {
+			const char *e = getenv("T4_FB_RECORD");
+			rec_every = (e && *e) ? strtoull(e, NULL, 0) : ~0ULL;
+			if (rec_every == 0)
+				rec_every = ~0ULL;
+			rec_next = rec_every;
+		}
+		if (__builtin_expect(heartbeat_counter >= rec_next, 0)
+		    && rec_every != ~0ULL) {
+			rec_next = heartbeat_counter + rec_every;
+			t4_fb_record_poll();
+		}
+	}
+	insn_hook_next = smp_every != ~0ULL ? smp_next : ~0ULL;
+	if (rec_every != ~0ULL && rec_next < insn_hook_next)
+		insn_hook_next = rec_next;
+}
+
 void mainloop (void)
 {
+        /* The node's decode tables never move while it runs.  Through
+         * t4cpu their pointers are reloaded after every guest store (a
+         * store through u_char * may alias the cpu_t), so take them once.
+         * The macros are restored after mainloop(). */
+        InstrSlot *const mainloop_icache = Icache;
+        ArgSlot   *const mainloop_acache = Acache;
+#undef  Icache
+#undef  Acache
+#define Icache  mainloop_icache
+#define Acache  mainloop_acache
+        /* Instructions since the timer block last ran (see delayCount1). */
+        int timer_tick = 0;
+        /* Any optional per-instruction machinery in use; see below. */
+        int rare_hooks;
         uint32_t temp, temp2;
         uint32_t otherWdesc, otherWPtr, otherPtr, altState;
         uint32_t PrevError;
@@ -3485,12 +3992,20 @@ void mainloop (void)
 	if (IsT806)
 		fprintf(stderr, "[T806] T800-compatible @ 200MHz (LDDEVID=0x%03x)\n", ProductIdentity);
 
-	/* Start timer thread — updates ClockReg asynchronously */
-	g_timer_bridge.ClockReg = ClockReg;
-	g_timer_bridge.timeslice = &timeslice;
-	g_timer_bridge.Timers = &Timers;
-	g_timer_bridge.TimersGo_val = TimersGo;
-	g_timer_threaded = timer_bridge_start(&g_timer_bridge);
+	/* Start timer thread once (node 0). Workers share it. */
+	if (nodeid <= 0) {
+		g_timer_bridge.pClockReg = ClockReg;
+		g_timer_bridge.ptimeslice = &timeslice;
+		g_timer_bridge.pTimers = &Timers;
+		g_timer_bridge.TimersGo_val = TimersGo;
+		g_timer_threaded = timer_bridge_start(&g_timer_bridge);
+	} else
+		g_timer_threaded = 1;
+	/* update_time() adapts delayCount1 only when it runs the clock itself.
+	 * The timer thread moves ClockReg every 100us, so polling the timer
+	 * queues every 6 instructions (the starting value) bought nothing. */
+	if (g_timer_threaded)
+		delayCount1 = 63;
 	TimerEnableHi = 1;
 	TimerEnableLo = 1;
 
@@ -3564,13 +4079,41 @@ void mainloop (void)
 	production_quiet = !runtime_diagnostics_requested();
 	if (production_quiet)
 		fprintf(stderr, "[FAST] Quiet production decoder path enabled\n");
+#ifndef EMUDEBUG
+	{
+		const char *env = getenv("T4_FAST_PRIMARY");
+		/* The accelerated decoder is opt-in until the Linux boot
+		 * differential suite proves full scheduler equivalence. */
+		fast_primary_enabled = env && *env &&
+			strtoul(env, NULL, 0) != 0;
+		env = getenv("T4_FAST_BLOCK");
+		/* Basic-block fusion is likewise opt-in: incorrect context
+		 * state is worse than a slower, reproducible emulator. */
+		fast_block_enabled = env && *env &&
+			strtoul(env, NULL, 0) != 0;
+	}
+#endif
+
+	/* Diagnostics, a stop breakpoint, the opt-in fast paths and decode
+	 * cache, the T9000 grouper and the instruction-count hooks are all
+	 * settled by now.  One loop-invariant test keeps every one of them off
+	 * the common path; production runs pay a register test, not loads. */
+	rare_hooks = !production_quiet || stop_iptr || dcache_enabled > 0 ||
+	             t9k.enabled ||
+#ifndef EMUDEBUG
+	             fast_block_enabled || fast_primary_enabled ||
+#endif
+	             (getenv("T4_IPTR_SAMPLE") && *getenv("T4_IPTR_SAMPLE")) ||
+	             (getenv("T4_FB_RECORD") && *getenv("T4_FB_RECORD"));
 
 	/*
 	 * T9000 P-trap return: longjmp resumes here (after one-time init)
 	 * with L IPtr/WPtr restored.  Clear OReg so prefix state is clean.
+	 * timer_tick changed after setjmp(), so it is indeterminate here.
 	 */
 	if (setjmp(t9k_prot.jmp_env) != 0) {
 		OReg = 0;
+		timer_tick = 0;
 		if (t9k_prot.debug)
 			fprintf(stderr,
 				"[T9K-PROT] resume L after trap IPtr=0x%08X cause=%u\n",
@@ -3583,7 +4126,7 @@ void mainloop (void)
 	{
                 /* Fast-path: minimal overhead per instruction. */
                 PrevError = ReadError;
-		if (unlikely(stop_iptr && IPtr == stop_iptr &&
+		if (unlikely(rare_hooks && stop_iptr && IPtr == stop_iptr &&
 		    (!stop_return || word_int(WPtr) == stop_return) &&
 		    (!stop_areg_set || AReg == stop_areg) &&
 		    (!stop_b_non_signext || (BReg != 0 && BReg != 0xFFFFFFFFu)) &&
@@ -3626,9 +4169,12 @@ void mainloop (void)
                 /* Timer and periodic checks.
                  * With threaded timer, only queue schedule + rare I/O.
                  * Headless: skip SDL entirely (present is already no-op). */
-                if (__builtin_expect(++count1 > delayCount1, 0))
+                if (__builtin_expect(++timer_tick > delayCount1, 0))
                 {
-                        count1 = 0;
+                        timer_tick = 0;
+                        /* Another node asked this one to stop. */
+                        if (SharedEvents && (nodeid >= 0) && SharedEvents[nodeid])
+                                return;
                         if (g_timer_threaded) {
                                 if (TimerEnableHi) schedule_timerq(HiPriority);
                                 if (TimerEnableLo) schedule_timerq(LoPriority);
@@ -3637,9 +4183,8 @@ void mainloop (void)
                         }
 
                         {
-                                static uint32_t slow_counter = 0;
                                 /* Every 1024 timer ticks ≈ rare host I/O */
-                                if (__builtin_expect((++slow_counter & 0x3FF) == 0, 0)) {
+                                if (nodeid <= 0 && __builtin_expect((++t4cpu->slow_counter & 0x3FF) == 0, 0)) {
 #ifdef T4_SDL_FB
                                         if (!display_headless) {
                                                 display_pump();
@@ -3653,33 +4198,18 @@ void mainloop (void)
                 }
 
 #ifndef EMUDEBUG
-                if (fast_primary_enabled < 0) {
-                        const char *env = getenv("T4_FAST_PRIMARY");
-			/* The accelerated decoder is opt-in until the Linux boot
-			 * differential suite proves full scheduler equivalence. */
-                        fast_primary_enabled = env && *env &&
-				strtoul(env, NULL, 0) != 0;
-                }
-                if (fast_block_enabled < 0) {
-                        const char *env = getenv("T4_FAST_BLOCK");
-			/* Basic-block fusion is likewise opt-in: incorrect context
-			 * state is worse than a slower, reproducible emulator. */
-                        fast_block_enabled = env && *env &&
-				strtoul(env, NULL, 0) != 0;
-                }
-
                 /* Release block path for straight-line runs of simple one-byte
                  * primary ops. It avoids the legacy icache and giant switch for
                  * stack/local arithmetic code, while branches, prefixes, OPR,
                  * calls, scheduler/channel ops, and debug tracing stay on the
                  * full path. Cached bytes are rechecked before execution, so
                  * self-modifying writes naturally fall back and rebuild. */
-                if (__builtin_expect(fast_block_enabled && OReg == 0 &&
+                if (__builtin_expect(rare_hooks && fast_block_enabled && OReg == 0 &&
                     !bootdbg_enabled && !cache_debug_trace_enabled &&
                     !iptr_trace_enabled && !sym_trace_active &&
                     !text_write_trace_enabled && !sk_areg_trace_enabled &&
                     !sk_addr_trace_enabled && !sk_store_trace_enabled &&
-                    !wptr_trace_enabled, 1)) {
+                    !wptr_trace_enabled, 0)) {
                         t4_fast_block_t *fb = &fast_blocks[IPtr & T4_FAST_BLOCK_MASK];
                         int valid = (fb->tag == IPtr && fb->len != 0);
 
@@ -3771,12 +4301,12 @@ void mainloop (void)
                  * frame offsets and constants in a single nibble, and making
                  * only one-byte primaries fast leaves nearly all C code on the
                  * diagnostic-heavy legacy path. */
-                if (__builtin_expect(fast_primary_enabled && OReg == 0 &&
+                if (__builtin_expect(rare_hooks && fast_primary_enabled && OReg == 0 &&
                     !bootdbg_enabled && !cache_debug_trace_enabled &&
                     !iptr_trace_enabled && !sym_trace_active &&
                     !text_write_trace_enabled && !sk_areg_trace_enabled &&
                     !sk_addr_trace_enabled && !sk_store_trace_enabled &&
-                    !wptr_trace_enabled && !trace_fb_ldc_enabled, 1)) {
+                    !wptr_trace_enabled && !trace_fb_ldc_enabled, 0)) {
 	                        dcache_entry_t *decoded;
 	                        uint32_t fast_ip;
 	                        uint32_t fast_oreg;
@@ -4139,10 +4669,6 @@ void mainloop (void)
 
 
 ProductionFetch:
-		/* Shared-events check only (timer already handled at loop top). */
-                if (SharedEvents && (nodeid >= 0) && SharedEvents[nodeid])
-                        return;
-
                 if (ReadGotoSNP)
                 {
                         if (noisy_boot_trace_enabled()) {
@@ -4159,10 +4685,48 @@ ProductionFetch:
 
         pslot = islot;
         islot = IHASH(IPtr);
-        if (unlikely(IPtr != Icache[islot].IPtr))
+        if (unlikely(IPtr != Icache[islot].ip))
         {
+                /* Checked when an address is first cached: a hit
+                 * is an address that already passed. */
+		if (IPtr < MemStart &&
+		    !(t4_sd_boot_enabled() &&
+		      (IPtr - BOOTBANK_BASE < BOOTBANK_SIZE ||
+		       (IPtr >= SD_BASE && IPtr < SD_LIMIT)))) {
+			/* A P-process that runs off its regions is an AccessViolation
+			 * (ISM 9.5): the machine traps to the supervisor, which is
+			 * exactly the case protection exists to contain.  Killing the
+			 * host instead loses the supervisor's diagnosis and turns a
+			 * contained guest fault into a dead emulator.  L-mode has no
+			 * supervisor to trap to, so it still halts below. */
+			if (t9k_in_p()) {
+				fprintf(stderr,
+					"[T9K-PROT] P-process left RAM: IPtr=0x%08X "
+					"WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X "
+					"— AccessViolation to supervisor\n",
+					IPtr, WPtr, AReg, BReg, CReg);
+				fflush(stderr);
+				t9k_p_trap(T9K_TRAP_ACCESS, IPtr);
+				/* not reached: t9k_p_trap longjmps to the mainloop */
+			}
+			fault_history_dump("execution left configured RAM");
+			/* Fatal: continuing would fetch from a negative mem[] index
+			 * (host SIGSEGV) or spin in garbage until timeout.  Stop with
+			 * a diagnostic instead — both prior failure faces become
+			 * this one message. */
+			fprintf(stderr,
+				"[WILDEXEC] IPtr=0x%08X left RAM (MemStart=0x%08X) "
+				"WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X — halting\n",
+				IPtr, MemStart, WPtr, AReg, BReg, CReg);
+			fflush(NULL);
+			if (t4_fabric) {
+				t4_net_request_stop();
+				return;
+			}
+			exit(2);
+		}
                 PROFILE(profile[PRO_ICMISS]++);
-                Icache[islot].IPtr = IPtr;
+                Icache[islot].ip = IPtr;
                 SetCached(IPtr);
                 /* OReg is preserved across icache misses; do not reset here. */
                 /* Cache debug tracing for miss */
@@ -4201,8 +4765,8 @@ FetchNext:
                                 /* Must populate Icache before execute — hit path
                                  * reloads NextIPtr/OReg/Icode from this slot. */
                                 Icache[islot].NextIPtr = IPtr;
-                                Icache[islot].OReg     = OReg;
-                                Icache[islot].Icode    = Icode;
+                                Icache[islot].oreg     = OReg;
+                                Icache[islot].icode    = Icode;
 #ifdef T4COMBINATIONS
                                 Icache[islot].Pcode = ProfileCode(Icode, OReg);
 #endif
@@ -4280,15 +4844,15 @@ FetchNext:
                                 OReg, IPtr, Icode, Idata);
                 }
                 Icache[islot].NextIPtr = IPtr;
-                Icache[islot].OReg     = OReg;
-                Icache[islot].Icode    = Icode;
+                Icache[islot].oreg     = OReg;
+                Icache[islot].icode    = Icode;
                 /* Cache debug tracing for store */
                 if (cache_debug_trace_enabled &&
-                    Icache[islot].IPtr >= cache_debug_trace_start &&
-                    Icache[islot].IPtr < cache_debug_trace_end) {
+                    Icache[islot].ip >= cache_debug_trace_start &&
+                    Icache[islot].ip < cache_debug_trace_end) {
                         fprintf(stderr,
                                 "[CACHE_STORE] slot=0x%X origIPtr=0x%08X NextIPtr=0x%08X OReg=0x%08X Icode=0x%02X WPtr=0x%08X\n",
-                                islot, Icache[islot].IPtr, IPtr, OReg, Icode, WPtr);
+                                islot, Icache[islot].ip, IPtr, OReg, Icode, WPtr);
                 }
 
 #ifdef EMUDEBUG
@@ -4303,20 +4867,20 @@ FetchNext:
                         u_short code1 = ProfileCode (Icode, OReg);
                         Icache[islot].Pcode = code1;
                         if ((i = combinations[(code0 << 10) + code1])
-                                && (Icache[pslot].NextIPtr == (Icache[islot].IPtr - 1)))
+                                && (Icache[pslot].NextIPtr == (Icache[islot].ip - 1)))
                         {
                                 i--;
                                 EMUDBG3 ("-I-EMU414: code0=#%03X code1=#%03X\n", code0, code1);
                                 EMUDBG2 ("-I-EMU414: combined code=#%03X\n", combined[i].ccode);
 
-                                Acache[pslot]._Arg0 = Icache[pslot].OReg;
-                                Acache[pslot]._Arg1 = Icache[islot].OReg;
+                                Acache[pslot]._Arg0 = Icache[pslot].oreg;
+                                Acache[pslot]._Arg1 = Icache[islot].oreg;
 
                                 Icache[pslot].NextIPtr = Icache[islot].NextIPtr;
-                                Icache[pslot].OReg  = combined[i].ccode;
-                                Icache[pslot].Icode = 0xF0;
-                                Icache[pslot].Pcode = ProfileCode (Icache[pslot].Icode, Icache[pslot].OReg);
-                                EMUDBG4 ("-I-EMU414: OReg=#%X Arg0=#%X Arg1=#%X\n", Icache[pslot].OReg, Acache[pslot]._Arg0, Acache[pslot]._Arg1);
+                                Icache[pslot].oreg  = combined[i].ccode;
+                                Icache[pslot].icode = 0xF0;
+                                Icache[pslot].Pcode = ProfileCode (Icache[pslot].icode, Icache[pslot].oreg);
+                                EMUDBG4 ("-I-EMU414: OReg=#%X Arg0=#%X Arg1=#%X\n", Icache[pslot].oreg, Acache[pslot]._Arg0, Acache[pslot]._Arg1);
                         }
                 }
 #endif
@@ -4327,28 +4891,33 @@ FetchNext:
                 PROFILE(profile[PRO_ICHIT]++);
 #endif
         IPtr  = Icache[islot].NextIPtr;
-        OReg  = Icache[islot].OReg;
-        Icode = Icache[islot].Icode;
+        OReg  = Icache[islot].oreg;
+        Icode = Icache[islot].icode;
         /* Cache debug tracing */
-        if (cache_debug_trace_enabled &&
+        if (rare_hooks && cache_debug_trace_enabled &&
             IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
-                uint8_t mem_op0 = byte_int(Icache[islot].IPtr);
-                uint8_t mem_op1 = byte_int(Icache[islot].IPtr + 1);
-                uint8_t mem_op2 = byte_int(Icache[islot].IPtr + 2);
-                uint8_t mem_op3 = byte_int(Icache[islot].IPtr + 3);
+                uint8_t mem_op0 = byte_int(Icache[islot].ip);
+                uint8_t mem_op1 = byte_int(Icache[islot].ip + 1);
+                uint8_t mem_op2 = byte_int(Icache[islot].ip + 2);
+                uint8_t mem_op3 = byte_int(Icache[islot].ip + 3);
                 fprintf(stderr,
                         "[CACHE_HIT] slot=0x%X origIPtr=0x%08X NextIPtr=0x%08X OReg=0x%08X Icode=0x%02X mem=%02X%02X%02X%02X WPtr=0x%08X\n",
-                        islot, Icache[islot].IPtr, IPtr, OReg, Icode,
+                        islot, Icache[islot].ip, IPtr, OReg, Icode,
                         mem_op0, mem_op1, mem_op2, mem_op3, WPtr);
         }
 
 ExecuteInstr:
+	if (__builtin_expect (t4_sig_pending != 0, 0)) {
+		int sig = (int) t4_sig_pending;
+		t4_sig_pending = 0;
+		t4_signal_exit (sig);
+	}
 	/* Feed the T9000 grouper model (T4_T9000=1); no cost when disabled. */
-	if (__builtin_expect(t9k.enabled, 0)) {
-		/* Icache[islot].IPtr is the start of the whole prefixed
+	if (__builtin_expect(rare_hooks && t9k.enabled, 0)) {
+		/* Icache[islot].ip is the start of the whole prefixed
 		 * instruction (the slot is hashed once, before the pfix/nfix
 		 * loop), so this is the encoded length the fetcher must pull. */
-		int t9k_bytes = (int)(IPtr - Icache[islot].IPtr);
+		int t9k_bytes = (int)(IPtr - Icache[islot].ip);
 		if (Icode == 0xf0 && (int)OReg >= T9K_COMBINED_BASE &&
 		    (int)OReg < T9K_COMBINED_BASE + T9K_COMBINED_COUNT) {
 			/* A fused pair (combined[] above): issue both halves,
@@ -4368,133 +4937,12 @@ ExecuteInstr:
 				  t9k_bytes);
 		}
 	}
-	if (IPtr < MemStart &&
-	    !(t4_sd_boot_enabled() &&
-	      (IPtr - BOOTBANK_BASE < BOOTBANK_SIZE ||
-	       (IPtr >= SD_BASE && IPtr < SD_LIMIT)))) {
-		/* A P-process that runs off its regions is an AccessViolation
-		 * (ISM 9.5): the machine traps to the supervisor, which is
-		 * exactly the case protection exists to contain.  Killing the
-		 * host instead loses the supervisor's diagnosis and turns a
-		 * contained guest fault into a dead emulator.  L-mode has no
-		 * supervisor to trap to, so it still halts below. */
-		if (t9k_in_p()) {
-			fprintf(stderr,
-				"[T9K-PROT] P-process left RAM: IPtr=0x%08X "
-				"WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X "
-				"— AccessViolation to supervisor\n",
-				IPtr, WPtr, AReg, BReg, CReg);
-			fflush(stderr);
-			t9k_p_trap(T9K_TRAP_ACCESS, IPtr);
-			/* not reached: t9k_p_trap longjmps to the mainloop */
-		}
-		fault_history_dump("execution left configured RAM");
-		/* Fatal: continuing would fetch from a negative mem[] index
-		 * (host SIGSEGV) or spin in garbage until timeout.  Stop with
-		 * a diagnostic instead — both prior failure faces become
-		 * this one message. */
-		fprintf(stderr,
-			"[WILDEXEC] IPtr=0x%08X left RAM (MemStart=0x%08X) "
-			"WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X — halting\n",
-			IPtr, MemStart, WPtr, AReg, BReg, CReg);
-		fflush(NULL);
-		exit(2);
-	}
 	heartbeat_counter++;
-	/* T4_IPTR_SAMPLE=N: every N instructions, record IPtr into a ring;
-	 * dumped at exit as a sorted histogram (hot-loop profiler). */
-	{
-		static uint64_t smp_every = 0, smp_next = 0;
-		if (__builtin_expect(smp_every == 0, 0)) {
-			extern void t4_iptr_sample_dump(void);
-			const char *e = getenv("T4_IPTR_SAMPLE");
-			smp_every = (e && *e) ? strtoull(e, NULL, 0) : ~0ULL;
-			if (smp_every == 0)
-				smp_every = ~0ULL;
-			if (smp_every != ~0ULL)
-				atexit(t4_iptr_sample_dump);
-			smp_next = smp_every;
-		}
-		if (__builtin_expect(heartbeat_counter >= smp_next, 0)
-		    && smp_every != ~0ULL) {
-			extern uint32_t iptr_samples[8192];
-			extern uint32_t iptr_sample_n;
-			smp_next = heartbeat_counter + smp_every;
-			iptr_samples[iptr_sample_n & 8191u] = IPtr;
-			wptr_samples[iptr_sample_n & 8191u] = WPtr;
-			iptr_sample_n++;
-			if (iptr_sample_n == 0)
-				iptr_sample_n = 8192; /* saturate wrap flag */
-			if ((iptr_sample_n & 2047u) == 0) {
-				uint32_t k;
-				const char *dw;
-				fprintf(stderr,
-					"[LIVE-FRAME] IPtr=0x%08X WPtr=0x%08X\n",
-					IPtr, WPtr);
-				for (k = 0; k < 32; k++)
-					fprintf(stderr, "W%-2u 0x%08X\n", k,
-						word_int(WPtr + 4u * k));
-				/* last write-watch hits (see writeword_int) */
-				{
-					extern uint32_t watch_ring[128][3];
-					extern uint32_t watch_ring_n;
-					uint32_t nback = watch_ring_n < 16u
-					    ? watch_ring_n : 16u;
-					for (k = 0; k < nback; k++) {
-						uint32_t idx =
-						    (watch_ring_n - nback + k)
-						    & 127u;
-						fprintf(stderr,
-							"WW val=0x%08X "
-							"IPtr=0x%08X hb=%u\n",
-							watch_ring[idx][0],
-							watch_ring[idx][1],
-							watch_ring[idx][2]);
-					}
-				}
-				/* T4_DUMP_WORDS=a[:n],b[:m],...: print n words
-				 * starting at each address (default 1) */
-				dw = getenv("T4_DUMP_WORDS");
-				while (dw && *dw) {
-					char *end;
-					uint32_t a = (uint32_t)
-					    strtoul(dw, &end, 0);
-					uint32_t cnt = 1, j;
-					if (end && *end == ':')
-						cnt = (uint32_t)
-						    strtoul(end + 1, NULL, 0);
-					if (cnt > 256)
-						cnt = 256;
-					for (j = 0; j < cnt; j++)
-						fprintf(stderr,
-							"M 0x%08X 0x%08X\n",
-							a + 4*j,
-							word_int(a + 4*j));
-					dw = strchr(dw, ',');
-					if (dw)
-						dw++;
-				}
-				fflush(stderr);
-			}
-		}
-	}
-	/* headless framebuffer video capture (see t4_fb_record_poll) */
-	{
-		static uint64_t rec_every = 0;   /* 0 = unresolved, ~0 = off */
-		static uint64_t rec_next = 0;
-		if (__builtin_expect(rec_every == 0, 0)) {
-			const char *e = getenv("T4_FB_RECORD");
-			rec_every = (e && *e) ? strtoull(e, NULL, 0) : ~0ULL;
-			if (rec_every == 0)
-				rec_every = ~0ULL;
-			rec_next = rec_every;
-		}
-		if (__builtin_expect(heartbeat_counter >= rec_next, 0)
-		    && rec_every != ~0ULL) {
-			rec_next = heartbeat_counter + rec_every;
-			t4_fb_record_poll();
-		}
-	}
+	/* The IPtr sampler and the framebuffer recorder both fire on
+	 * instruction counts: one compare against the nearer of their next
+	 * firings (all ones while neither is on) stands in for both. */
+	if (__builtin_expect(rare_hooks && heartbeat_counter >= insn_hook_next, 0))
+		run_insn_hooks ();
 	if (__builtin_expect(production_quiet, 1))
 		goto FastDispatch;
 	fault_history_record(IPtr, WPtr, AReg, BReg, CReg, OReg, Icode);
@@ -4662,13 +5110,13 @@ FastDispatch:
 			       CReg = BReg;
 			       BReg = AReg;
 			       AReg = index (WPtr, OReg);
-			       if (sk_areg_trace_enabled &&
+			       if (rare_hooks && sk_areg_trace_enabled &&
 			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			           fprintf(stderr,
 			                   "[SKA] LDLP IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X WPtr=0x%08X\n",
 			                   IPtr, OReg, oldA, AReg, WPtr);
 			       }
-			       if (sk_addr_trace_enabled &&
+			       if (rare_hooks && sk_addr_trace_enabled &&
 			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			           fprintf(stderr,
 			                   "[SKADDR] LDLP IPtr=0x%08X OReg=0x%X WPtr=0x%08X addr=0x%08X\n",
@@ -4687,18 +5135,18 @@ FastDispatch:
 			       uint32_t addr = index(AReg, OReg);
 			       uint32_t value = word(addr);
 			       /* Debug: Show critical ldnl operations in bootstrap range */
-			       if (IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			       if (rare_hooks && IPtr >= 0x80000070 && IPtr <= 0x80000200) {
 			           printf("[LDNL] IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X value=0x%08X\n",
 			                  IPtr, AReg, OReg, addr, value);
 			       }
 			       AReg = value;
-			       if (sk_areg_trace_enabled &&
+			       if (rare_hooks && sk_areg_trace_enabled &&
 			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			           fprintf(stderr,
 			                   "[SKA] LDNL IPtr=0x%08X OReg=0x%X addr=0x%08X AReg:0x%08X->0x%08X\n",
 			                   IPtr, OReg, addr, oldA, AReg);
 			       }
-			       if (sk_addr_trace_enabled &&
+			       if (rare_hooks && sk_addr_trace_enabled &&
 			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			           fprintf(stderr,
 			                   "[SKADDR] LDNL IPtr=0x%08X OReg=0x%X addr=0x%08X value=0x%08X\n",
@@ -4715,10 +5163,10 @@ FastDispatch:
 			       AReg = OReg;
 			       /* Optional trace for framebuffer-address LDC spam during kernel boot.
 			        * Leave this off by default so boot logs stay readable. */
-			       if (trace_fb_ldc_enabled && fb_addr_in_range(AReg)) {
+			       if (rare_hooks && trace_fb_ldc_enabled && fb_addr_in_range(AReg)) {
 			           fprintf(stderr, "[FB_LDC] IPtr=0x%08X loaded=0x%08X\n", IPtr, AReg);
 			       }
-			       if (sk_areg_trace_enabled &&
+			       if (rare_hooks && sk_areg_trace_enabled &&
 			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			           fprintf(stderr,
 			                   "[SKA] LDC IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X\n",
@@ -4733,7 +5181,7 @@ FastDispatch:
 			   {
 			       uint32_t oldA = AReg;
 			       AReg = index (AReg, OReg);
-			       if (sk_areg_trace_enabled &&
+			       if (rare_hooks && sk_areg_trace_enabled &&
 			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			           fprintf(stderr,
 			                   "[SKA] LDNLP IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X\n",
@@ -4752,13 +5200,13 @@ FastDispatch:
 			       CReg = BReg;
 			       BReg = AReg;
 			       AReg = word(addr);
-			       if (sk_areg_trace_enabled &&
+			       if (rare_hooks && sk_areg_trace_enabled &&
 			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			           fprintf(stderr,
 			                   "[SKA] LDL IPtr=0x%08X OReg=0x%X addr=0x%08X AReg:0x%08X->0x%08X\n",
 			                   IPtr, OReg, addr, oldA, AReg);
 			       }
-			       if (sk_addr_trace_enabled &&
+			       if (rare_hooks && sk_addr_trace_enabled &&
 			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			           fprintf(stderr,
 			                   "[SKADDR] LDL IPtr=0x%08X OReg=0x%X WPtr=0x%08X addr=0x%08X value=0x%08X\n",
@@ -4766,7 +5214,7 @@ FastDispatch:
 			       }
 			   }
 			   /* Debug: Trace ldl in bootstrap range */
-			   if (noisy_boot_trace_enabled() &&
+			   if (rare_hooks && noisy_boot_trace_enabled() &&
 			       IPtr >= 0x80000070 && IPtr <= 0x80000200) {
 			       printf("[LDL] IPtr=0x%08X local=%d addr=0x%08X value=0x%08X → AReg\n",
 			              IPtr, OReg, index(WPtr, OReg), AReg);
@@ -4779,7 +5227,7 @@ FastDispatch:
 			   {
 			       uint32_t oldA = AReg;
 			       AReg = t4_eadd32 (AReg, OReg);
-			       if (sk_areg_trace_enabled &&
+			       if (rare_hooks && sk_areg_trace_enabled &&
 			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			           fprintf(stderr,
 			                   "[SKA] ADC IPtr=0x%08X OReg=0x%X AReg:0x%08X->0x%08X\n",
@@ -4793,17 +5241,17 @@ FastDispatch:
 		case 0x90: /* call  */
 			   IPtr++;
 			   /* Log kernel function calls */
-			   if (noisy_boot_trace_enabled() &&
+			   if (rare_hooks && noisy_boot_trace_enabled() &&
 			       IPtr >= 0x80000000 && IPtr < 0x81000000) {
 			       printf("[CALL] from=0x%08X to=0x%08X WPtr=0x%08X→0x%08X\n",
 			              IPtr - 1, IPtr + OReg, WPtr, index(WPtr, -4));
 			   }
-			   maybe_log_nearest_sym(IPtr - 1, "CALL");
-			   if (wptr_trace_enabled) {
+			   if (rare_hooks) maybe_log_nearest_sym(IPtr - 1, "CALL");
+			   if (rare_hooks && wptr_trace_enabled) {
 			       printf("[WPtr] CALL IPtr=0x%08X target=0x%08X WPtr=0x%08X→0x%08X\n",
 			              IPtr - 1, IPtr + OReg, WPtr, index(WPtr, -4));
 			   }
-			   if (bootdbg_stop_after_call_enabled &&
+			   if (rare_hooks && bootdbg_stop_after_call_enabled &&
 			       (IPtr - 1) >= boot_call_start && (IPtr - 1) <= boot_call_end) {
 			       last_boot_call_is_gcall = 0;
 			       last_boot_call_site = IPtr - 1;
@@ -4812,7 +5260,7 @@ FastDispatch:
 			       last_boot_call_wptr = WPtr;
 			       maybe_auto_text_base();
 			       stop_after_boot_call = 1;
-			       if (bootdbg_enabled)
+			       if (rare_hooks && bootdbg_enabled)
 			               fprintf(stderr,
 			                       "[BOOTDBG] armed stop after CALL @ 0x%08X target=0x%08X return=0x%08X\n",
 			                       last_boot_call_site, last_boot_call_target, last_boot_call_return);
@@ -4852,7 +5300,7 @@ FastDispatch:
 				   }
 			   }
 			   /* Cache debug tracing for CALL target */
-			   if (cache_debug_trace_enabled &&
+			   if (rare_hooks && cache_debug_trace_enabled &&
 			       IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
 			       uint8_t t0 = byte_int(IPtr);
 			       uint8_t t1 = byte_int(IPtr + 1);
@@ -4888,14 +5336,14 @@ FastDispatch:
 			       int32_t delta = (int32_t)OReg;
 			       uint32_t new_wptr = index(WPtr, delta);
 			       /* Cache debug tracing for AJW */
-			       if (cache_debug_trace_enabled &&
+			       if (rare_hooks && cache_debug_trace_enabled &&
 			           IPtr >= cache_debug_trace_start && IPtr < cache_debug_trace_end) {
 			           fprintf(stderr,
 			                   "[AJW_DEBUG] IPtr=0x%08X OReg=0x%08X delta=%d WPtr=0x%08X→0x%08X\n",
 			                   IPtr, OReg, delta, WPtr, new_wptr);
 			       }
 			       /* Log ALL workspace changes in bootstrap range, or significant changes in kernel */
-			       if (noisy_boot_trace_enabled() &&
+			       if (rare_hooks && noisy_boot_trace_enabled() &&
 			           ((IPtr >= 0x80000070 && IPtr <= 0x80000200) ||
 			            (IPtr >= 0x80000000 && IPtr < 0x81000000 && (delta > 10 || delta < -10)))) {
 			           printf("[AJW] IPtr=0x%08X delta=%d WPtr=0x%08X→0x%08X\n",
@@ -4916,9 +5364,17 @@ FastDispatch:
 				   if (!wptr_q3_ok &&
 				       (new_wptr == 0x2FFA2FFA || new_wptr < MemStart ||
 				        (uint64_t)new_wptr >= (uint64_t)MemStart + (uint64_t)MemSize)) {
-					   printf("[ERROR] Invalid WPtr after ajw: 0x%08X at IPtr=0x%08X (valid range: 0x%08X-0x%08X)\n",
-						  new_wptr, IPtr, MemStart,
-						  (uint32_t)((uint64_t)MemStart + (uint64_t)MemSize - 1));
+					   /* Report the first few, then only at powers of
+					    * two: a guest looping over a bad AJW once wrote
+					    * one line per instruction, a 24 GB boot log. */
+					   static unsigned long bad_ajw_count;
+					   bad_ajw_count++;
+					   if (bad_ajw_count <= 16 ||
+					       (bad_ajw_count & (bad_ajw_count - 1)) == 0)
+						   printf("[ERROR] Invalid WPtr after ajw: 0x%08X at IPtr=0x%08X (valid range: 0x%08X-0x%08X) [%lu so far]\n",
+							  new_wptr, IPtr, MemStart,
+							  (uint32_t)((uint64_t)MemStart + (uint64_t)MemSize - 1),
+							  bad_ajw_count);
 					   fault_history_dump("invalid AJW workspace");
 				   }
 			       }
@@ -4941,7 +5397,7 @@ FastDispatch:
 		case 0xd0: /* stl   */
 			   {
 			       uint32_t addr = index(WPtr, OReg);
-			       if (text_write_trace_enabled &&
+			       if (rare_hooks && text_write_trace_enabled &&
 			           addr >= text_write_trace_start &&
 			           addr < text_write_trace_end) {
 			           uint32_t delta = 0;
@@ -4963,17 +5419,17 @@ FastDispatch:
 			       writeword(addr, AReg);
 			   }
 			   /* Debug: Trace stl in bootstrap range */
-			   if (noisy_boot_trace_enabled() &&
+			   if (rare_hooks && noisy_boot_trace_enabled() &&
 			       IPtr >= 0x80000070 && IPtr <= 0x80000200) {
 			       printf("[STL] IPtr=0x%08X local=%d addr=0x%08X AReg=0x%08X stored\n",
 			              IPtr, OReg, index(WPtr, OReg), AReg);
 			   }
-			   if (sk_store_trace_enabled && sk_entry_iptr &&
+			   if (rare_hooks && sk_store_trace_enabled && sk_entry_iptr &&
 			       IPtr >= sk_entry_iptr && IPtr <= (sk_entry_iptr + 0x200)) {
 			       printf("[SKSTL] IPtr=0x%08X local=%d addr=0x%08X AReg=0x%08X\n",
 			              IPtr, OReg, index(WPtr, OReg), AReg);
 			   }
-			   if (sk_areg_trace_enabled &&
+			   if (rare_hooks && sk_areg_trace_enabled &&
 			       IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			       fprintf(stderr,
 			               "[SKA] STL IPtr=0x%08X AReg:0x%08X->0x%08X\n",
@@ -4989,7 +5445,7 @@ FastDispatch:
 			   {
 			       uint32_t stnl_addr = index(AReg, OReg);
 			       /* Trace VGA register writes (0xA0000000 range) */
-			       if ((stnl_addr & 0xFFFFF000) == 0xA0000000) {
+			       if (rare_hooks && (stnl_addr & 0xFFFFF000) == 0xA0000000) {
 			           fprintf(stderr, "[VGA_STNL] IPtr=0x%08X addr=0x%08X val=0x%08X\n",
 			                   IPtr, stnl_addr, BReg);
 			       }
@@ -5001,7 +5457,7 @@ FastDispatch:
 			           vga_dump_framebuffer_bmp(sname, screenshot_count - 1);
 			       }
 			       /* Debug: trace ALL STNLs in setup_arch to find FB writes */
-			       if (IPtr >= 0x8053c57b && IPtr < 0x8053d57b) {
+			       if (rare_hooks && IPtr >= 0x8053c57b && IPtr < 0x8053d57b) {
 			           static int setup_stnl_count = 0;
 			           if (setup_stnl_count < 200) {
 			               fprintf(stderr, "[SETUP_STNL#%d] IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X val=0x%08X\n",
@@ -5009,7 +5465,7 @@ FastDispatch:
 			               setup_stnl_count++;
 			           }
 			       }
-			       if (fb_addr_in_range(stnl_addr)) {
+			       if (rare_hooks && fb_addr_in_range(stnl_addr)) {
 			           static int fb_stnl_count = 0;
 			           if (fb_stnl_count < 50) {
 			               fprintf(stderr, "[FB_STNL#%d] IPtr=0x%08X addr=0x%08X val=0x%08X\n",
@@ -5018,12 +5474,12 @@ FastDispatch:
 			           }
 			       }
 			   }
-			   if (bootdbg_enabled && IPtr >= 0x80883FE0 && IPtr <= 0x80884020) {
+			   if (rare_hooks && bootdbg_enabled && IPtr >= 0x80883FE0 && IPtr <= 0x80884020) {
 			       uint32_t addr = index(AReg, OReg);
 			       fprintf(stderr, "[BOOTDBG] STNL IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X BReg=0x%08X\n",
 			               IPtr, AReg, OReg, addr, BReg);
 			   }
-			   if (sk_store_trace_enabled && sk_entry_iptr &&
+			   if (rare_hooks && sk_store_trace_enabled && sk_entry_iptr &&
 			       IPtr >= sk_entry_iptr && IPtr <= (sk_entry_iptr + 0x200)) {
 			       uint32_t addr = index(AReg, OReg);
 			       printf("[SKSTNL] IPtr=0x%08X addr=0x%08X BReg=0x%08X\n",
@@ -5031,7 +5487,7 @@ FastDispatch:
 			   }
 			   {
 			       uint32_t addr = index(AReg, OReg);
-			       if (text_write_trace_enabled &&
+			       if (rare_hooks && text_write_trace_enabled &&
 			           addr >= 0x80880000 && addr < 0x80890000) {
 			           uint32_t delta = 0;
 			           const link_sym *lsym = find_link_sym(IPtr, &delta);
@@ -5051,7 +5507,7 @@ FastDispatch:
 			       }
 			   }
 			   writeword (index (AReg, OReg), BReg);
-			   if (sk_areg_trace_enabled &&
+			   if (rare_hooks && sk_areg_trace_enabled &&
 			       IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			       fprintf(stderr,
 			               "[SKA] STNL IPtr=0x%08X AReg:0x%08X->0x%08X\n",
@@ -5064,7 +5520,8 @@ FastDispatch:
 
 	PROFILEINSTR(add_profile (0x100 + OReg));
 	/* T9000: privileged secondaries trap when running as P-process. */
-	t9k_check_priv_op(OReg);
+	if (unlikely(t9k_prot.is_p))
+		t9k_check_priv_op(OReg);
 	switch (OReg)
 	{
 		case 0x00: /* rev         */
@@ -5073,7 +5530,7 @@ FastDispatch:
 			       temp = AReg;
 			       AReg = BReg;
 			       BReg = temp;
-			       if (sk_areg_trace_enabled &&
+			       if (rare_hooks && sk_areg_trace_enabled &&
 			           IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			           fprintf(stderr,
 			                   "[SKA] REV IPtr=0x%08X AReg:0x%08X->0x%08X BReg=0x%08X\n",
@@ -5131,12 +5588,12 @@ FastDispatch:
 			   {
 			       uint32_t call_site = IPtr;
 			   /* Debug: Show gcall in bootstrap range */
-			   if (IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			   if (rare_hooks && IPtr >= 0x80000070 && IPtr <= 0x80000200) {
 			       printf("[GCALL] IPtr=0x%08X AReg=0x%08X (target) WPtr=0x%08X BReg=0x%08X CReg=0x%08X\n",
 			              IPtr, AReg, WPtr, BReg, CReg);
 			   }
-			   maybe_log_nearest_sym(IPtr, "GCALL");
-			   if (wptr_trace_enabled) {
+			   if (rare_hooks) maybe_log_nearest_sym(IPtr, "GCALL");
+			   if (rare_hooks && wptr_trace_enabled) {
 			       printf("[WPtr] GCALL IPtr=0x%08X target=0x%08X WPtr=0x%08X\n",
 			              IPtr, AReg, WPtr);
 			   }
@@ -5186,13 +5643,13 @@ FastDispatch:
 			           wj_gcall++;
 			       }
 			   }
-			   if (bootdbg_enabled && temp >= 0x804BAC00 && temp <= 0x804BB000) {
+			   if (rare_hooks && bootdbg_enabled && temp >= 0x804BAC00 && temp <= 0x804BB000) {
 			       fprintf(stderr,
 			               "[BOOTDBG] gcall target IPtr=0x%08X return_addr=0x%08X WPtr=0x%08X\n",
 			               IPtr, AReg, WPtr);
 			   }
 			   /* Show where we're jumping to */
-			   if (IPtr >= 0x80000070 && IPtr <= 0x80000200 || temp >= 0x80000070 && temp <= 0x80000200) {
+			   if (rare_hooks && ((IPtr >= 0x80000070 && IPtr <= 0x80000200) || (temp >= 0x80000070 && temp <= 0x80000200))) {
 			       printf("[GCALL] Jumping to IPtr=0x%08X return_addr=0x%08X\n", IPtr, AReg);
 			   }
 			   last_boot_call_is_gcall = 1;
@@ -5201,10 +5658,10 @@ FastDispatch:
 			   last_boot_call_return = AReg;
 			   last_boot_call_wptr = WPtr;
 			   maybe_auto_text_base();
-			   if (bootdbg_stop_after_call_enabled &&
+			   if (rare_hooks && bootdbg_stop_after_call_enabled &&
 			       call_site >= boot_call_start && call_site <= boot_call_end) {
 			       stop_after_boot_call = 1;
-			       if (bootdbg_enabled)
+			       if (rare_hooks && bootdbg_enabled)
 			               fprintf(stderr,
 			                       "[BOOTDBG] armed stop after GCALL @ 0x%08X target=0x%08X return=0x%08X\n",
 			                       last_boot_call_site, last_boot_call_target, last_boot_call_return);
@@ -5212,7 +5669,14 @@ FastDispatch:
 			   }
 			   break;
 		case 0x07: /* in          */
-OprIn:                     if (IsLinkOut(BReg)) /* M.Bruestle 22.1.2012 */
+OprIn:                     if (__builtin_expect (T9K_EXTCHAN(BReg), 0))
+                           {
+                                /* T9000 event or virtual channel */
+                                IPtr++;
+                                t9k_ext_in (BReg, CReg, AReg, T9K_IO_FIXED);
+                                break;
+                           }
+                           if (IsLinkOut(BReg)) /* M.Bruestle 22.1.2012 */
                            {
                                 MSGDBG2 ("-W-EMUDBG: Warning - doing IN on Link%dOut.\n", TheLink(BReg));
                                 goto OprOut;
@@ -5293,7 +5757,13 @@ DescheduleIn:
 			   IPtr++;
 			   break;
 		case 0x0b: /* out         */
-OprOut:                    if (IsLinkIn(BReg)) /* M.Bruestle 22.1.2012 */
+OprOut:                    if (__builtin_expect (T9K_EXTCHAN(BReg), 0))
+                           {
+                                IPtr++;
+                                t9k_ext_out (BReg, CReg, AReg, T9K_IO_FIXED);
+                                break;
+                           }
+                           if (IsLinkIn(BReg)) /* M.Bruestle 22.1.2012 */
                            {
                                 MSGDBG2 ("-W-EMUDBG: Warning - doing OUT on Link%dIn.\n", TheLink(BReg));
                                 goto OprIn;
@@ -5306,6 +5776,12 @@ OprOut:                    if (IsLinkIn(BReg)) /* M.Bruestle 22.1.2012 */
 				/* Internal communication. */
 				otherWdesc = word (BReg);
                                 MSGDBG2 ("-I-EMUDBG: out(2): Internal communication. Channel word=#%08X.\n", otherWdesc);
+                                if (__builtin_expect (T9K_RESCHAN_P == otherWdesc, 0))
+                                {
+                                        /* resource channel: claim, then wait */
+                                        t9k_internal_claim (BReg);
+                                        otherWdesc = NotProcess_p;
+                                }
 				if (otherWdesc == NotProcess_p)
 				{
 					/* Not ready. */
@@ -5394,7 +5870,12 @@ DescheduleOut:
                            PROFILE(profile[PRO_CHANOUT]++);
 			   MSGDBG2 ("-I-EMUDBG: outbyte: Channel=#%08X.\n", BReg);
 			   IPtr++;
-                           if (IsLinkIn(BReg)) /* M.Bruestle 22.1.2012 */
+                           if (__builtin_expect (T9K_EXTCHAN(BReg), 0))
+                           {
+                                writeword (WPtr, AReg);         /* pw.Temp */
+                                t9k_ext_out (BReg, WPtr, 1, T9K_IO_FIXED);
+                           }
+                           else if (IsLinkIn(BReg)) /* M.Bruestle 22.1.2012 */
                            {
 			        MSGDBG3 ("-W-EMUDBG: Warning - doing OUTWORD on Link%dIn. Old channel word=#%08X.\n", TheLink(BReg), word (BReg));
 				/* Link communication. */
@@ -5409,6 +5890,11 @@ DescheduleOut:
 			   {
 				/* Internal communication. */
 				otherWdesc = word (BReg);
+                                if (__builtin_expect (T9K_RESCHAN_P == otherWdesc, 0))
+                                {
+                                        t9k_internal_claim (BReg);
+                                        otherWdesc = NotProcess_p;
+                                }
 				if (otherWdesc == NotProcess_p)
 				{
 					/* Not ready. */
@@ -5473,7 +5959,12 @@ DescheduleOutByte:
                            PROFILE(profile[PRO_CHANOUT] += 4);
 			   MSGDBG2 ("-I-EMUDBG: outword(1): Channel=#%08X.\n", BReg);
 			   IPtr++;
-                           if (IsLinkIn(BReg)) /* M.Bruestle 22.1.2012 */
+                           if (__builtin_expect (T9K_EXTCHAN(BReg), 0))
+                           {
+                                writeword (WPtr, AReg);         /* pw.Temp */
+                                t9k_ext_out (BReg, WPtr, 4, T9K_IO_FIXED);
+                           }
+                           else if (IsLinkIn(BReg)) /* M.Bruestle 22.1.2012 */
                            {
 			        MSGDBG3 ("-W-EMUDBG: Warning - doing OUTWORD on Link%dIn. Old channel word=#%08X.\n", TheLink(BReg), word (BReg));
 				/* Link communication. */
@@ -5489,6 +5980,11 @@ DescheduleOutByte:
 				/* Internal communication. */
 				otherWdesc = word (BReg);
                                 MSGDBG2 ("-I-EMUDBG: outword(2): Internal communication. Channel word=#%08X.\n", otherWdesc);
+                                if (__builtin_expect (T9K_RESCHAN_P == otherWdesc, 0))
+                                {
+                                        t9k_internal_claim (BReg);
+                                        otherWdesc = NotProcess_p;
+                                }
 				if (otherWdesc == NotProcess_p)
 				{
                                         MSGDBG ("-I-EMUDBG: outword(3): Not ready.\n");
@@ -5566,8 +6062,16 @@ DescheduleOutWord:
 			   break;
 		case 0x12: /* XXX resetch     */
 			   temp = AReg;
-			   AReg = word (temp);
-                           reset_channel (temp);
+                           if (__builtin_expect (T9K_EXTCHAN(temp), 0))
+                                AReg = t9k_ext_resetch (temp);
+                           else if ((IsLinkIn(temp) || IsLinkOut(temp)) &&
+                                    t9k_link_virtual (TheLink(temp)))
+                                AReg = Undefined_p;     /* not in byte-stream mode */
+                           else
+                           {
+			        AReg = word (temp);
+                                reset_channel (temp);
+                           }
 			   IPtr++;
 			   break;
 		case 0x13: /* csub0       */
@@ -5687,7 +6191,7 @@ DescheduleOutWord:
 			       uint32_t new_wptr = index(WPtr, 4);
 			       uint32_t old_iptr = IPtr;
 			       /* Log kernel function returns */
-			       if (noisy_boot_trace_enabled() &&
+			       if (rare_hooks && noisy_boot_trace_enabled() &&
 			           IPtr >= 0x80000000 && IPtr < 0x81000000) {
 			           printf("[RET] from=0x%08X to=0x%08X WPtr=0x%08X→0x%08X\n",
 			                  IPtr, return_addr, WPtr, new_wptr);
@@ -5706,8 +6210,13 @@ DescheduleOutWord:
 			       }
 			       /* Validate return address */
 			       if (return_addr == 0x2FFA2FFA || return_addr == 0x80000000) {
-			           printf("[ERROR] Invalid return address 0x%08X at IPtr=0x%08X WPtr=0x%08X\n",
-			                  return_addr, IPtr, WPtr);
+			           /* Throttled like the AJW check above. */
+			           static unsigned long bad_ret_count;
+			           bad_ret_count++;
+			           if (bad_ret_count <= 16 ||
+			               (bad_ret_count & (bad_ret_count - 1)) == 0)
+			               printf("[ERROR] Invalid return address 0x%08X at IPtr=0x%08X WPtr=0x%08X [%lu so far]\n",
+			                      return_addr, IPtr, WPtr, bad_ret_count);
 			       }
 			       /* TCWG spec: "The ret instruction restores the Iptr and adjusts the
 			        * workspace pointer to deallocate the four locations." */
@@ -5726,7 +6235,7 @@ DescheduleOutWord:
 			       UpdateWdescReg (new_wptr | ProcPriority);
                                T4DEBUG(checkWPtr ("RET", WPtr));
 			       /* Cache debug tracing for RET */
-			       if (cache_debug_trace_enabled &&
+			       if (rare_hooks && cache_debug_trace_enabled &&
 			           (old_iptr >= cache_debug_trace_start && old_iptr < cache_debug_trace_end)) {
 			           fprintf(stderr,
 			                   "[RET_DEBUG] from=0x%08X to=0x%08X WPtr=0x%08X\n",
@@ -5757,6 +6266,12 @@ DescheduleOutWord:
 			   AReg = ClockReg[ProcPriority];
 			   IPtr++;
 			   break;
+                case 0x23: /* testlds     */
+                           CReg = BReg;
+                           BReg = AReg;
+                           AReg = STATUSReg;
+                           IPtr++;
+                           break;
                 case 0x24: /* testlde     */
                            CReg = BReg;
                            BReg = AReg;
@@ -5767,6 +6282,12 @@ DescheduleOutWord:
                            CReg = BReg;
                            BReg = AReg;
                            AReg = DReg;
+                           IPtr++;
+                           break;
+                case 0x26: /* teststs     */
+                           STATUSReg = AReg;
+                           AReg = BReg;
+                           BReg = CReg;
                            IPtr++;
                            break;
                 case 0x27: /* testste     */
@@ -5829,6 +6350,30 @@ DescheduleOutWord:
                            CReg = temp;
 			   IPtr++;
 			   break;
+		case 0x2d: /* testhardchan */
+                           /* Shift BReg into the selected link channel's
+                            * register stack: Count -> Ptr -> DBuff -> AReg.
+                            * PtrReg/CountReg are the live transfer pointer
+                            * and count, so - as on silicon - this is only
+                            * valid while no transfer is in progress. */
+                           if (!IsLinkIn(AReg) && !IsLinkOut(AReg))
+                           {
+                                printf ("-E-EMU414: testhardchan on non-link channel #%08X.\n", AReg);
+                                processor_state ();
+                                handler (-1);
+                                break;
+                           }
+                           {
+                                Channel *chan = IsLinkIn(AReg) ? &Link[TheLink(AReg)].In
+                                                               : &Link[TheLink(AReg)].Out;
+                                AReg           = chan->DBuffReg;
+                                chan->DBuffReg = chan->Address;
+                                chan->Address  = chan->Length;
+                                chan->Length   = BReg;
+                           }
+                           BReg = CReg;
+			   IPtr++;
+			   break;
 		case 0x2e: /* XXX dist        */
 			   EMUDBG2 ("-I-EMUDBG: dist(1): Time=%8X.\n", CReg);
 			   temp = ClockReg[ProcPriority];
@@ -5850,6 +6395,20 @@ DescheduleOutWord:
 			   break;
 		case 0x2f: /* XXX: support ALT construct on Link0 disc        */
 			   EMUDBG2 ("-I-EMUDBG: disc(1): Channel=#%08X.\n", CReg);
+                           if (__builtin_expect (T9K_EXTCHAN(CReg), 0))
+                           {
+                                /* T9000 event or virtual channel */
+                                if ((BReg != false_t) && t9k_ext_disc (CReg) &&
+                                    (word (index (WPtr, Temp_s)) == NoneSelected_o))
+                                {
+                                        writeword (index (WPtr, Temp_s), AReg);
+                                        AReg = true_t;
+                                }
+                                else
+                                        AReg = false_t;
+                                IPtr++;
+                                break;
+                           }
                            if (serve && (CReg == Link0In))
           		   {
 				EMUDBG ("-I-EMUDBG: disc(2): Link.\n");
@@ -6008,7 +6567,7 @@ DescheduleOutWord:
 			   IPtr++;
 			   break;
 		case 0x3b: /* XXX sb          */
-			   if (sk_areg_trace_enabled &&
+			   if (rare_hooks && sk_areg_trace_enabled &&
 			       IPtr >= 0x80883FF0 && IPtr <= 0x80884020) {
 			       fprintf(stderr,
 			               "[SKA] SB IPtr=0x%08X AReg=0x%08X BReg=0x%08X\n",
@@ -6019,7 +6578,7 @@ DescheduleOutWord:
                                                IPtr, BReg);
                                }
 			   }
-			   if (sk_store_trace_enabled && sk_entry_iptr &&
+			   if (rare_hooks && sk_store_trace_enabled && sk_entry_iptr &&
 			       IPtr >= sk_entry_iptr && IPtr <= (sk_entry_iptr + 0x200)) {
 			       printf("[SKSB] IPtr=0x%08X addr=0x%08X BReg=0x%08X\n",
 			              IPtr, AReg, BReg);
@@ -6033,7 +6592,7 @@ DescheduleOutWord:
                            /* XXX: proc prio toggle trick of AReg lsb=1       */
                            T4DEBUG(checkWordAligned ("GAJW", AReg));
 			   temp = AReg;
-                           if (wptr_trace_enabled) {
+                           if (rare_hooks && wptr_trace_enabled) {
                                    printf("[WPtr] GAJW IPtr=0x%08X WPtr=0x%08X→0x%08X\n",
                                           IPtr, WPtr, temp);
                            }
@@ -6144,6 +6703,14 @@ DescheduleOutWord:
 			   break;
 		case 0x48: /* XXX: support ALT construct on Link0  enbc        */
 			   EMUDBG2 ("-I-EMUDBG: enbc(1): Channel=#%08X.\n", BReg);
+                           if (__builtin_expect (T9K_EXTCHAN(BReg), 0))
+                           {
+                                if ((AReg != false_t) && t9k_ext_enbc (BReg))
+                                        writeword (index (WPtr, State_s), Ready_p);
+                                BReg = CReg;
+                                IPtr++;
+                                break;
+                           }
                            otherWdesc = word (BReg);
 			   if ((AReg == true_t) && (otherWdesc == NotProcess_p))
 			   {
@@ -6767,6 +7334,11 @@ DescheduleOutWord:
                            BReg = CReg;
 		           IPtr++;
 		           break;
+		case 0x79: /* pop - pop integer stack (T425, T9000 ISM p.398) */
+			   AReg = BReg;
+			   BReg = CReg;
+			   IPtr++;
+			   break;
 		case 0xb1: /* break */
 			   IPtr++;
 			   handle_j0_break();
@@ -6801,10 +7373,8 @@ DescheduleOutWord:
 			   TimerEnableLo = 1;
 			   IPtr++;
 			   break;
-		case 0x7e: /* ldmemstartval */
-			   CReg = BReg;
-			   BReg = AReg;
-			   AReg = MemStart;
+		case 0x7e: /* ldmemstartval: the MemStart config register */
+			   t9k_vcp_exec (OReg);
 			   IPtr++;
 			   break;
 		case 0x80: /* XXX fpsttest -- M.Bruestle  */
@@ -7467,22 +8037,33 @@ DescheduleOutWord:
                            CReg = 0;
 		           IPtr++;
 		           break;
-		/* T9000 VCP / configuration instructions: no Virtual Channel
-		 * Processor or config space is modelled - fail loudly by name. */
+		/* T9000 VCP, channel and configuration instructions
+		 * (t9000_vcp.c). */
 		case 0xbc: /* insphdr */
 		case 0xbd: /* readbfr */
 		case 0xbe: /* ldconf */
 		case 0xbf: /* stconf */
 		case 0xc0: /* ldcnt */
 		case 0xc3: /* ldchstatus */
-		case 0xc7: /* cir */
 		case 0xc9: /* chantype */
-		case 0xcc: /* ciru */
-                           printf ("-E-EMU9000: unimplemented T9000 VCP/config instruction (OReg #%02X)\n", OReg);
-                           maybe_log_nearest_sym(IPtr, "t9k-vcp-unimpl");
-                           processor_state ();
-			   handler (-1);
+		           BADCODE(IsT414);
+			   IPtr++;
+			   t9k_vcp_exec (OReg);
 			   break;
+		case 0xc7: /* cir - check in range                      (T9000) */
+		           BADCODE(IsT414);
+                           if (INT32(CReg) < INT32(AReg) || INT32(CReg) > INT32(BReg))
+                               SetError;
+                           AReg = CReg;
+		           IPtr++;
+		           break;
+		case 0xcc: /* ciru - check in range unsigned            (T9000) */
+		           BADCODE(IsT414);
+                           if (CReg < AReg || CReg > BReg)
+                               SetError;
+                           AReg = CReg;
+		           IPtr++;
+		           break;
 		case 0xfa: /* cs - check sixteen                        (T9000) */
 		           BADCODE(IsT414);
                            if (INT32(AReg) < -32768 || INT32(AReg) > 32767)
@@ -7965,7 +8546,7 @@ DescheduleOutWord:
 			               fb_combo_count++;
 			           }
 			       }
-			       if (text_write_trace_enabled &&
+			       if (rare_hooks && text_write_trace_enabled &&
 			           addr >= text_write_trace_start &&
 			           addr < text_write_trace_end) {
 			           uint32_t delta = 0;
@@ -8039,7 +8620,7 @@ DescheduleOutWord:
 			               fb_wsub_count++;
 			           }
 			       }
-			       if (text_write_trace_enabled &&
+			       if (rare_hooks && text_write_trace_enabled &&
 			           addr >= text_write_trace_start &&
 			           addr < text_write_trace_end) {
 			           uint32_t delta = 0;
@@ -8474,7 +9055,7 @@ DescheduleOutWord:
                                 static float dec[256];
                                 float acc;
                                 uint32_t nblk = CReg, b;
-                                int bsz = tvx_gguf_block_bytes ((int)quant_fmt);
+                                int bsz = tvx_qfmt_block_bytes ((int)quant_fmt);
                                 int i, n;
 
                                 BADCODE(IsT414);
@@ -8489,7 +9070,7 @@ DescheduleOutWord:
 
                                         for (i = 0; i < bsz; i++)
                                                 raw[i] = byte (bp + i);
-                                        n = tvx_gguf_decode_block ((int)quant_fmt, raw, dec);
+                                        n = tvx_qfmt_decode_block ((int)quant_fmt, raw, dec);
                                         if (n <= 0)
                                                 break;
                                         ap = BReg + (uint32_t)b * (uint32_t)n * 4u;
@@ -8729,11 +9310,17 @@ DescheduleOutWord:
                                 uint32_t aptr = word (BReg);
                                 uint32_t wptr = word (BReg + 4);
                                 uint32_t nblk = CReg, r_, b;
-                                int bsz = tvx_gguf_block_bytes
+                                int bsz = tvx_qfmt_block_bytes
                                               ((int)quant_fmt);
                                 int i, n;
 
                                 BADCODE(IsT414);
+                                if (tvx_src_fmt == TVX_FMT_QACT) {
+                                        AReg = tvx_qgemm_int (AReg, aptr,
+                                                              wptr, nblk);
+                                        IPtr++;
+                                        break;
+                                }
                                 if (bsz > 0 && bsz <= (int)sizeof(raw)) {
                                     for (r_ = 0; r_ < vec_len; r_++) {
                                         float acc = 0.0f;
@@ -8749,7 +9336,7 @@ DescheduleOutWord:
 
                                             for (i = 0; i < bsz; i++)
                                                 raw[i] = byte (bp + i);
-                                            n = tvx_gguf_decode_block
+                                            n = tvx_qfmt_decode_block
                                                 ((int)quant_fmt, raw, dec);
                                             if (n <= 0)
                                                 break;
@@ -8920,6 +9507,36 @@ DescheduleOutWord:
                                 writereal32 (AReg + 56, r);
                            }
                            AReg = BReg;
+                           BReg = CReg;
+                           IPtr++;
+                           break;
+                case 0x1f9: /* vcvt     A=dst, B=src, C=dst fmt; pop 3     */
+                           /* VSETLEN elements from the VSETFMT format to
+                            * C: 0 f32, 1 bf16, 2 f16, round-to-nearest-even
+                            * - bf16 is how partial sums cross a link. */
+                           {
+                                uint32_t i, f;
+                                BADCODE(IsT414);
+                                for (i = 0; i < vec_len; i++) {
+                                        f = tvx_float_to_bits (tvx_fetch_pos (BReg, i));
+                                        if (CReg == 1 || CReg == 2) {
+                                                f = CReg == 1 ? tvx_f32_to_bf16 (f)
+                                                              : tvx_f32_to_f16 (f);
+                                                writebyte_int (AReg + 2*i, (u_char)f);
+                                                writebyte_int (AReg + 2*i + 1, (u_char)(f >> 8));
+                                        } else
+                                                writeword_int (AReg + 4*i, f);
+                                }
+                           }
+                           IPtr++;
+                           break;
+                case 0x1f7: /* vq8k     A=dst block_q8_K[], B=src; pop 2   */
+                case 0x1f8: /* vq80     A=dst block_q8_0[], B=src; pop 2   */
+                           BADCODE(IsT414);
+                           tvx_vqact (AReg, BReg, OReg == 0x1f7
+                                                  ? TVX_GGML_Q8_K
+                                                  : TVX_GGML_Q8_0);
+                           AReg = CReg;
                            BReg = CReg;
                            IPtr++;
                            break;
@@ -9205,14 +9822,7 @@ DescheduleOutWord:
                            AReg = ProductIdentity;
 			   IPtr++;
 			   break;
-		/* T9000 VCP and protection-shadow instructions.  The emulator
-		 * has physical OS-links, no Virtual Channel Processor and no
-		 * shadow register file, so these cannot be given meaningful
-		 * semantics.  Fail loudly with a name instead of "bad Icode". */
-		case 0xFFFFFFFDu: /* stshadow */
-		case 0xFFFFFFFCu: /* ldshadow */
-		case 0xFFFFFFFBu: /* tret */
-		case 0xFFFFFFF7u: /* swapgstatus */
+		/* T9000 VCP, channel and resource instructions (t9000_vcp.c) */
 		case 0xFFFFFFEEu: /* stopch */
 		case 0xFFFFFFEDu: /* vout */
 		case 0xFFFFFFECu: /* vin */
@@ -9231,8 +9841,93 @@ DescheduleOutWord:
 		case 0xFFFFFFDAu: /* erdsq */
 		case 0xFFFFFFD9u: /* stresptr */
 		case 0xFFFFFFD8u: /* ldresptr */
-                           printf ("-E-EMU9000: unimplemented T9000 VCP/shadow instruction (OReg #%08X)\n", OReg);
-                           maybe_log_nearest_sym(IPtr, "t9k-vcp-unimpl");
+			   IPtr++;
+			   t9k_vcp_exec (OReg);
+			   break;
+		case 0xFFFFFFFDu: /* stshadow (T9000, ISM 13.3) */
+		case 0xFFFFFFFCu: /* ldshadow */
+                           shadow_transfer (AReg, BReg, CReg, OReg == 0xFFFFFFFDu);
+                           AReg = BReg = CReg = Undefined_p;
+			   IPtr++;
+			   break;
+		case 0xFFFFFFDEu: /* restart - resume an interrupted L-process (ISM 13.4) */
+                           {
+                               uint32_t pds = AReg;
+
+                               if (pds & ByteSelectMask)
+                               {
+                                   SetError;
+                                   IPtr++;
+                                   break;
+                               }
+                               if (NotProcess_p != ThReg)
+                                   writeword (ThReg, t9k_status_pack (STATUSReg, FP_Error,
+                                                                      TimesliceDisabled, 0));
+                               UpdateWdescReg (GetDescWPtr(word (index (pds, T9K_PS_SWPTR))) | ProcPriority);
+                               IPtr = word (index (pds, T9K_PS_SIPTR));
+                               AReg = word (index (pds, T9K_PS_SAREG));
+                               BReg = word (index (pds, T9K_PS_SBREG));
+                               CReg = word (index (pds, T9K_PS_SCREG));
+                               EReg = word (index (pds, T9K_PS_SEREG));
+                               XReg = word (index (pds, T9K_PS_SXREG));
+                               temp = word (index (pds, T9K_PS_CNTL));
+                               STATUSReg = t9k_status_raw (temp) | (STATUSReg & GotoSNPBit);
+                               TimesliceDisabled = (temp & SB_TSDIS) != 0;
+                               FP_Error = (temp & SB_FPERROR) ? TRUE : FALSE;
+                               IntsDisabled = 0;
+                           }
+			   break;
+		case 0xFFFFFFFBu: /* tret - trap return (ISM 10.4, 13.2.2) */
+                           /* Wptr is the THDS; the trap-handler itself must
+                            * have a null trap-handler. */
+                           if (NotProcess_p != ThReg)
+                           {
+                               SetError;
+                               IPtr++;
+                               break;
+                           }
+                           {
+                               uint32_t thds = WPtr, front = word (index (thds, 2));
+                               uint32_t cntl = word (thds) & 0x7FFFFFFFu;  /* sb.ThInUse */
+
+                               writeword (thds, cntl);
+                               if (NotProcess_p != front)
+                               {
+                                   /* trap-sharing queue goes to the front of
+                                    * the scheduling list at this priority */
+                                   uint32_t back = word (index (thds, 3));
+                                   uint32_t oldf = FPtrReg[ProcPriority];
+
+                                   FPtrReg[ProcPriority] = front;
+                                   if (NotProcess_p == oldf)
+                                       BPtrReg[ProcPriority] = back;
+                                   else
+                                       writeword (index (back, Link_s), oldf);
+                                   writeword (index (thds, 2), NotProcess_p);
+                               }
+                               if (0 == AReg)
+                               {
+                                   UpdateWdescReg (GetDescWPtr(word (index (thds, 7))) | ProcPriority);
+                                   IPtr = word (index (thds, 8));
+                                   AReg = word (index (thds, 9));
+                                   BReg = word (index (thds, 10));
+                                   CReg = word (index (thds, 11));
+                                   STATUSReg = t9k_status_raw (cntl) | (STATUSReg & GotoSNPBit);
+                                   TimesliceDisabled = (cntl & SB_TSDIS) != 0;
+                                   FP_Error = (cntl & SB_FPERROR) ? TRUE : FALSE;
+                                   ThReg = thds;
+                               }
+                               else
+                               {
+                                   /* terminate the trapped process */
+                                   IPtr++;
+                                   SetGotoSNP;
+                               }
+                           }
+			   break;
+		case 0xFFFFFFF7u: /* swapgstatus - not in the ISM (tables B.4, C) */
+                           printf ("-E-EMU9000: swapgstatus (OReg #%08X) is not an IMS T9000 instruction\n", OReg);
+                           maybe_log_nearest_sym(IPtr, "t9k-not-ism");
                            processor_state ();
 			   handler (-1);
 			   break;
@@ -9321,6 +10016,10 @@ FastPrimaryError:
                 printf ("-I-EMU414: Done.\n");
 	}
 }
+#undef  Icache
+#undef  Acache
+#define Icache        (t4cpu->s_Icache)
+#define Acache        (t4cpu->s_Acache)
 
 
 void Enqueue (uint32_t wptr, uint32_t pri)
@@ -9356,6 +10055,25 @@ void Enqueue (uint32_t wptr, uint32_t pri)
 	}
 }
 
+/* Make a process ready from inside an instruction that may already have
+ * descheduled the current one.  schedule() treats the current low-priority
+ * process as running and would save it as the interrupted process when a
+ * high-priority process becomes ready; a descheduled process is waiting,
+ * so the high-priority one just joins its queue. */
+void t4_wake (uint32_t wdesc)
+{
+        if (ReadGotoSNP && LoPriority == ProcPriority &&
+            HiPriority == GetDescPriority(wdesc))
+                Enqueue (GetDescWPtr(wdesc), HiPriority);
+        else
+                schedule (wdesc);
+}
+
+uint32_t t4_product_identity (void)
+{
+        return ProductIdentity;
+}
+
 /* Add a process to the relevant priority process queue. */
 void schedule (uint32_t wdesc)
 {
@@ -9363,13 +10081,8 @@ void schedule (uint32_t wdesc)
 	uint32_t temp;
 
         wptr = GetDescWPtr(wdesc);
-#ifndef NDEBUG
         if (NotProcess_p == wptr)
-        {
-                printf ("-E-EMU414: Wdesc = #%08X. Cannot schedule NotProcess_p.\n", wdesc);
-                handler (-1);
-        }
-#endif
+                return;
         pri  = GetDescPriority(wdesc);
 
 #ifdef EMUDEBUG
@@ -9467,28 +10180,11 @@ int run_process (void)
 	if ((ProcPriority == LoPriority) && (ReadInterrupt))
 	{
 		/* Return to interrupted LoPriority process. */
-		UpdateWdescReg (GetDescWPtr(word (index (MostNeg, 11))) | LoPriority);
+		shadow_resume ();
                 T4DEBUG(checkWPtr ("RunProcess(1)", WPtr));
 	        EMUDBG3 ("-I-EMUDBG: RunProcess: ProcPriority = %s, WPtr = #%08X.\n",
                                 StrPrio(ProcPriority), WPtr);
-
-		IPtr = word (index (MostNeg, 12));
-		AReg = word (index (MostNeg, 13));
-		BReg = word (index (MostNeg, 14));
-		CReg = word (index (MostNeg, 15));
-		STATUSReg = word (index (MostNeg, 16));
-		/*EReg = word (index (MostNeg, 17));*/
-
-#ifdef EMUDEBUG
-                if (IsT800 || IsTVS)
-#endif
-                {
-                        FAReg = FARegSave;
-                        FBReg = FBRegSave;
-                        FCReg = FCRegSave;
-                }
-                ClearInterrupt; /* XXX Not necessary ??? */
-	}  
+	}
 	else
 	{
 	        lastptr = BPtrReg[ProcPriority];
@@ -9507,7 +10203,7 @@ int run_process (void)
 			if (audit >= 1 && ReadInterrupt &&
 			    (ProcPriority == LoPriority) &&
 			    GetDescWPtr(ptr) ==
-			        GetDescWPtr(word (index (MostNeg, 11)))) {
+			        GetDescWPtr(t4cpu->s_sh.wdesc)) {
 				fprintf(stderr,
 					"[INT-ALARM] interrupted process "
 					"0x%08X resumed via QUEUE (A/B/C "
@@ -9590,7 +10286,7 @@ int start_process (void)
                 }
 
                 if (Idle && ProcessQEmpty && TimerQEmpty)
-                        links_active = (0 != linkcomms ("idle", FALSE, LTO_BOOT));
+                        links_active = (0 != linkcomms ("idle", FALSE, LTO_IDLE));
                 else
                         links_active = (0 != linkcomms ("running", FALSE, LTO_COMM));
                 active = active || links_active;
@@ -9600,9 +10296,16 @@ int start_process (void)
                         break;
                 }
 
-		/* Check timer queue, update timers. */
+		/* Check timer queue, update timers.  The timer thread moves
+                 * ClockReg; the queues are still ours to run, or an idle
+                 * processor never wakes a process waiting in tin. */
                 active = active || (!TimerQEmpty);
-                if (++count1 > delayCount1 * speed_multiplier)
+                if (g_timer_threaded)
+                {
+                        if (TimerEnableHi) schedule_timerq (HiPriority);
+                        if (TimerEnableLo) schedule_timerq (LoPriority);
+                }
+                else if (++count1 > delayCount1 * speed_multiplier)
 		        update_time ();
                 if (!Idle)
                 {
@@ -9614,12 +10317,29 @@ int start_process (void)
                         if (SharedEvents[nodeid])
                                 return 1;
                 }
+                if (t4_fabric && nodeid >= 0 && t4_fabric->events && t4_fabric->events[nodeid])
+                        return 1;
+                if (t4_net_stop_requested())
+                        return 1;
+                /* A pending SIGINT/SIGTERM is normally serviced at
+                 * ExecuteInstr, which an idle emulator never reaches: a
+                 * guest parked on a timer that never fires kept
+                 * `timeout 8s t4` running for hours. */
+                if (__builtin_expect (t4_sig_pending != 0, 0)) {
+                        int sig = (int) t4_sig_pending;
+                        t4_sig_pending = 0;
+                        t4_signal_exit (sig);
+                }
         } while (active);
 
         if (!active)
         {
                 printf ("-E-EMU414: Node%d Error - stopped no Link/Process/Timer activity!\n", nodeid < 0 ? 0 : nodeid);
                 processor_state ();
+                if (t4_fabric) {
+                        t4_net_request_stop();
+                        return 1;
+                }
                 handler (-1);
         }
 
@@ -9737,18 +10457,58 @@ void interrupt (void)
 				"B=0x%08X C=0x%08X\n",
 				IPtr, Wdesc, AReg, BReg, CReg);
 	}
-	writeword (index (MostNeg, 11), Wdesc);
         if (IdleProcess_p != Wdesc)
-        {
                 EMUDBG ("-I-EMUDBG: Interrupt LoPriority process.\n");
+        shadow_save ();
+        /* Note: that an interrupted process is not placed onto the scheduling lists. */
+}
 
-	        writeword (index (MostNeg, 12), IPtr);
-	        writeword (index (MostNeg, 13), AReg);
-	        writeword (index (MostNeg, 14), BReg);
-	        writeword (index (MostNeg, 15), CReg);
-	        writeword (index (MostNeg, 16), STATUSReg);
-	        /*writeword (index (MostNeg, 17), EReg);*/
+/* ---- T9000 shadow state (ISM 13.3) --------------------------------------- */
 
+static uint32_t t9k_status_pack (uint32_t raw, int fp_error, int tsdis, int is_p)
+{
+        return ((raw & ErrorFlag) ? SB_INTOV : 0u)
+             | ((raw & HaltOnErrorFlag) ? SB_T4HALT : 0u)
+             | (fp_error ? SB_FPERROR : 0u)
+             | (tsdis ? SB_TSDIS : 0u)
+             | (is_p ? SB_ISP : 0u);
+}
+
+static uint32_t t9k_status_raw (uint32_t sb)
+{
+        return ((sb & SB_INTOV) ? ErrorFlag : 0u)
+             | ((sb & SB_T4HALT) ? HaltOnErrorFlag : 0u);
+}
+
+/* Full context switch on interruption: the low-priority process's state goes
+ * into the shadow registers.  A null interrupted process is recorded as
+ * WdescReg.sh = NotProcess.p, StatusReg.sh = 0. */
+static void shadow_save (void)
+{
+        t9k_shadow_t *sh = &t4cpu->s_sh;
+        int i;
+
+        sh->th = ThReg;
+        if (IdleProcess_p == Wdesc)
+        {
+                sh->wdesc = NotProcess_p;
+                sh->status = 0;
+        }
+        else
+        {
+                sh->wdesc = Wdesc;
+                sh->iptr = IPtr;
+                sh->a = AReg;
+                sh->b = BReg;
+                sh->c = CReg;
+                sh->e = EReg;
+                sh->x = XReg;
+                sh->status = STATUSReg;
+                sh->tsdis = TimesliceDisabled;
+                sh->bm[0] = m2dLength;
+                sh->bm[1] = m2dDestStride;
+                sh->bm[2] = m2dSourceStride;
+                sh->fp_error = FP_Error;
 #ifdef EMUDEBUG
                 if (IsT800 || IsTVS)
 #endif
@@ -9758,7 +10518,169 @@ void interrupt (void)
                         FCRegSave = FCReg;
                 }
         }
-        /* Note: that an interrupted process is not placed onto the scheduling lists. */
+        /* A P-process is interrupted as a whole: the high-priority process
+         * runs as an L-process (ISM tables 13.2, 13.6). */
+        sh->is_p = t9k_prot.is_p;
+        for (i = 0; i < 4; i++)
+                sh->region[i] = t9k_prot.region[i];
+        sh->pstate = t9k_prot.pstate_reg;
+        sh->wdescstub = t9k_prot.wdesc_stub;
+        sh->sup_iptr = t9k_prot.supervisor_iptr;
+        if (sh->is_p)
+                t9k_leave_p ();
+
+        if (!t9k_chanspace_active ())
+        {
+                /* T800 save area (WdescIntSaveLoc ...) for T800 code */
+                writeword (index (MostNeg, 11), Wdesc);
+                if (IdleProcess_p != Wdesc)
+                {
+                        writeword (index (MostNeg, 12), IPtr);
+                        writeword (index (MostNeg, 13), AReg);
+                        writeword (index (MostNeg, 14), BReg);
+                        writeword (index (MostNeg, 15), CReg);
+                        writeword (index (MostNeg, 16), STATUSReg);
+                }
+        }
+}
+
+/* Reload the interrupted process (possibly one installed by ldshadow). */
+static void shadow_resume (void)
+{
+        t9k_shadow_t *sh = &t4cpu->s_sh;
+
+        UpdateWdescReg (GetDescWPtr(sh->wdesc) | LoPriority);
+        IPtr = sh->iptr;
+        AReg = sh->a;
+        BReg = sh->b;
+        CReg = sh->c;
+        EReg = sh->e;
+        XReg = sh->x;
+        STATUSReg = sh->status;
+        TimesliceDisabled = sh->tsdis;
+        ThReg = sh->th;
+        m2dLength = sh->bm[0];
+        m2dDestStride = sh->bm[1];
+        m2dSourceStride = sh->bm[2];
+        FP_Error = sh->fp_error;
+#ifdef EMUDEBUG
+        if (IsT800 || IsTVS)
+#endif
+        {
+                FAReg = FARegSave;
+                FBReg = FBRegSave;
+                FCReg = FCRegSave;
+        }
+        if (sh->is_p)
+                t9k_resume_p (sh->region, sh->pstate, sh->wdescstub, sh->sup_iptr);
+        ClearInterrupt;
+}
+
+/* stshadow / ldshadow (ISM 13.3, figure 13.1).  Areg and Breg are shadow
+ * markers 0..7, Creg the block of store.  The floating-point group uses the
+ * fpstall layout. */
+static void shadow_transfer (uint32_t from, uint32_t to, uint32_t ptr, int store)
+{
+        t9k_shadow_t *sh = &t4cpu->s_sh;
+        uint32_t g, i, sb;
+
+        if (from >= to || to > 7u)
+                return;                         /* undefined effect */
+        for (g = from; g < to; g++)
+        {
+                switch (g)
+                {
+                case 0:
+                        for (i = 0; i < 4; i++, ptr += 4)
+                                if (store) writeword (ptr, sh->region[i]);
+                                else sh->region[i] = word (ptr);
+                        break;
+                case 1:
+                        if (store)
+                        {
+                                writeword (ptr, sh->pstate);
+                                writeword (ptr + 4, sh->wdescstub);
+                        }
+                        else
+                        {
+                                sh->pstate = word (ptr);
+                                sh->wdescstub = word (ptr + 4);
+                        }
+                        ptr += 8;
+                        break;
+                case 2:
+                        if (store) writeword (ptr, sh->th);
+                        else sh->th = word (ptr);
+                        ptr += 4;
+                        break;
+                case 3:
+                        if (store)
+                        {
+                                sb = (NotProcess_p == sh->wdesc) ? 0u :
+                                     t9k_status_pack (sh->status, sh->fp_error,
+                                                      sh->tsdis, sh->is_p);
+                                writeword (ptr, sb);
+                        }
+                        else
+                        {
+                                sb = word (ptr);
+                                sh->status = t9k_status_raw (sb);
+                                sh->tsdis = (sb & SB_TSDIS) != 0;
+                                sh->is_p = (sb & SB_ISP) != 0;
+                                sh->fp_error = (sb & SB_FPERROR) != 0;
+                        }
+                        ptr += 4;
+                        break;
+                case 4:
+                {
+                        uint32_t *r[11];
+
+                        r[0] = &sh->wdesc; r[1] = &sh->iptr; r[2] = &sh->a;
+                        r[3] = &sh->b; r[4] = &sh->c; r[5] = &sh->e; r[6] = &sh->x;
+                        r[7] = &sh->bm[0]; r[8] = &sh->bm[1]; r[9] = &sh->bm[2];
+                        r[10] = &sh->eptr;
+                        for (i = 0; i < 11; i++, ptr += 4)
+                                if (store) writeword (ptr, *r[i]);
+                                else *r[i] = word (ptr);
+                        break;
+                }
+                case 5:
+                        if (store)
+                        {
+                                writeword (ptr,
+                                           t9k_fp_lenc (FARegSave.length)
+                                         | (t9k_fp_lenc (FBRegSave.length) << 2)
+                                         | (t9k_fp_lenc (FCRegSave.length) << 4)
+                                         | (sh->fp_error ? (1u << 6) : 0u));
+                                t9k_fp_store_reg (ptr + 4,  &FARegSave);
+                                t9k_fp_store_reg (ptr + 12, &FBRegSave);
+                                t9k_fp_store_reg (ptr + 20, &FCRegSave);
+                        }
+                        else
+                        {
+                                uint32_t st = word (ptr);
+                                t9k_fp_load_reg (ptr + 4,  &FARegSave, t9k_fp_ldec (st & 3u));
+                                t9k_fp_load_reg (ptr + 12, &FBRegSave, t9k_fp_ldec ((st >> 2) & 3u));
+                                t9k_fp_load_reg (ptr + 20, &FCRegSave, t9k_fp_ldec ((st >> 4) & 3u));
+                                sh->fp_error = (st & (1u << 6)) != 0;
+                        }
+                        ptr += 28;
+                        break;
+                case 6:
+                        if (store)
+                        {
+                                writeword (ptr, sh->wl);
+                                writeword (ptr + 4, sh->wu);
+                        }
+                        else
+                        {
+                                sh->wl = word (ptr);
+                                sh->wu = word (ptr + 4);
+                        }
+                        ptr += 8;
+                        break;
+                }
+        }
 }
 
 /* Insert a process into the relevant priority process queue. */
@@ -10178,7 +11100,7 @@ uint32_t word_int (uint32_t ptr)
 
 	/* T9000: translate when P-mode, or L-mode with RODS still loaded
 	 * (soft leave_p mid C-call keeps Q3 WPtr — must relocate). */
-	if (unlikely(t9k_prot.enabled && !t9k_prot.phys_bypass))
+	if (unlikely(t9k_prot.active && !t9k_prot.phys_bypass))
 		ptr = t9k_translate(ptr, T9K_ACC_READ);
 
 	/* Fast path: normal extended memory below the historical MMIO cliff
@@ -10195,6 +11117,8 @@ uint32_t word_int (uint32_t ptr)
 #endif
 		return *(uint32_t *)(mem + (MemWordMask & ptr));
 	}
+	if (likely(CORE_RAM_ADDR(ptr)))
+		return *(uint32_t *)(core + (MemWordMask & ptr));
 
 	/* Word reads from the SD windows — T9000 boot bank ("reads for
 	 * configuration words are assembled from bytes", TIS 10.5.1) and
@@ -10209,10 +11133,25 @@ uint32_t word_int (uint32_t ptr)
 		       ((uint32_t)sd_read_byte(off + 3) << 24);
 	}
 
-	/* With -ss, Link0In is an architectural channel word.  The host
-	 * server must be able to store/read the waiting workspace descriptor
-	 * there; only use the byte-stream MMIO shim when no server is active. */
-	if (unlikely(!serve && ptr == LINK0_IN))
+	/* Link0In is an architectural channel word whenever anything real is
+	 * using it as one: with -ss the host server stores the waiting
+	 * workspace descriptor there, and on any node of a configured network
+	 * (nodeid >= 0) the guest does.  Only a standalone run with no server
+	 * and no network may treat it as the byte-stream MMIO shim.
+	 *
+	 * Getting this wrong is subtle because it is READ-ONLY: writes always
+	 * went to memory, so reset_channel's `writeword(Link0In, NotProcess_p)`
+	 * appeared to work and then read back as 0 (whatever the shim
+	 * returned).  The receive path took that 0 for the descriptor of a
+	 * blocked process and scheduled process 0 - Wdesc = 0, IPtr fetched
+	 * from word(0xFFFFFFFC) - so the node wild-jumped into the memory fill
+	 * pattern the instant it was booted.
+	 *
+	 * Only worker nodes are affected (node 0 has serve set), and only when
+	 * the network map actually gives a worker link 0 - which is why it hid
+	 * until the 16-processor c215 map, whose node 1 receives on link 0
+	 * instead of link 1. */
+	if (unlikely(!serve && nodeid < 0 && ptr == LINK0_IN))
 		return (uint32_t)mmio_iserver_read_byte();
 
 	/* Check for UART register access */
@@ -10341,13 +11280,14 @@ void writeword_int (uint32_t ptr, uint32_t value)
 	static uint32_t watch_addr = 0;
 
 	/* T9000: translate (+ write check in P-mode). L-mode still relocates Q3. */
-	if (unlikely(t9k_prot.enabled && !t9k_prot.phys_bypass))
+	if (unlikely(t9k_prot.active && !t9k_prot.phys_bypass))
 		ptr = t9k_translate(ptr, T9K_ACC_WRITE);
 
 	/* Keep the write watchpoint ahead of the normal-RAM fast return. */
 	if (!watch_addr) {
 		const char *wa = getenv("T4_WATCH_ADDR");
 		watch_addr = wa ? (uint32_t)strtoul(wa, NULL, 16) : 0xFFFFFFFF;
+		ram_watch_addr = watch_addr;
 	}
 	if (unlikely(watch_addr != 0xFFFFFFFF &&
 	    (ptr & ~3u) == (watch_addr & ~3u))) {
@@ -10357,7 +11297,6 @@ void writeword_int (uint32_t ptr, uint32_t value)
 		 * so at a stall the final writers are visible. */
 		extern uint32_t watch_ring[128][3];
 		extern uint32_t watch_ring_n;
-		extern volatile uint64_t heartbeat_counter;
 		watch_ring[watch_ring_n & 127u][0] = value;
 		watch_ring[watch_ring_n & 127u][1] = IPtr;
 		watch_ring[watch_ring_n & 127u][2] =
@@ -10395,6 +11334,11 @@ void writeword_int (uint32_t ptr, uint32_t value)
 		}
 #endif
 		*(uint32_t *)(mem + (MemWordMask & ptr)) = value;
+		InvalidateRange(ptr, 4);
+		return;
+	}
+	if (likely(CORE_RAM_ADDR(ptr))) {
+		*(uint32_t *)(core + (MemWordMask & ptr)) = value;
 		InvalidateRange(ptr, 4);
 		return;
 	}
@@ -10717,7 +11661,7 @@ u_char byte_int (uint32_t ptr)
 {
 	u_char result;
 
-	if (unlikely(t9k_prot.enabled && !t9k_prot.phys_bypass))
+	if (unlikely(t9k_prot.active && !t9k_prot.phys_bypass))
 		ptr = t9k_translate(ptr, T9K_ACC_READ);
 
 	/* Fast path: RAM below historical MMIO cliff; FB carveout redirected. */
@@ -10728,8 +11672,12 @@ u_char byte_int (uint32_t ptr)
 #endif
 		return mem[ptr & MemByteMask];
 	}
+	/* Core bytes, unless the read watchpoint at the end must see them. */
+	if (likely(CORE_RAM_ADDR(ptr) && ram_watch_addr == 0xFFFFFFFF))
+		return core[ptr & MemByteMask];
 
-	if (unlikely(!serve && ptr == LINK0_IN))
+	/* Same rule as word_int(): see the comment there. */
+	if (unlikely(!serve && nodeid < 0 && ptr == LINK0_IN))
 		return mmio_iserver_read_byte();
 
 	/* Check for SD card access */
@@ -10824,7 +11772,7 @@ u_char byte (uint32_t ptr)
 /* Write a byte to memory. */
 INLINE void writebyte_int (uint32_t ptr, u_char value)
 {
-	if (unlikely(t9k_prot.enabled && !t9k_prot.phys_bypass))
+	if (unlikely(t9k_prot.active && !t9k_prot.phys_bypass))
 		ptr = t9k_translate(ptr, T9K_ACC_WRITE);
 
 	/* Fast path: RAM below historical MMIO cliff; FB carveout redirected. */
@@ -10836,6 +11784,12 @@ INLINE void writebyte_int (uint32_t ptr, u_char value)
 		}
 #endif
 		mem[ptr & MemByteMask] = value;
+		INVALIDATE_ADDR(ptr);
+		return;
+	}
+	/* Core bytes, unless the write watchpoint at the end must see them. */
+	if (likely(CORE_RAM_ADDR(ptr) && ram_watch_addr == 0xFFFFFFFF)) {
+		core[ptr & MemByteMask] = value;
 		INVALIDATE_ADDR(ptr);
 		return;
 	}
@@ -11113,6 +12067,18 @@ INLINE void movebytes_int (uint32_t dst, uint32_t src, uint32_t len)
                 p = mem + (dst & MemByteMask);
                 q = mem + (src & MemByteMask);
                 memmove (p, q, len);
+                InvalidateRange (dst, len);
+        }
+        else if ((CoreRange(src,len) || EXT_RAM_RANGE(src,len)) &&
+                 (CoreRange(dst,len) || EXT_RAM_RANGE(dst,len)) &&
+                 ram_watch_addr == 0xFFFFFFFF)
+        {
+                /* One end in the core, the other in external RAM (the FB
+                 * windows were diverted above): two host arrays, so the
+                 * ranges cannot overlap. */
+                p = (CoreAddr(dst) ? core : mem) + (dst & MemByteMask);
+                q = (CoreAddr(src) ? core : mem) + (src & MemByteMask);
+                memcpy (p, q, len);
                 InvalidateRange (dst, len);
         }
         else
