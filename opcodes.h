@@ -153,7 +153,7 @@ char* TvxOps[] = {
 /*1EC*/ "VSETFMT",     "FTSETLIT",   "FLITB",      "QGEMM",
 /*1F0*/ "VBLEND8",     "VFILL",      "VFILL2D",    "CSUM",
 /*1F4*/ "VBLEND2D",    "STVXSTATE",  "CSUMCPY",    "VQ8K",
-/*1F8*/ "VQ80",        "VCVT"
+/*1F8*/ "VQ80",        "VCVT",       "VXFER"
 };
 #define MIN_TVX 0x1c0
-#define MAX_TVX 0x1f9
+#define MAX_TVX 0x1fa

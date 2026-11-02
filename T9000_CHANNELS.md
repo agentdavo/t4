@@ -67,10 +67,15 @@ channel words.
   acknowledge before the next is sent; the outputting process is
   rescheduled when the last packet is acknowledged.  A packet that arrives
   before its input is waiting goes to the virtual link's packet buffer and
-  is acknowledged when the input takes it.
+  is acknowledged when the input takes it.  One whose input is waiting is
+  acknowledged as soon as its header is in ("the VCP sends an acknowledge
+  packet as soon as it receives the start of the data packet", HRM 11.2.3),
+  so on a quiet path the next packet follows with no gap.
 * **Link queues** (HRM 11.2.3): per physical link, high- and low-priority
   data and acknowledge queues threaded through the VLCBs; high priority
-  first, acknowledges and data alternately within a priority.
+  first, acknowledges and data alternately within a priority.  On a timed
+  network (`T4_T9K_NET`) the queued packets become ready at different
+  cycles, and the one ready first goes first; the alternation breaks ties.
 * **Deactivated channels** (HRM 11.3.1) send nothing and perform no
   scheduling; acknowledges, completions, ALT wake-ups and resource claims
   are held and carried out by `setchmode` on activation.
@@ -98,6 +103,21 @@ header - need an IMS C104 in the path to delete the routing part; see
 `initvlcb`, `sethdr`, `writehdr`, `readhdr`, `insphdr`, `readbfr`,
 `swapbfr`, `setchmode`, `stopch`, `resetch`, `ldchstatus`, `chantype`,
 `vin`, `vout`, `ldcnt`, `ldconf`, `stconf`, `ldmemstartval`.
+
+**VXFER** (TVX OPR `0x1FA`, not a T9000 instruction; `__vxfer` in
+`include/t9000.h`).  A = a list of `{channel, buffer, length}` words, B = the
+number of entries.  It starts every transfer on the list, deschedules once,
+and wakes the process when all are done - one instruction where a collective
+step otherwise needs a process per transfer.  An input entry takes up to
+`length` bytes, and the count received (or `LengthError.p`) replaces the
+entry's length.  An output entry is *posted*: it is done once its last
+packet has left the node, when its buffer is free again.  The VCP still
+takes the final acknowledge, and that virtual link's next message waits for
+it as any next packet does, so ordering and flow control are unchanged; the
+process just does not wait for the acknowledge's round trip.  `vout` and `out`
+keep the T9000's synchronous completion.  VXFER is privileged like `vin` and
+`vout`: in a P-process it traps to the supervisor.  Its cost in the cycle
+model is 20 cycles plus 3 per entry.
 
 ## Configuration space (HRM ch.15)
 
@@ -389,9 +409,13 @@ bring up virtual links.
 
 **Virtual links per node.**  Their channel words run from `#80000040` to
 MemStart, and T4 (and the compiler's linker) put MemStart at `#80000070`,
-so a node has at most **six** virtual links.  `initvlcb` on a seventh raises
-IntegerError, and channel words from `#80000070` up are the program's own
-code.
+so a node starts with **six** virtual links; `initvlcb` on a seventh raises
+IntegerError.  MemStart is a writable configuration register (HRM ch.15):
+`__stconf(T9_CR_MEMSTART, (unsigned)T9_VIN(n))` before
+`t9_vcp_channels(n)` gives n.  The channel addresses from `#80000070` up then
+coincide with the boot code, which is harmless: VLCBs live inside the VCP,
+and only channel instructions treat those addresses as channels.
+`ffn_cube.c -DSPLIT=k` uses 6k.
 
 **Cycle model.**  With `T4_T9000=1` and `T4_T9K_NET=1|2` (see
 `t9000_group.h`), every link message carries its sender's ready cycle, in a
@@ -408,13 +432,16 @@ stamped before a packet already queued is not held behind it, but keeps the
 link busy for its bytes.
 
 Measured (transputer/tests/net in the compiler tree): 24 KB over one cable,
-one virtual link 1.36x the raw link time at 9 MB/s and 3.43x at 90 MB/s,
-three links 1.06x and 1.16x; byte stream 1.00x.  Each virtual link waits for
-every 32-byte packet's acknowledge, so through a switch one link per cable
-gets about 54% of a 9 MB/s DS-link.  DeepSeek's shared-expert FFN on 8
-nodes and three C104s (`c104.sh`): 5.7 ms at 9 MB/s, 4.7 ms at 90 MB/s, both
-within 10% of a model that charges every packet its acknowledge round trip;
-the same FFN on an 8-node hypercube of byte-stream links takes 6.7 ms.
+one virtual link 1.06x the raw link time at 9 MB/s and 2.42x at 90 MB/s,
+three links 1.06x and 1.09x; byte stream 1.00x (`vlbw.sh`).  Each virtual
+link waits for every 32-byte packet's acknowledge, so a fast link or a path
+through switches needs several in flight.  A collective step through one
+C104 (`msglat.sh`, 4-byte messages at 9 MB/s): 139 cycles with one VXFER,
+of which 99 are the wire; 213 with a process per output, which waits for
+the last acknowledge.  DeepSeek's shared-expert FFN on 8 nodes and three
+C104s (`c104.sh`, VXFER, three virtual links per peer and plane): 5.16 ms
+at 9 MB/s and 4.13 ms at 90 MB/s - with one per peer, 5.35 and 4.55 ms; the
+same FFN on an 8-node hypercube of byte-stream links takes 6.73 ms.
 
 ## Testing
 

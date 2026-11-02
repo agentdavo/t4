@@ -220,6 +220,7 @@ typedef struct {
     int      net_defer;
     uint64_t net_not_before;
     uint64_t net_arrival;
+    uint64_t net_start;       /* when that packet started arriving          */
     int      c104_lat;        /* cycles a C104 adds to route a packet       */
     uint64_t link_in_last[4]; /* ready cycle of the latest packet queued    */
     uint64_t link_out_last[4];
@@ -985,6 +986,14 @@ static inline int t9k_class_opr(int oreg, uint32_t creg, uint32_t veclen,
             *latency = 3;
             return T9K_SLOW;
         }
+        if (oreg == 0x1FA) {                  /* VXFER: creg = entries   */
+            /* One in/out's process overhead for the whole group, plus the
+             * three descriptor words read per entry handed to the VCP. */
+            uint64_t n = creg ? creg : 1;
+            if (n > 1000000u) n = 1000000u;
+            *latency = 20 + 3 * (int)n;
+            return T9K_SLOW;
+        }
         if (oreg >= 0x1C0 && oreg <= 0x1F9) { /* TVX + TVX-GFX           */
             /* Block and vector ops do a lot of work per issue; scalar
              * conversions are single-cycle ALU operations.  The figures
@@ -1241,6 +1250,7 @@ static inline void t9k_net_received(int link, uint64_t ready, uint32_t nbytes)
         t9k.link_in_free[link & 3] += t9k_link_xfer(nbytes);
     }
     if (t9k.net_defer) {
+        t9k.net_start = start;
         t9k.net_arrival = start + t9k_link_xfer(nbytes) + (uint64_t)t9k.link_lat;
         return;
     }

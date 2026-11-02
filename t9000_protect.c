@@ -322,6 +322,7 @@ int t9k_is_privileged_op(uint32_t oreg)
 	case 0xFFFFFFD8u: /* ldresptr */
 	case 0xFFFFFFD3u: /* icl */
 	case 0xFFFFFFD2u: /* fdcl */
+	case 0x1FA: /* vxfer (TVX): starts VCP transfers, like vin/vout */
 		return 1;
 	default:
 		return 0;

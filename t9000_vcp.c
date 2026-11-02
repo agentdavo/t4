@@ -112,6 +112,12 @@ typedef struct t9k_vlink {
          * the owed acknowledge may leave; the cycle the buffered packet
          * arrived */
         uint64_t t_data, t_ack, t_buf;
+
+        /* VXFER: the transfer belongs to its process's group; an input's
+         * length goes back to in_cnt_at.  out_posted: a group's output
+         * whose last packet has left, the final acknowledge still to come */
+        uint8_t  in_grp, out_grp, out_posted;
+        uint32_t in_cnt_at;
 } t9k_vlink_t;
 
 typedef struct t9k_plink {
@@ -148,6 +154,10 @@ typedef struct t9k_vcp {
         int      nmisc;
         uint32_t misc_addr[NMISC], misc_val[NMISC];
         uint64_t t_rx;                  /* arrival cycle of the packet in hand */
+        uint64_t t_head;                /* and of its header (HRM 11.2.3) */
+        /* processes waiting for a group of transfers (VXFER): transfers
+         * left, and the latest cycle one of them finished */
+        struct { uint32_t wdesc, left; uint64_t t; } grp[8];
 } t9k_vcp_t;
 
 /* T4_T9K_NET (p.c, t9000_group.h).  The VCP is hardware beside the CPU, so
@@ -157,6 +167,8 @@ typedef struct t9k_vcp {
 int      t9k_net_timed (void);
 void     t9k_net_defer (int on, uint64_t not_before);
 uint64_t t9k_net_arrival (void);
+uint64_t t9k_net_head (unsigned hl);
+uint64_t t9k_net_link_free (int link);
 uint64_t t9k_net_now (void);
 void     t9k_net_wake_at (uint64_t t);
 
@@ -588,12 +600,36 @@ static void out_queue_data (t9k_vcp_t *v, uint32_t n)
                 q_push (v, n, 0, l->out_prio);
 }
 
+/* One transfer of w's VXFER group is done; 1 if it was the last, with
+ * v->t_rx set to when the group's latest transfer finished. */
+static int grp_done (t9k_vcp_t *v, uint32_t w)
+{
+        int g;
+
+        for (g = 0; g < 8; g++)
+                if (v->grp[g].left && v->grp[g].wdesc == w)
+                        break;
+        if (g == 8)
+                return 1;
+        if (v->t_rx > v->grp[g].t)
+                v->grp[g].t = v->t_rx;
+        if (--v->grp[g].left)
+                return 0;
+        v->t_rx = v->grp[g].t;
+        return 1;
+}
+
 static void out_complete (t9k_vcp_t *v, uint32_t n)
 {
         t9k_vlink_t *l = &v->vl[n];
         uint32_t w = l->out_wdesc;
 
         l->out_wdesc = NOTPROC;
+        if (l->out_grp) {
+                l->out_grp = 0;
+                if (!grp_done (v, w))
+                        return;                 /* more of its group to come */
+        }
         if (l->out_active) {
                 vcp_wake_at (v->t_rx);
                 t4_wake (w);
@@ -601,18 +637,47 @@ static void out_complete (t9k_vcp_t *v, uint32_t n)
                 l->out_sched = w;
 }
 
+/* A VXFER output is done for its group once its last packet has left on
+ * `link`: the buffer is free then.  The VCP takes the final acknowledge
+ * itself (rx_ack), and the link's next message waits for it as any next
+ * packet does, so only the process stops waiting for the round trip. */
+static void out_post (t9k_vcp_t *v, uint32_t n, int link)
+{
+        t9k_vlink_t *l = &v->vl[n];
+        uint32_t w = l->out_wdesc;
+        uint64_t t_rx = v->t_rx;
+
+        l->out_grp = 0;
+        l->out_posted = 1;
+        l->out_wdesc = NOTPROC;
+        v->t_rx = t9k_net_timed () ? t9k_net_link_free (link) : 0;
+        if (grp_done (v, w)) {
+                vcp_wake_at (v->t_rx);
+                t4_wake (w);
+        }
+        v->t_rx = t_rx;
+}
+
 static void in_complete (t9k_vcp_t *v, uint32_t n)
 {
         t9k_vlink_t *l = &v->vl[n];
         uint32_t w = l->in_wdesc;
 
-        if (l->in_vlen)
+        if (l->in_grp)                          /* into the VXFER entry */
+                writeword (l->in_cnt_at,
+                           l->in_overrun ? T9K_LENGTHERROR_P : l->in_count);
+        else if (l->in_vlen)
                 writeword (WSLOT(DWPTR(w), W_POINTER),
                            l->in_overrun ? T9K_LENGTHERROR_P : l->in_count);
         l->in_wdesc = NOTPROC;
         l->in_vlen = 0;
         VDBG (v, "vl%u input complete, %u bytes%s\n", n, l->in_count,
               l->in_overrun ? " (too long)" : "");
+        if (l->in_grp) {
+                l->in_grp = 0;
+                if (!grp_done (v, w))
+                        return;
+        }
         if (l->in_active) {
                 vcp_wake_at (v->t_rx);
                 t4_wake (w);
@@ -636,7 +701,10 @@ static void in_deliver (t9k_vcp_t *v, uint32_t n, u_char *d, uint32_t len, int l
                 l->in_limit -= take;
         }
         l->in_count += len;
-        l->t_ack = v->t_rx;             /* acknowledged once it is in */
+        /* "The VCP sends an acknowledge packet as soon as it receives the
+         * start of the data packet, provided a process is ready to receive
+         * the message" (HRM 11.2.3): the next packet follows with no gap */
+        l->t_ack = v->t_head;
         owe_ack (v, n, DPRI(l->in_wdesc));
         if (last)
                 in_complete (v, n);
@@ -673,14 +741,18 @@ static void vcp_error (t9k_vcp_t *v, int link, uint32_t code, uint32_t hdr)
 static void rx_ack (t9k_vcp_t *v, int link, uint32_t n)
 {
         t9k_vlink_t *l = vl_get (v, n);
+        int posted;
 
         if (!l->out_await_ack) {
                 /* not one of the HRM 11.9 error classes: nothing to ack */
                 VDBG (v, "link%d: acknowledge for idle vl%u ignored\n", link, n);
                 return;
         }
+        posted = l->out_posted;
         l->out_await_ack = 0;
-        l->t_data = v->t_rx;            /* the next packet may go now */
+        l->out_posted = 0;
+        if (v->t_rx > l->t_data)
+                l->t_data = v->t_rx;    /* the next packet may go now */
         if (l->stop_wdesc != NOTPROC) {
                 uint32_t s = l->stop_wdesc;
 
@@ -689,6 +761,10 @@ static void rx_ack (t9k_vcp_t *v, int link, uint32_t n)
                 l->out_left = 0;
                 VDBG (v, "vl%u output stopped\n", n);
                 t4_wake (s);
+                return;
+        }
+        if (posted) {                   /* its process went on long ago */
+                out_queue_data (v, n);  /* the next message, if one began */
                 return;
         }
         if (l->out_last)
@@ -804,6 +880,9 @@ void t9k_link_rx (int link)
                 if (n < 0)
                         break;
                 v->t_rx = t9k_net_timed () ? t9k_net_arrival () : 0;
+                v->t_head = t9k_net_timed ()
+                        ? t9k_net_head ((v->plink[link].vmode & T9K_VLM_HEADER2) ? 2u : 1u)
+                        : 0;
                 rx_packet (v, link, pkt, n);
         }
         /* acknowledges and follow-on data packets go out at once */
@@ -825,19 +904,38 @@ void t9k_vcp_serve_links (void)
 }
 
 /* Next virtual link to serve on physical link p: high priority before low,
- * acknowledges and data alternately within a priority (HRM 11.2.3). */
-static int32_t tx_pick (t9k_plink_t *p, int *is_ack, int *pri)
+ * acknowledges and data alternately within a priority (HRM 11.2.3).  On a
+ * timed network (T4_T9K_NET) the queued packets become ready at different
+ * cycles - an acknowledge once its data started arriving, data once the
+ * last packet was acknowledged - and the link sends whichever is ready
+ * first; the alternation only breaks ties.  Taking them in queue order let
+ * a packet ready late hold the link while one ready early waited. */
+static int32_t tx_pick (t9k_vcp_t *v, t9k_plink_t *p, int *is_ack, int *pri)
 {
         int pr;
 
         for (pr = 0; pr < 2; pr++) {
                 int a = p->aq_head[pr] >= 0, d = p->dq_head[pr] >= 0;
+                int32_t best, n;
+                uint64_t t;
 
                 if (!a && !d)
                         continue;
                 *pri = pr;
                 *is_ack = a && (!d || p->ack_turn[pr]);
-                return *is_ack ? p->aq_head[pr] : p->dq_head[pr];
+                best = *is_ack ? p->aq_head[pr] : p->dq_head[pr];
+                if (!t9k_net_timed ())
+                        return best;
+                t = *is_ack ? v->vl[best].t_ack : v->vl[best].t_data;
+                for (n = p->aq_head[pr]; n >= 0; n = v->vl[n].aq_next)
+                        if (v->vl[n].t_ack < t) {
+                                best = n; t = v->vl[n].t_ack; *is_ack = 1;
+                        }
+                for (n = p->dq_head[pr]; n >= 0; n = v->vl[n].dq_next)
+                        if (v->vl[n].t_data < t) {
+                                best = n; t = v->vl[n].t_data; *is_ack = 0;
+                        }
+                return best;
         }
         return -1;
 }
@@ -863,7 +961,7 @@ void t9k_link_tx (int link)
         }
         for (guard = 0; guard < 64; guard++) {
                 int is_ack = 0, pri = 0, h, len;
-                int32_t n = tx_pick (p, &is_ack, &pri);
+                int32_t n = tx_pick (v, p, &is_ack, &pri);
                 t9k_vlink_t *l;
                 uint32_t cnt = 0;
                 int last = 0;
@@ -906,6 +1004,8 @@ void t9k_link_tx (int link)
                         l->out_left -= cnt;
                         l->out_await_ack = 1;
                         l->out_last = (uint8_t)last;
+                        if (last && l->out_grp)
+                                out_post (v, (uint32_t)n, link);
                 }
                 VDBG (v, "link%d tx vl%d %s %u bytes\n", link, n,
                       is_ack ? "ack" : (last ? "EOM" : "EOP"), cnt);
@@ -1070,39 +1170,130 @@ int t9k_event_out_pin (int n)
 
 /* ---- communication on external channels --------------------------------- */
 
-static void v_out (t9k_vcp_t *v, uint32_t n, uint32_t src, uint32_t len)
+/* A transfer is set up for process w, w is descheduled, then the transfer
+ * goes: done in that order because it can finish - and wake w - at once.
+ * VXFER sets up several and deschedules once. */
+static void v_out_begin (t9k_vcp_t *v, uint32_t n, uint32_t src, uint32_t len, uint32_t w)
 {
         t9k_vlink_t *l = vl_get (v, n);
 
         if (l->out_wdesc != NOTPROC)
                 int_error (v, "output on a busy virtual channel", vin_addr (n) + 4u);
-        l->out_wdesc = CURWDESC;
+        l->out_wdesc = w;
         l->out_ptr = src;
         l->out_left = len;
         l->out_prio = (uint8_t)ProcPriority;
         l->out_last = 0;
-        l->t_data = vcp_now ();         /* the first packet goes from here */
-        deschedule ();
+        /* the first packet goes from here - or, after a posted VXFER
+         * output, once that one's final acknowledge is in */
+        if (vcp_now () > l->t_data || !l->out_await_ack)
+                l->t_data = vcp_now ();
         VDBG (v, "vl%u out %u bytes from #%08X\n", n, len, src);
-        out_queue_data (v, n);
-        vcp_kick (v, l->link);
 }
 
-static void v_in (t9k_vcp_t *v, uint32_t n, uint32_t dst, uint32_t max, int kind)
+static void v_out_go (t9k_vcp_t *v, uint32_t n)
+{
+        out_queue_data (v, n);
+        vcp_kick (v, vl_get (v, n)->link);
+}
+
+static void v_out (t9k_vcp_t *v, uint32_t n, uint32_t src, uint32_t len)
+{
+        v_out_begin (v, n, src, len, CURWDESC);
+        deschedule ();
+        v_out_go (v, n);
+}
+
+static void v_in_begin (t9k_vcp_t *v, uint32_t n, uint32_t dst, uint32_t max, int kind,
+                        uint32_t w)
 {
         t9k_vlink_t *l = vl_get (v, n);
 
         if (l->in_wdesc != NOTPROC && !l->in_alt)
                 int_error (v, "input on a busy virtual channel", vin_addr (n));
-        l->in_wdesc = CURWDESC;
+        l->in_wdesc = w;
         l->in_alt = 0;
         l->in_ptr = dst;
         l->in_limit = max;
         l->in_count = 0;
         l->in_vlen = (uint8_t)(kind == T9K_IO_VARIABLE);
         l->in_overrun = 0;
-        deschedule ();
         VDBG (v, "vl%u in up to %u bytes to #%08X\n", n, max, dst);
+}
+
+static void v_in_go (t9k_vcp_t *v, uint32_t n);
+
+static void v_in (t9k_vcp_t *v, uint32_t n, uint32_t dst, uint32_t max, int kind)
+{
+        v_in_begin (v, n, dst, max, kind, CURWDESC);
+        deschedule ();
+        v_in_go (v, n);
+}
+
+/* VXFER (TVX OPR 0x1FA, transputer-tcc __vxfer): start n transfers on
+ * virtual channels at once and wake the process when every one is done.
+ * list holds n {channel, buffer, length} words: an output channel sends
+ * length bytes; an input channel takes up to length bytes, and the length
+ * received goes back over the entry's length (LengthError.p on an
+ * overrun), as vin leaves it for ldcnt.  One instruction and one
+ * deschedule for the lot, where software needs a process per transfer.
+ * An output is posted: it is done once its last packet has left, and the
+ * group does not wait for the final acknowledge's round trip (out_post). */
+void t9k_vcp_group (uint32_t list, uint32_t n)
+{
+        t9k_vcp_t *v = vcp_get ();
+        uint32_t w = CURWDESC, i, idx, chan, e;
+        int g, k, started = 0;
+
+        if (n == 0)
+                return;
+        for (g = 0; g < 8 && v->grp[g].left; g++)
+                ;
+        if (g == 8) {
+                int_error (v, "vxfer: eight groups already waiting", list);
+                return;
+        }
+        for (i = 0; i < n; i++) {
+                e = list + 12u * i;
+                chan = word (e);
+                if (bad_align (v, chan, "vxfer"))
+                        continue;
+                k = chan_kind (v, chan, &idx);
+                if (k == K_V_OUT) {
+                        v_out_begin (v, idx, word (e + 4u), word (e + 8u), w);
+                        vl_get (v, idx)->out_grp = 1;
+                } else if (k == K_V_IN) {
+                        v_in_begin (v, idx, word (e + 4u), word (e + 8u), T9K_IO_VARIABLE, w);
+                        vl_get (v, idx)->in_grp = 1;
+                        vl_get (v, idx)->in_cnt_at = e + 8u;
+                } else {
+                        int_error (v, "vxfer: not a virtual channel", chan);
+                        continue;
+                }
+                started++;
+        }
+        if (!started)
+                return;
+        v->grp[g].wdesc = w;
+        v->grp[g].left = (uint32_t)started;
+        v->grp[g].t = 0;
+        deschedule ();
+        for (i = 0; i < n; i++) {
+                chan = word (list + 12u * i);
+                if (chan & 3u)
+                        continue;
+                k = chan_kind (v, chan, &idx);
+                if (k == K_V_OUT)
+                        v_out_go (v, idx);
+                else if (k == K_V_IN)
+                        v_in_go (v, idx);
+        }
+}
+
+static void v_in_go (t9k_vcp_t *v, uint32_t n)
+{
+        t9k_vlink_t *l = vl_get (v, n);
+
         if (l->buf_state) {
                 u_char tmp[T9K_MAX_PACKET];
                 u_char *d = bytes_int (l->buf, tmp, l->buf_len);
@@ -1117,6 +1308,7 @@ static void v_in (t9k_vcp_t *v, uint32_t n, uint32_t dst, uint32_t max, int kind
                 l->buf_len = 0;
                 /* taken now, or when it arrived if that is later */
                 v->t_rx = vcp_now () > l->t_buf ? vcp_now () : l->t_buf;
+                v->t_head = v->t_rx;
                 in_deliver (v, n, d, len, last);
         }
         vcp_kick (v, l->link);

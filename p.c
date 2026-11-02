@@ -222,6 +222,15 @@ void t9k_net_defer (int on, uint64_t not_before)
 }
 
 uint64_t t9k_net_arrival (void) { return t9k.net_arrival; }
+
+/* When the first hl bytes - the header - of that packet were in. */
+uint64_t t9k_net_head (unsigned hl)
+{
+        return t9k.net_start + t9k_link_xfer (hl) + (uint64_t)t9k.link_lat;
+}
+
+/* When the packet just sent on link has left. */
+uint64_t t9k_net_link_free (int link) { return t9k.link_free[link & 3]; }
 uint64_t t9k_net_now (void)     { return t9k_cycles_so_far (); }
 void t9k_net_wake_at (uint64_t t) { t9k_advance_to (t); }
 
@@ -5027,7 +5036,9 @@ ExecuteInstr:
 					combined[ci].code1, Arg1,
 					CReg, vec_len, t9k_bytes);
 		} else if (Icode == 0xf0) {
-			int lat, kind = t9k_class_opr((int)OReg, CReg,
+			/* VXFER counts its entries in B, not C */
+			int lat, kind = t9k_class_opr((int)OReg,
+						      OReg == 0x1fa ? BReg : CReg,
 						      vec_len, &lat);
 			t9k_issue(kind, lat, t9k_bytes);
 		} else {
@@ -9636,6 +9647,11 @@ DescheduleOutWord:
                                 }
                            }
                            IPtr++;
+                           break;
+                case 0x1fa: /* vxfer    A=list of {chan,buf,len}, B=count  */
+                           BADCODE(IsT414);
+                           IPtr++;
+                           t9k_vcp_group (AReg, BReg);
                            break;
                 case 0x1f7: /* vq8k     A=dst block_q8_K[], B=src; pop 2   */
                 case 0x1f8: /* vq80     A=dst block_q8_0[], B=src; pop 2   */

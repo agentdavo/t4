@@ -113,6 +113,10 @@ void t9k_internal_claim(uint32_t chan);
  * caller has advanced IPtr.  Returns 0 if op is not handled here. */
 int  t9k_vcp_exec(uint32_t op);
 
+/* VXFER: start the n {channel, buffer, length} transfers at list, deschedule
+ * once and wake when all are done. */
+void t9k_vcp_group(uint32_t list, uint32_t n);
+
 /* Interrupt save-area handling: once the T9000 channel space is in use the
  * T800 save area at #8000002C.. overlaps event channel words. */
 int  t9k_chanspace_active(void);
