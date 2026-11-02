@@ -199,6 +199,11 @@ typedef struct {
     int      tern_lanes;      /* add/subtract lanes for that dot when the
                                  weights are ternary - IQ1_S, IQ1_M, TQ1_0,
                                  TQ2_0 (0 = same as int_lanes)             */
+    /* QGEMM's activation pointer as executed (p.c; bit 0: the vector is
+     * unchanged since a QGEMM loaded it), and what the activation buffer
+     * holds - address, bytes per block, blocks (0: nothing). */
+    uint32_t qg_acts;
+    uint32_t act_tag, act_tag_blk, act_tag_n;
     int      act_buf;         /* QGEMM activation buffer, bytes: a row's
                                  activations that fit are read once per
                                  instruction (0 = streamed every row)      */
@@ -856,7 +861,11 @@ static inline int t9k_opr_bw(int oreg, uint32_t creg, uint32_t *mac,
          * (292 bytes per 256) for the K- and i-quants, Q8_0 (34 per 32) for
          * the rest - whose dot runs on the integer lanes.  A row of CReg
          * blocks whose activations fit T4_T9K_ACTBUF is read once for all
-         * rows, leaving only the weights to stream. */
+         * rows, leaving only the weights to stream.  The buffer keeps them
+         * after the instruction, tagged with their address: bit 0 of the
+         * next QGEMM's activation pointer says the program has not changed
+         * that vector since, and then a tag match skips the read - gate and
+         * up of one input, or the row chunks of one matrix, load it once. */
         uint32_t ne, bytes, act;
         if (!t9k_qfmt_geom(quant_fmt, &ne, &bytes))
             return 0;
@@ -872,10 +881,21 @@ static inline int t9k_opr_bw(int oreg, uint32_t creg, uint32_t *mac,
         *wr = 1;
         if (t9k.act_buf > 0
             && (uint64_t)act * creg <= (uint64_t)t9k.act_buf) {
+            uint32_t a = t9k.qg_acts & ~1u;
+
             *rd = bytes;
-            *rd_once = (uint64_t)act * creg;
+            if ((t9k.qg_acts & 1u) && t9k.act_tag_n && a == t9k.act_tag &&
+                act == t9k.act_tag_blk && creg <= t9k.act_tag_n) {
+                *rd_once = 0;                   /* still in the buffer */
+            } else {
+                *rd_once = (uint64_t)act * creg;
+                t9k.act_tag = a;
+                t9k.act_tag_blk = act;
+                t9k.act_tag_n = creg;
+            }
         } else {
             *rd = bytes + act;
+            t9k.act_tag_n = 0;                  /* streamed through it */
         }
         return 1;
     }

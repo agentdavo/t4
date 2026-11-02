@@ -5050,6 +5050,9 @@ ExecuteInstr:
 					combined[ci].code1, Arg1,
 					CReg, vec_len, t9k_bytes);
 		} else if (Icode == 0xf0) {
+			/* QGEMM's activation buffer is tagged by address */
+			if (OReg == 0x1ef)
+				t9k.qg_acts = word (BReg);
 			/* VXFER counts its entries in B, not C */
 			int lat, kind = t9k_class_opr((int)OReg,
 						      OReg == 0x1fa ? BReg : CReg,
@@ -9465,7 +9468,9 @@ DescheduleOutWord:
                            {
                                 static T4_THREAD_LOCAL uint8_t raw[256];
                                 static T4_THREAD_LOCAL float dec[256];
-                                uint32_t aptr = word (BReg);
+                                /* bit 0: the vector is unchanged since a
+                                 * QGEMM loaded it (timing only) */
+                                uint32_t aptr = word (BReg) & ~1u;
                                 uint32_t wptr = word (BReg + 4);
                                 uint32_t nblk = CReg, r_, b;
                                 int bsz = tvx_qfmt_block_bytes
