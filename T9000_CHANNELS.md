@@ -424,7 +424,10 @@ slot after the mailbox data in a threaded network.  The model is per node:
 buffers, and `T4_T9K_MARKS` lines carry the node (`[T9000-MARK] n3 tag`).
 The VCP keeps per-virtual-link times: a data packet leaves when the previous
 one was acknowledged, an acknowledge when its data arrived, and the CPU
-waits only when the VCP wakes a process.  A C104 adds `T4_T9K_LINKLAT` per
+waits only when the VCP wakes a process.  Even then only an idle CPU waits:
+while it runs another process, the woken one joins the queue when the CPU's
+clock reaches the cycle its transfer finished, so a node computes while its
+VCP moves data (`ffn_cube.c -DOVERLAP`).  A C104 adds `T4_T9K_LINKLAT` per
 hop and `T4_T9K_C104LAT` (20 cycles) to route, and serialises each output
 link; a packet's bytes are counted once along a path (wormhole).  Packets
 reach a link in host order, which through a switch is not cycle order: one

@@ -196,6 +196,9 @@ typedef struct {
                                  the documented single write port)         */
     int      int_lanes;       /* integer MAC lanes for the Q8_K dot of QGEMM
                                  (0 = same as mac_lanes)                   */
+    int      tern_lanes;      /* add/subtract lanes for that dot when the
+                                 weights are ternary - IQ1_S, IQ1_M, TQ1_0,
+                                 TQ2_0 (0 = same as int_lanes)             */
     int      act_buf;         /* QGEMM activation buffer, bytes: a row's
                                  activations that fit are read once per
                                  instruction (0 = streamed every row)      */
@@ -225,6 +228,13 @@ typedef struct {
     uint64_t link_in_last[4]; /* ready cycle of the latest packet queued    */
     uint64_t link_out_last[4];
     int      net_ooo;         /* the send being made is out of host order   */
+    /* Processes the VCP finished a transfer for while the CPU was running
+     * another one: each joins the queue once the CPU's clock reaches the
+     * cycle its transfer was done (t9k_net_release), so the CPU keeps
+     * working meanwhile - the VCP runs beside it. */
+    struct { uint32_t wdesc; uint64_t t; } net_pend[32];
+    int      net_npend;
+    uint64_t net_pend_min;    /* the earliest of their cycles               */
     /* Decoupled-execution timeline.  Only used when slow_pipelined is set;
      * the default path adds latency blindly, as before, so the documented
      * T9000 numbers are reproduced bit-for-bit. */
@@ -282,6 +292,7 @@ static inline void t9k_init(void)
         { "T4_T9K_RDBW",       8,  offsetof(t9k_state, rd_bw)           },
         { "T4_T9K_WRBW",       4,  offsetof(t9k_state, wr_bw)           },
         { "T4_T9K_INTLANES",   0,  offsetof(t9k_state, int_lanes)       },
+        { "T4_T9K_TERNLANES",  0,  offsetof(t9k_state, tern_lanes)      },
         { "T4_T9K_ACTBUF",     0,  offsetof(t9k_state, act_buf)         },
         { "T4_T9K_NET",        0,  offsetof(t9k_state, net_on)          },
         { "T4_T9K_LINKMBPS",   9,  offsetof(t9k_state, link_mbps)       },
@@ -332,7 +343,7 @@ static inline void t9k_init(void)
              * record words and FSINCOSB's {sin,cos} pairs are spec'd as
              * paired 64-bit stores (8-byte-aligned destinations) to
              * make the write path real at instruction level. */
-            if (prof[1] && prof[2] && (prof[3] == '2' || prof[3] == '3')) {
+            if (prof[1] && prof[2] && prof[3] >= '2' && prof[3] <= '4') {
                 if (!getenv("T4_T9K_MACLANES")) t9k.mac_lanes = 8;
                 if (!getenv("T4_T9K_RDBW"))     t9k.rd_bw = 16;
                 if (!getenv("T4_T9K_WRBW"))     t9k.wr_bw = 8;
@@ -345,17 +356,32 @@ static inline void t9k_init(void)
              * buffer and 64 integer MAC lanes.  On DeepSeek-V4.1-Flash that
              * takes a layer from 104.6M to 11.3M cycles, within 10% of the
              * 16 B/cycle weight-read floor (tests/bench/layer.sh). */
-            if (prof[1] && prof[2] && prof[3] == '3') {
+            if (prof[1] && prof[2] && (prof[3] == '3' || prof[3] == '4')) {
                 if (!getenv("T4_T9K_ACTBUF"))   t9k.act_buf = 16384;
                 if (!getenv("T4_T9K_INTLANES")) t9k.int_lanes = 64;
                 fprintf(stderr,
                     "[T9000] profile 'tvx3': + 16 KB QGEMM activation "
                     "buffer, 64 integer MAC lanes\n");
             }
+            /* T4_T9K_PROFILE=tvx4: tvx3 plus ternary lanes.  IQ1_S and
+             * IQ1_M weights are grid values in {-1, 0, +1} (the delta term
+             * comes from the Q8_K block sums), so their dot against Q8_K
+             * needs no multiplier: a lane is an int8 add/subtract, about a
+             * quarter of an 8x8 MAC.  At 64 MAC lanes those experts are
+             * MAC-bound - 4 cycles per 50-byte block against 3.1 to read
+             * it, 1.29x the weight-read floor (layer.sh) - and 256 ternary
+             * lanes make them read-bound. */
+            if (prof[1] && prof[2] && prof[3] == '4') {
+                if (!getenv("T4_T9K_TERNLANES")) t9k.tern_lanes = 256;
+                fprintf(stderr,
+                    "[T9000] profile 'tvx4': + 256 ternary add/subtract "
+                    "lanes\n");
+            }
         }
     }
     if (t9k.mac_lanes < 1) t9k.mac_lanes = 1;
     if (t9k.int_lanes < 1) t9k.int_lanes = t9k.mac_lanes;
+    if (t9k.tern_lanes < 1) t9k.tern_lanes = t9k.int_lanes;
     if (t9k.n_units < 1) t9k.n_units = 1;
     if (t9k.n_units > T9K_MAX_UNITS) t9k.n_units = T9K_MAX_UNITS;
     if (t9k.n_acc < 1) t9k.n_acc = 1;
@@ -779,7 +805,8 @@ static inline int t9k_qfmt_geom(uint32_t fmt, uint32_t *ne, uint32_t *bytes)
  *
  * *rd_once is read once per instruction rather than per unit, and *int_mac
  * puts the MACs on the integer lanes (T4_T9K_INTLANES) instead of the FP
- * ones: both are for QGEMM's activation buffer and its Q8_K dot. */
+ * ones - 2: on the ternary lanes (T4_T9K_TERNLANES): both are for QGEMM's
+ * activation buffer and its Q8_K dot. */
 static inline int t9k_opr_bw(int oreg, uint32_t creg, uint32_t *mac,
                              uint32_t *rd, uint32_t *wr, uint64_t *rd_once,
                              int *int_mac)
@@ -835,7 +862,9 @@ static inline int t9k_opr_bw(int oreg, uint32_t creg, uint32_t *mac,
             return 0;
         if (tvx_src_fmt == 3u) {
             act = ne == 256u ? 292u : 34u;
-            *int_mac = 1;
+            *int_mac = quant_fmt == 19u || quant_fmt == 29u ||   /* iq1_s/m */
+                       quant_fmt == 34u || quant_fmt == 35u      /* tq1/2_0 */
+                       ? 2 : 1;
         } else {
             act = ne * (tvx_src_fmt == 1u ? 2u : 4u);
         }
@@ -1082,7 +1111,8 @@ static inline int t9k_class_opr(int oreg, uint32_t creg, uint32_t veclen,
                 if (n == 0) n = 1;
                 if (t9k_opr_bw(oreg, creg, &mac, &rdb, &wrb, &rd1, &imac)) {
                     /* bottleneck of MAC array, read port, write port */
-                    uint64_t lanes = (uint64_t)(imac ? t9k.int_lanes
+                    uint64_t lanes = (uint64_t)(imac == 2 ? t9k.tern_lanes
+                                                : imac ? t9k.int_lanes
                                                      : t9k.mac_lanes);
                     uint64_t tm = ((uint64_t)mac * n + lanes - 1) / lanes;
                     uint64_t tr = ((uint64_t)rdb * n + rd1

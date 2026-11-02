@@ -214,7 +214,7 @@ uint64_t t9k_route_packet (uint64_t ready, uint32_t nbytes, uint64_t *out_free,
 /* For the VCP (t9000_vcp.c), which times its own packets: with defer on, a
  * packet it sends leaves no earlier than not_before, and one it receives
  * does not stall the CPU but leaves its arrival cycle for t9k_net_arrival.
- * A process the VCP wakes resumes no earlier than t9k_net_wake_at's cycle. */
+ * A process the VCP wakes resumes no earlier than t9k_net_wake's cycle. */
 void t9k_net_defer (int on, uint64_t not_before)
 {
         t9k.net_defer = on;
@@ -232,7 +232,14 @@ uint64_t t9k_net_head (unsigned hl)
 /* When the packet just sent on link has left. */
 uint64_t t9k_net_link_free (int link) { return t9k.link_free[link & 3]; }
 uint64_t t9k_net_now (void)     { return t9k_cycles_so_far (); }
-void t9k_net_wake_at (uint64_t t) { t9k_advance_to (t); }
+
+/* Processes the VCP holds while the CPU runs another (t9k_net_wake, near
+ * t4_wake): polled between instructions, where schedule() may switch. */
+static void t9k_net_release (int idle);
+#define T9K_NET_POLL() \
+        do { if (__builtin_expect (t9k.net_npend != 0, 0) && \
+                 t9k_cycles_so_far () >= t9k.net_pend_min) \
+                     t9k_net_release (0); } while (0)
 
 uint32_t ram_fast_limit = FB_LEGACY_DEFAULT;
 uint32_t fb_base        = FB_BASE_DEFAULT;
@@ -4233,6 +4240,11 @@ void mainloop (void)
 	{
                 /* Fast-path: minimal overhead per instruction. */
                 PrevError = ReadError;
+                /* T4_T9K_NET: between instructions, a process the VCP
+                 * holds joins the queue once this node's clock reaches the
+                 * end of its transfer */
+                if (unlikely(rare_hooks) && OReg == 0)
+                        T9K_NET_POLL ();
 		if (unlikely(rare_hooks && stop_iptr && IPtr == stop_iptr &&
 		    (!stop_return || word_int(WPtr) == stop_return) &&
 		    (!stop_areg_set || AReg == stop_areg) &&
@@ -10220,6 +10232,52 @@ void t4_wake (uint32_t wdesc)
                 schedule (wdesc);
 }
 
+/* The VCP finished wdesc's transfer at cycle t.  An idle CPU waits for it.
+ * A busy one does not: the VCP works beside the CPU, so wdesc is held and
+ * joins the queue when the CPU's clock reaches t (t9k_net_release).
+ * Called at a point where schedule() may switch processes. */
+void t9k_net_wake (uint32_t wdesc, uint64_t t)
+{
+        int n = t9k.net_npend;
+
+        if (Idle || t <= t9k_cycles_so_far () ||
+            n == (int)(sizeof t9k.net_pend / sizeof t9k.net_pend[0])) {
+                t9k_advance_to (t);
+                t4_wake (wdesc);
+                return;
+        }
+        t9k.net_pend[n].wdesc = wdesc;
+        t9k.net_pend[n].t = t;
+        t9k.net_npend = n + 1;
+        if (n == 0 || t < t9k.net_pend_min)
+                t9k.net_pend_min = t;
+}
+
+/* Wake the held processes whose transfers are done by now - when idle,
+ * after waiting for the first of them. */
+static void t9k_net_release (int idle)
+{
+        uint64_t now;
+        int i;
+
+        if (idle)
+                t9k_advance_to (t9k.net_pend_min);
+        now = t9k_cycles_so_far ();
+        t9k.net_pend_min = UINT64_MAX;
+        for (i = 0; i < t9k.net_npend; ) {
+                if (t9k.net_pend[i].t <= now) {
+                        uint32_t w = t9k.net_pend[i].wdesc;
+
+                        t9k.net_pend[i] = t9k.net_pend[--t9k.net_npend];
+                        t4_wake (w);
+                } else {
+                        if (t9k.net_pend[i].t < t9k.net_pend_min)
+                                t9k.net_pend_min = t9k.net_pend[i].t;
+                        i++;
+                }
+        }
+}
+
 uint32_t t4_product_identity (void)
 {
         return ProductIdentity;
@@ -10461,6 +10519,13 @@ int start_process (void)
                         return 1;
                 if (0 == run_process ())
                         break;
+                /* nothing to run: wait for a process the VCP holds */
+                if (t9k.net_npend) {
+                        t9k_net_release (1);
+                        if (!Idle)
+                                break;
+                        continue;
+                }
 
 #ifdef EMUDEBUG
                 if (emudebug)

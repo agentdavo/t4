@@ -170,17 +170,21 @@ uint64_t t9k_net_arrival (void);
 uint64_t t9k_net_head (unsigned hl);
 uint64_t t9k_net_link_free (int link);
 uint64_t t9k_net_now (void);
-void     t9k_net_wake_at (uint64_t t);
+void     t9k_net_wake (uint32_t wdesc, uint64_t t);
 
 static uint64_t vcp_now (void)
 {
         return t9k_net_timed () ? t9k_net_now () : 0;
 }
 
-static void vcp_wake_at (uint64_t t)
+/* The transfer w waited for finished at cycle t: on a timed network w
+ * resumes no earlier than t, and the CPU runs other processes meanwhile. */
+static void vcp_wake (uint32_t w, uint64_t t)
 {
         if (t9k_net_timed ())
-                t9k_net_wake_at (t);
+                t9k_net_wake (w, t);
+        else
+                t4_wake (w);
 }
 
 #define VDBG(v, ...) \
@@ -631,8 +635,7 @@ static void out_complete (t9k_vcp_t *v, uint32_t n)
                         return;                 /* more of its group to come */
         }
         if (l->out_active) {
-                vcp_wake_at (v->t_rx);
-                t4_wake (w);
+                vcp_wake (w, v->t_rx);
         } else
                 l->out_sched = w;
 }
@@ -652,8 +655,7 @@ static void out_post (t9k_vcp_t *v, uint32_t n, int link)
         l->out_wdesc = NOTPROC;
         v->t_rx = t9k_net_timed () ? t9k_net_link_free (link) : 0;
         if (grp_done (v, w)) {
-                vcp_wake_at (v->t_rx);
-                t4_wake (w);
+                vcp_wake (w, v->t_rx);
         }
         v->t_rx = t_rx;
 }
@@ -679,8 +681,7 @@ static void in_complete (t9k_vcp_t *v, uint32_t n)
                         return;
         }
         if (l->in_active) {
-                vcp_wake_at (v->t_rx);
-                t4_wake (w);
+                vcp_wake (w, v->t_rx);
         } else
                 l->in_sched = w;
 }
