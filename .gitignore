@@ -18,3 +18,4 @@ dump
 *.uart
 framebuffer.bmp
 screenshot_*.bmp
+*.Identifier
