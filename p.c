@@ -11896,15 +11896,16 @@ INLINE u_char* memrange (uint32_t ptr, u_char *data, uint32_t len)
 {
         u_char *dst;
 #ifdef T4_SDL_FB
-        if (len)
+        /* A range that only partly overlaps an FB window lives in two host
+         * arrays, so it has no single pointer: hand back data[] for the
+         * caller to write through writebytes_int().  data[] is NOT filled -
+         * this is a write destination; to read a range use bytes_int(). */
+        if (len && fb_range_intersects(ptr, len))
         {
                 uint32_t off;
-                uint64_t start = ptr;
-                uint64_t end = start + (uint64_t)len;
-                if (fb_addr_to_offset(ptr, &off) &&
-                    (end - start) <= (uint64_t)(FB_SIZE - off) &&
-                    fb_addr_in_range((uint32_t)(end - 1)))
+                if (fb_addr_to_offset(ptr, &off) && len <= FB_SIZE - off)
                         return vga_framebuffer + off;
+                return data;
         }
 #endif
         /* SD windows FIRST: ExtMemAddr() below is a SIGNED comparison, so
@@ -11988,9 +11989,12 @@ INLINE void movebytes_int (uint32_t dst, uint32_t src, uint32_t len)
                 unsigned char *tmp = (len <= sizeof(tmp_stack)) ? tmp_stack : malloc(len);
                 if (!tmp) goto fb_slow;
 
-                /* Read source bytes — use direct pointer when possible */
+                /* Read source bytes — use direct pointer when possible.
+                 * bytes_int, not memrange: memrange's fallback returns tmp
+                 * unfilled, so a source straddling the core/external RAM
+                 * boundary copied the previous move's leftovers. */
                 {
-                    u_char *sp = memrange(src, tmp, len);
+                    u_char *sp = bytes_int(src, tmp, len);
                     if (sp != tmp)
                         memcpy(tmp, sp, len);
                 }
@@ -12117,15 +12121,16 @@ INLINE u_char* bytes_int (uint32_t ptr, u_char *data, uint32_t len)
 {
         u_char *dst;
 #ifdef T4_SDL_FB
-        if (len)
+        /* Partly in an FB window: the bytes are split between
+         * vga_framebuffer[] and RAM, so gather them one at a time. */
+        if (len && fb_range_intersects(ptr, len))
         {
-                uint32_t off;
-                uint64_t start = ptr;
-                uint64_t end = start + (uint64_t)len;
-                if (fb_addr_to_offset(ptr, &off) &&
-                    (end - start) <= (uint64_t)(FB_SIZE - off) &&
-                    fb_addr_in_range((uint32_t)(end - 1)))
+                uint32_t off, i;
+                if (fb_addr_to_offset(ptr, &off) && len <= FB_SIZE - off)
                         return vga_framebuffer + off;
+                for (i = 0; i < len; i++)
+                        data[i] = byte_int (ptr + i);
+                return data;
         }
 #endif
 	/* Write byte, ensuring memory reference is in range. */
