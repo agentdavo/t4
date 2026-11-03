@@ -555,14 +555,13 @@ int main (int argc, char **argv)
 					      !strcmp (argv[arg] + 2, "425"))
 					  {
                                                 /* a strict T414 or T425:
-                                                 * see t4xx_has_opr().  Both
-                                                 * load at #80000070, where
-                                                 * transputer-netload puts
-                                                 * every image (a T414's own
-                                                 * MemStart is #80000048). */
+                                                 * see t4xx_has_opr().  The
+                                                 * T414 has 2K of on-chip RAM
+                                                 * and MemStart #80000048,
+                                                 * where tcc -mt414 links. */
                                                 Txxx = t4_isa_strict = atoi (argv[arg] + 2);
                                                 CoreSize    = (Txxx == 425 ? 4 : 2) * 1024;
-                                                MemStart    = 0x80000070;
+                                                MemStart    = Txxx == 425 ? 0x80000070 : 0x80000048;
                                                 ExtMemStart = Txxx == 425 ? 0x80001000 : 0x80000800;
 					  }
 					  else if (argv[arg][3]!='\0')
