@@ -5259,8 +5259,11 @@ FastDispatch:
 			       uint32_t oldA = AReg;
 			       uint32_t addr = index(AReg, OReg);
 			       uint32_t value = word(addr);
-			       /* Debug: Show critical ldnl operations in bootstrap range */
-			       if (rare_hooks && IPtr >= 0x80000070 && IPtr <= 0x80000200) {
+			       /* Debug: Show critical ldnl operations in bootstrap range
+			        * (boot debugging only: a small program's own loops
+			        * live there too, and printed every pass) */
+			       if (rare_hooks && bootdbg_enabled &&
+			           IPtr >= 0x80000070 && IPtr <= 0x80000200) {
 			           printf("[LDNL] IPtr=0x%08X AReg=0x%08X OReg=0x%X addr=0x%08X value=0x%08X\n",
 			                  IPtr, AReg, OReg, addr, value);
 			       }
