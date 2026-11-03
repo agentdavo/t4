@@ -146,4 +146,10 @@ int  t9k_cfg_write(uint32_t a, uint32_t val, int by_cpu);
 #define T9K_VCPSIG_RESET1       4       /* reset 1: back to the power-on configuration */
 void t9k_vcp_signal(int sig);
 
+/* Data link faults (HRM 13.5; delivered by t9000_ctl.c): a parity or
+ * disconnect error on link n - -1 not running, 1 localized, 0 to report -
+ * and resetch's reset-and-restart of a byte-stream link. */
+int  t9k_ds_link_error(int n, int disconnect);
+void t9k_ds_link_restart(int n);
+
 #endif /* T9000_VCP_H */

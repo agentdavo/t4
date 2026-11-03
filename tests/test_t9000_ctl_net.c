@@ -16,7 +16,12 @@
  *   C  Reset 2, reboots it with a program that halts on error: a CPU error;
  *   D  Stop and Reset 3 on a running program;
  *   E  control-link protocol errors: an invalid command code, RecoverError
- *      re-sending an unhandshaken error, a command overtaking a handshake.
+ *      re-sending an unhandshaken error, a command overtaking a handshake;
+ *   F  link failures on the Link1 cable (HRM 13.5): WrongParity from node 0
+ *      is a parity error at node 1 - on a reliable link a system error
+ *      (#81) - and node 1's halted output a disconnect at node 0; then the
+ *      links are restarted (CPoke LinkNCommand, resetch) and the same error
+ *      with LocalizeError set is recorded but not reported.
  *
  * Command codes and handshake layout: ../t9000_ctl.h.  Probes are in
  * test_t9000_vcp_fn.S.  Needs two threaded nodes: run_t9000_vcp.sh starts
@@ -40,6 +45,7 @@ typedef unsigned char u8;
 
 extern void t9_stconf(u32 *), t9_ldconf(u32 *), t9_initvlcb(u32 *), t9_sethdr(u32 *);
 extern void t9_writehdr(u32 *), t9_setchmode(u32 *), t9_vout(u32 *), t9_vin_cnt(u32 *);
+extern void t9_resetch(u32 *);
 
 #define VIN0    0x80000040u
 #define VOUT0   0x80000044u
@@ -352,6 +358,26 @@ void test_main(void)
     msg[0] = C_START; msg[1] = 0; msg[2] = 0;
     check("restart", command(3, 2) == 0);
     check("last", c_cpeek(0x1004) == 0xC1);
+
+    /* ---- F: link failures (HRM 13.5) ---- */
+    op(t9_stconf, 0x8102, 8, 0);                /* WrongParity on our Link1 */
+    check("link-error", error_message(0x81));   /* reliable: a system error */
+    check("reset3d", c_reset(3) == 0);
+    check("l1-parity", (c_cpeek(0x8103) & 0x1B) == 0x09);  /* error, parity, halted */
+    check("errorcode3", c_cpeek(0x1004) == 0x81);
+    /* node 1's halted output was a disconnect at our end */
+    check("l1-disc", (op(t9_ldconf, 0x8103, 0, 0) & 0x1B) == 0x11);
+    check("l1-local", c_cpoke(0x8101, 8) == 0);            /* LocalizeError */
+    check("l1-restart", c_cpoke(0x8102, 3) == 0 && (c_cpeek(0x8103) & 0x1B) == 0x02);
+    op(t9_resetch, 0x80000004u, 0, 0);          /* resetch Link1Out: restart ours */
+    check("resetch", (op(t9_ldconf, 0x8103, 0, 0) & 0x1B) == 0x02);
+    op(t9_stconf, 0x8102, 8, 0);
+    for (i = 0; i < 2; i++) {                   /* no Error message comes first */
+        msg[0] = C_IDENTIFY;
+        check("localized", command(1, 6) == 0);
+    }
+    check("l1-parity2", (c_cpeek(0x8103) & 0x1B) == 0x09);
+    check("errorcode4", c_cpeek(0x1004) == 0x81);  /* not reported */
 
     uart_puts(pass ? "\nALL-PASS\n" : "\nFAILED\n");
 }

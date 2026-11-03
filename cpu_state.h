@@ -89,6 +89,11 @@ typedef struct cpu_t {
         LinkIface s_CLink[2];
         int      s_ctl_links;
         int      s_ctl_halt;
+        /* Link faults (HRM 13.5): s_line_err is set by the far end, bit
+         * 2*link + 1 for a disconnect, + 0 for a parity error (links 4-5 =
+         * CLink0-1); s_link_halted has bit n set while Link n is stopped. */
+        _Atomic uint32_t s_line_err;
+        uint8_t  s_link_halted;
 } cpu_t;
 
 extern T4_THREAD_LOCAL cpu_t *t4cpu;

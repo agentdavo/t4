@@ -104,6 +104,14 @@ int  t9k_ctl_after_halt (void);
 /* The control system set Wdesc and Iptr (Run/Reboot) for this start. */
 int  t9k_ctl_started_cpu (void);
 
+/* Link faults (HRM 13.5, 8.5.3); link 0-3 = Link0-3, 4-5 = CLink0-1.
+ * t9k_line_signal: this node's output on `link` gives the far end a parity
+ * (disconnect = 0) or disconnect error.  t9k_line_poll: act on the faults
+ * the far ends have signalled here.  Threaded fabric and single-node
+ * loopback only. */
+void t9k_line_signal (int link, int disconnect);
+void t9k_line_poll (void);
+
 /* Configuration space: system services #1003-#1006 and CLink0-1.  Return 0
  * if a is not one of these, else 1 (done) or -1 (refused: not readable /
  * not writable / write-locked against the CPU). */

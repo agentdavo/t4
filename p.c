@@ -3175,6 +3175,9 @@ int linkcomms (char *where, int doBoot, int timeOut)
 
         if (nodeid < 0 && !t4cpu->s_loopback)
                 return 0;
+        /* link faults from the far ends (t9000_ctl.c, HRM 13.5) */
+        if (atomic_load_explicit (&t4cpu->s_line_err, memory_order_relaxed))
+                t9k_line_poll ();
         /* T9000 control links (t9000_ctl.c): a Run or Reboot command ends
          * a boot wait */
         if (t4cpu->s_ctl_links && (t9k_ctl_poll () & T9K_CTL_START))
@@ -3188,6 +3191,10 @@ int linkcomms (char *where, int doBoot, int timeOut)
         for (i = 0; i < 4; i++)
         {
                 if ((0 == i) && serve) /* skip Host link */
+                        continue;
+                /* a link halted by an error or a reset carries nothing
+                 * until it is started again */
+                if (t4cpu->s_link_halted & (1u << i))
                         continue;
                 /* a link put in virtual mode (a CPoke during a control-link
                  * boot) is the VCP's, not a byte-stream boot link */
@@ -3540,6 +3547,19 @@ static void init_link_loopback (void)
                 t4cpu->s_loopback = calloc (4, SCH_SIZE);
         if (!t4cpu->s_loopback)
                 handler (-1);
+}
+
+/* The far end of this node's link (0-3 data, 4-5 CLink0-1) for a link
+ * fault (t9000_ctl.c): node -1 is this node, looped back.  0 if cabled. */
+int t4_link_far_end (int link, int *node, int *flink)
+{
+        if (nodeid >= 0)
+                return connectedNetLink (nodeid, link, node, flink);
+        if (link >= 4 || !t4cpu->s_loopback || t4_loopback_peer[link] < 0)
+                return -1;
+        *node = -1;
+        *flink = t4_loopback_peer[link];
+        return 0;
 }
 
 /* Open a link channel */
@@ -6400,7 +6420,10 @@ DescheduleOutWord:
                            else
                            {
 			        AReg = word (temp);
-                                reset_channel (temp);
+                                /* on a byte-stream channel this resets
+                                 * and restarts the link (HRM 13.7.2) */
+                                if (NULL != reset_channel (temp))
+                                        t9k_ds_link_restart (TheLink(temp));
                            }
 			   IPtr++;
 			   break;

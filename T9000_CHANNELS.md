@@ -334,13 +334,49 @@ removes the record.  ErrorCode (#1004) holds the latest error.
 | system (#01-#03, #8x) | stopped, VCP discarding | set | yes |
 | system, StandAloneMode set | reset, rebooted from ROM | set (kept) | no |
 
-The system errors T4 raises are the VCP's (#02, reliable links only) and
-the CPU's (#01): T4's halt-on-error stands for the T9000 halting on an
-error with a null trap-handler (ISM 10.3.3).  T4 links do not fail, so
-#80-#83 and #C2 never occur (`WrongParity` is accepted and ignored), and
+The system errors T4 raises are the VCP's (#02, reliable links only), the
+CPU's (#01) - T4's halt-on-error stands for the T9000 halting on an error
+with a null trap-handler (ISM 10.3.3) - and link faults (#80-#83, below);
 the PMI raises nothing.  With no control link wired and StandAloneMode
 clear a system error is recorded in ErrorCode/ModeStatus but the CPU runs
 on, as described under "Errors" above.
+
+### Link failures (HRM 13.5, 8.5.3)
+
+T4's links never fail on their own; software makes them fail the way the
+HRM gives it to: `WrongParity` in LinkNCommand or CLinkNCommand (stconf or
+CPoke) gives the far end of the cable a parity error, and `ResetOutput`
+(outputs held low) a disconnect error.  The fault is a line event, carried
+outside the link's mailbox (`s_line_err` on the far node's `cpu_t`), so it
+arrives even when the mailbox is full.
+
+* **At the link that sees it** (data or control): LinkStatus gets
+  LinkError and ParityError or DiscError, LinkStarted clears, and the link
+  engine resets - what its input held is lost.  A link that is not running
+  sees no fault.
+* **Propagation.**  A link with a parity error halts its output, which the
+  far end sees as a disconnect, halting that end in turn (HRM 13.5); a
+  disconnect goes no further.
+* **Reporting.**  Link0-3: with LinkNMode.LocalizeError (bit 3) clear - a
+  reliable link, the power-on default - the error goes to the control unit
+  as #80-#83, a system error (CPU stopped, VCP discarding, Error message);
+  with it set the link just resets ("unreliable", HRM 13.5.2).  CLink1:
+  #C2, a control-link error.  CLink0: nothing can be reported; its halted
+  output is what the neighbour sees (HRM 8.5.3).
+* **Frozen until restarted.**  A halted link carries nothing - no VCP
+  packets, no byte-stream messages, no control packets - until software
+  starts it again: LinkNCommand/CLinkNCommand StartLink (ResetLink empties
+  its buffers first), `resetch` on a byte-stream channel (reset and
+  restart, HRM 13.7.2), `setchmode` on a byte-stream channel, or a control
+  unit Reset 1 or 2.  CLink0 restarts on its next token (HRM 8.3.1); the
+  controller then resynchronises the device with RecoverError.
+
+Faults reach nodes of the threaded fabric (`-st`) and a stand-alone node's
+looped-back links (`T4_LINK_LOOPBACK`); a cable to a C104 or to a node in
+another process carries none.  Not modelled: the disconnect that a link
+reset causes at the far end (HRM 13.7.2's enforced reset delay) - so
+`resetch`-based recovery of T800-style links behaves as before - and link
+timing.
 
 ### The CPU under control
 
@@ -487,10 +523,18 @@ same FFN on an 8-node hypercube of byte-stream links takes 6.73 ms.
   reboots it into a program that halts on error (CPU error); stops a
   running program; and checks the state table, invalid operands and the
   #C0/#C1 errors, RecoverError re-sending an unhandshaken error message.
+  Then link failures on the Link1 cable: WrongParity from node 0 is a
+  parity error at node 1, reported as #81 on its reliable link, and a
+  disconnect back at node 0; after restarting both ends (CPoke
+  Link1Command, `resetch`), the same fault with LocalizeError set is
+  recorded in Link1Status but not reported.
 * `tests/test_t9000_ctl_chain.c` - three nodes on a daisy-chained control
   network (node 0 Link2 - node 1 CLink0, node 1 CLink1 - node 2 CLink0):
   node 2 is labelled, identified, booted, started and reset through node 1,
-  and its Error message comes back the same way.
+  and its Error message comes back the same way.  Then WrongParity on node
+  1's CLink1: a parity error at node 2's CLink0, a disconnect back at node
+  1 reported as #C2; the controller restarts CLink1 and resynchronises
+  node 2 with RecoverError.
 
 Run them with `make -f Makefile.linux test-vcp` or `tests/run_t9000_vcp.sh`
 (`T4_BIN` picks the emulator).  They build with `transputer-tcc` and

@@ -12,10 +12,13 @@
  * finishes anything that needs the CPU stopped (resets, a reboot) once
  * mainloop() has returned.
  *
- * What is not modelled: link speeds, parity and disconnection (T4 links do
- * not fail, so #80-#83 and #C2 are never raised; WrongParity is accepted and
- * ignored), the PMI (#03), the cache, and DS-link LocalizeError (it masks
- * only parity/disconnect errors, HRM 13.5).
+ * Link faults (HRM 13.5, 8.5.3): WrongParity and ResetOutput on a link give
+ * its far end a parity or disconnect error; t9k_line_signal() and
+ * t9k_line_poll() below carry and act on them.
+ *
+ * What is not modelled: link speeds, spontaneous link faults, the disconnect
+ * a link reset causes at the far end (HRM 13.7.2), the PMI (#03) and the
+ * cache.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +42,7 @@ extern void t4_cpu_clear (void);
 extern void t4_cpu_start (uint32_t wdesc, uint32_t iptr);
 extern void t4_cpu_halt (int now);
 extern uint32_t t4_status_reg (void);
+extern int t4_link_far_end (int link, int *node, int *flink);
 extern int32_t quit;
 extern volatile sig_atomic_t t4_sig_pending;
 extern void t4_signal_exit (int);
@@ -51,8 +55,11 @@ extern void t4_signal_exit (int);
 #define G_ERROR         4
 
 /* CLinkNStatus bits (HRM table 13.7) */
+#define ST_ERROR        0x01u
 #define ST_STARTED      0x02u
 #define ST_RESETOUT     0x04u
+#define ST_PARITY       0x08u
+#define ST_DISC         0x10u
 #define ST_TOKEN        0x20u
 
 /* Our message packet waiting for its acknowledge */
@@ -529,6 +536,82 @@ static void command (t9k_ctl_t *c, const u_char *d, int len)
         handshake (c, code, st, v);
 }
 
+/* ---- link faults (HRM 13.5, 8.5.3) ------------------------------------- */
+
+/* A link error is a line event, not data: the far end of the cable is told
+ * through its s_line_err bits, not its mailbox (which may be full).  The
+ * cable's far end is a node of the threaded fabric or, for a stand-alone
+ * node, its own looped-back link; a C104 or a node in another process does
+ * not see faults. */
+void t9k_line_signal (int link, int disconnect)
+{
+        int node, flink;
+        cpu_t *far = NULL;
+
+        if (t4_link_far_end (link, &node, &flink) != 0)
+                return;
+        if (node < 0 || node == nodeid)
+                far = t4cpu;
+        else if (t4_fabric && node < t4_fabric->nnodes)
+                far = t4_fabric->cpus[node];
+        if (!far)
+                return;
+        atomic_fetch_or (&far->s_line_err, 1u << (2 * flink + (disconnect ? 1 : 0)));
+        if (far != t4cpu)
+                t4_node_wake (far);
+}
+
+/* A parity or disconnect error on this node's link: the link records it
+ * and resets.  A parity error halts the link's output, which the far end
+ * sees as a disconnect, and halts that output in turn (HRM 13.5).  Unless
+ * localized, an error on Link0-3 goes to the control unit as #80-#83 (a
+ * system error), one on CLink1 as #C2; one on CLink0 cannot be reported,
+ * and its halted output is what tells the neighbour (HRM 8.5.3). */
+static void line_fault (int link, int disconnect)
+{
+        static const char *const what[] = { "parity", "disconnect" };
+        t9k_ctl_t *c = t4cpu->s_ctl;
+        u_char tmp[SCH_SIZE];
+        int k = link - 4, r;
+
+        if (link < 4) {
+                r = t9k_ds_link_error (link, disconnect);
+                if (r < 0)
+                        return;         /* not running: nothing to break */
+                printf ("-I-EMU9000: Node%d Link%d %s error%s\n", nodeid < 0 ? 0 : nodeid,
+                        link, what[disconnect], r ? " (localized)" : "");
+                if (!disconnect)
+                        t9k_line_signal (link, 1);
+                if (!r)
+                        t9k_ctl_error (T9K_CE_LINK (link));
+                return;
+        }
+        if (!c || !(c->cl_status[k] & ST_STARTED))
+                return;
+        c->cl_status[k] = (c->cl_status[k] & ~ST_STARTED) | ST_ERROR |
+                          (disconnect ? ST_DISC : ST_PARITY);
+        if (ch_open (&t4cpu->s_CLink[k].In))
+                (void)channel_recvP (&t4cpu->s_CLink[k].In, tmp, 0);
+        if (k)
+                c->ndown = c->nup = 0;
+        printf ("-I-EMU9000: Node%d CLink%d %s error\n", nodeid < 0 ? 0 : nodeid,
+                k, what[disconnect]);
+        if (!disconnect)
+                t9k_line_signal (link, 1);
+        if (k)
+                t9k_ctl_error (T9K_CE_CLINK1);
+}
+
+void t9k_line_poll (void)
+{
+        uint32_t ev = atomic_exchange (&t4cpu->s_line_err, 0u);
+        int bit;
+
+        for (bit = 0; ev; bit++, ev >>= 1)
+                if (ev & 1u)
+                        line_fault (bit >> 1, bit & 1);
+}
+
 /* ---- packet handler (HRM 8.3.2) ----------------------------------------- */
 
 static void rx_ack (t9k_ctl_t *c)
@@ -599,7 +682,8 @@ static void ctl_tx (t9k_ctl_t *c)
         u_char pkt[2 + 8 + 1];
         int guard, len, own;
 
-        if (c->ndown && ch_open (o1) && channel_sendP (o1, c->down, c->ndown, 0) >= 0)
+        if (c->ndown && ch_open (o1) && (c->cl_status[1] & ST_STARTED) &&
+            channel_sendP (o1, c->down, c->ndown, 0) >= 0)
                 c->ndown = 0;
         if (!ch_open (o0) || !(c->cl_status[0] & ST_STARTED))
                 return;
@@ -702,6 +786,8 @@ int t9k_ctl_ready (void)
         t9k_ctl_t *c = t4cpu ? t4cpu->s_ctl : NULL;
         Channel *i0, *i1, *o0, *o1;
 
+        if (t4cpu && atomic_load_explicit (&t4cpu->s_line_err, memory_order_relaxed))
+                return 1;               /* a link fault to act on */
         if (!c || !t4cpu->s_ctl_links)
                 return 0;
         i0 = &t4cpu->s_CLink[0].In;
@@ -808,6 +894,8 @@ int t9k_ctl_after_halt (void)
         CDBG (c, "CPU stopped (state %d); serving the control links\n", c->gross);
         ctl_tx (c);
         for (;;) {
+                if (atomic_load_explicit (&t4cpu->s_line_err, memory_order_relaxed))
+                        t9k_line_poll ();
                 if (t9k_ctl_poll () & T9K_CTL_START)
                         return 1;
                 /* the VCP and links run on with the CPU stopped (HRM
@@ -902,18 +990,32 @@ int t9k_ctl_conf_write (uint32_t a, uint32_t val, int by_cpu)
         case 1:
                 c->cl_mode[k] = val & 0x1Fu;
                 return 1;
-        case 2:
+        case 2: {
+                int was = (c->cl_status[k] & ST_STARTED) != 0;
+
                 if (val & 1u) {         /* ResetLink: buffers emptied */
+                        u_char tmp[SCH_SIZE];
+
                         c->cl_status[k] = 0;
+                        if (ch_open (&t4cpu->s_CLink[k].In))
+                                (void)channel_recvP (&t4cpu->s_CLink[k].In, tmp, 0);
                         if (k)
                                 c->ndown = c->nup = 0;
                 }
                 if (val & 2u)           /* StartLink */
                         c->cl_status[k] |= ST_STARTED;
-                if (val & 4u)           /* ResetOutput */
+                /* as on a data link (HRM 13.6): outputs held low are a
+                 * disconnect at the far end, a bad parity bit a parity error */
+                if (val & 4u) {         /* ResetOutput */
                         c->cl_status[k] = (c->cl_status[k] & ~ST_STARTED) | ST_RESETOUT;
+                        if (was)
+                                t9k_line_signal (4 + k, 1);
+                }
+                if ((val & 8u) && (c->cl_status[k] & ST_STARTED))      /* WrongParity */
+                        t9k_line_signal (4 + k, 0);
                 CDBG (c, "CLink%d command #%X: status #%02X\n", k, val, c->cl_status[k]);
                 return 1;
+        }
         case 4:
                 c->cl_wlock[k] = val & 1u;
                 return 1;

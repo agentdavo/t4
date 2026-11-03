@@ -211,6 +211,22 @@ static void plink_clear_queues (t9k_plink_t *p)
         p->aq_head[0] = p->aq_head[1] = p->aq_tail[0] = p->aq_tail[1] = -1;
 }
 
+/* LinkNStatus.LinkStarted: a link reset by software or by an error (HRM
+ * 13.5) carries nothing until it is started again.  ds_sync() mirrors the
+ * halted links into t4cpu->s_link_halted, which linkcomms() tests. */
+#define DS_RUNNING(v, l)        ((v)->plink[l].ds_status & 0x2u)
+
+static void ds_sync (t9k_vcp_t *v)
+{
+        uint8_t m = 0;
+        int i;
+
+        for (i = 0; i < T9K_NUM_LINKS; i++)
+                if (!DS_RUNNING (v, i))
+                        m |= (uint8_t)(1u << i);
+        t4cpu->s_link_halted = m;
+}
+
 static void vcp_update_span (t9k_vcp_t *v)
 {
         uint32_t lim = v->space ? v->memstart : T9K_MIN_VIRTUAL_CHAN;
@@ -268,6 +284,7 @@ void t9k_vcp_reset_node (void)
         if (e && *e && *e != '0')
                 v->space = 1;
         vcp_update_span (v);
+        ds_sync (v);
 }
 
 void t9k_vcp_destroy (struct cpu_t *c)
@@ -547,7 +564,8 @@ int t9k_link_listening (int link)
 {
         t9k_vcp_t *v = t4cpu->s_vcp;
 
-        return v && v->state >= VCP_RUNNING && !(v->plink[link].vmode & T9K_VLM_BYTEMODE);
+        return v && v->state >= VCP_RUNNING && !(v->plink[link].vmode & T9K_VLM_BYTEMODE) &&
+               DS_RUNNING (v, link);
 }
 
 int t9k_link_tx_pending (int link)
@@ -555,7 +573,8 @@ int t9k_link_tx_pending (int link)
         t9k_vcp_t *v = t4cpu->s_vcp;
         t9k_plink_t *p;
 
-        if (!v || v->state < VCP_RUNNING || v->state == VCP_DISCARDING)
+        if (!v || v->state < VCP_RUNNING || v->state == VCP_DISCARDING ||
+            !DS_RUNNING (v, link))
                 return 0;
         p = &v->plink[link];
         return p->dq_head[0] >= 0 || p->dq_head[1] >= 0 ||
@@ -869,8 +888,10 @@ void t9k_link_rx (int link)
         u_char pkt[MAX_DATA];
         int i, n;
 
-        /* "waiting": incoming packets stall at the link inputs */
-        if (!v || v->state < VCP_RUNNING || !t9k_link_virtual (link))
+        /* "waiting": incoming packets stall at the link inputs; a link
+         * halted by an error or a reset takes nothing */
+        if (!v || v->state < VCP_RUNNING || !t9k_link_virtual (link) ||
+            !DS_RUNNING (v, link))
                 return;
         if (!Link[link].In.schbuf && Link[link].In.sock < 0)
                 return;
@@ -949,7 +970,7 @@ void t9k_link_tx (int link)
         int guard;
 
         if (!v || v->state < VCP_RUNNING || v->state == VCP_DISCARDING ||
-            !t9k_link_virtual (link))
+            !t9k_link_virtual (link) || !DS_RUNNING (v, link))
                 return;
         p = &v->plink[link];
         if (!link_connected (link)) {
@@ -1981,6 +2002,7 @@ static void op_setchmode (t9k_vcp_t *v)
                         p->ds_status = (p->ds_status & ~0x19u) | 0x2u;  /* started */
                 else
                         p->ds_status &= ~0x3Bu;                         /* reset */
+                ds_sync (v);
                 break;
         }
         default:
@@ -2197,6 +2219,7 @@ void t9k_vcp_signal (int sig)
                         p->ds_wlock = 0;
                         p->warned = 0;
                 }
+                ds_sync (v);
                 memset (v->ev, 0, sizeof v->ev);
                 v->status = 0;
                 v->command = 0;
@@ -2211,6 +2234,42 @@ void t9k_vcp_signal (int sig)
                 break;
         }
         VDBG (v, "control unit signal %d -> state %d\n", sig, v->state);
+}
+
+/* A parity or disconnect error on data link n's input (HRM 13.5): the link
+ * records it in LinkNStatus and resets, losing what it held, and carries
+ * nothing until started again.  -1: the link was not running, so there is
+ * no error; 1: LinkNMode.LocalizeError keeps it from the control unit;
+ * 0: report it. */
+int t9k_ds_link_error (int n, int disconnect)
+{
+        t9k_vcp_t *v = vcp_get ();
+        t9k_plink_t *p = &v->plink[n];
+        Channel *in = &Link[n].In;
+        u_char tmp[MAX_DATA];
+
+        if (!DS_RUNNING (v, n))
+                return -1;
+        p->ds_status = (p->ds_status & ~0x2u) | 0x1u | (disconnect ? 0x10u : 0x8u);
+        ds_sync (v);
+        if (in->schbuf || in->sock >= 0)
+                (void)channel_recvP (in, tmp, 0);
+        in->npend = 0;
+        VDBG (v, "link%d %s error, link halted\n", n, disconnect ? "disconnect" : "parity");
+        return (p->ds_mode & 0x8u) != 0;
+}
+
+/* resetch on a byte-stream channel resets and restarts its link (HRM
+ * 13.7.2).  With no VCP (T800 code) no link can have stopped, and there is
+ * no need to create one. */
+void t9k_ds_link_restart (int n)
+{
+        t9k_vcp_t *v = t4cpu->s_vcp;
+
+        if (!v)
+                return;
+        v->plink[n].ds_status = 0x2u;
+        ds_sync (v);
 }
 
 /* Link0-3 DS-link registers: #8n01 Mode, #8n02 Command, #8n03 Status,
@@ -2317,14 +2376,32 @@ static int conf_write (t9k_vcp_t *v, uint32_t a, uint32_t val, int by_cpu)
                         return 0;
                 switch (reg) {
                 case 1: p->ds_mode = val & 0x1Fu; return 1;
-                case 2:
-                        if (val & 1u)           /* ResetLink */
+                case 2: {
+                        int was = DS_RUNNING (v, lk) != 0;
+
+                        if (val & 1u) {         /* ResetLink: buffers emptied */
+                                Channel *in = &Link[lk].In;
+                                u_char tmp[MAX_DATA];
+
                                 p->ds_status = 0;
+                                if (in->schbuf || in->sock >= 0)
+                                        (void)channel_recvP (in, tmp, 0);
+                                in->npend = 0;
+                        }
                         if (val & 2u)           /* StartLink */
                                 p->ds_status |= 0x2u;   /* LinkStarted */
-                        if (val & 4u)           /* ResetOutput */
+                        /* the far end sees outputs held low as a disconnect,
+                         * and a bad parity bit as a parity error (HRM 13.6) */
+                        if (val & 4u) {         /* ResetOutput */
                                 p->ds_status = (p->ds_status & ~0x2u) | 0x4u;
+                                if (was)
+                                        t9k_line_signal (lk, 1);
+                        }
+                        if ((val & 8u) && DS_RUNNING (v, lk))   /* WrongParity */
+                                t9k_line_signal (lk, 0);
+                        ds_sync (v);
                         return 1;
+                }
                 case 4: p->ds_wlock = val & 1u; return 1;
                 default: return 0;      /* LinkNStatus is read-only */
                 }

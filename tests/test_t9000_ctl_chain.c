@@ -8,7 +8,10 @@
  * other packet down CLink1 once that link is started (a CPoke of
  * CLink1Command); everything arriving on its CLink1 goes back up CLink0.
  * So node 2 is labelled, identified, booted, started and reset entirely
- * through node 1, and its Error message comes back the same way.
+ * through node 1, and its Error message comes back the same way.  Last, a
+ * parity fault on the node 1 - node 2 control cable: node 1 reports #C2,
+ * the controller restarts CLink1 and resynchronises node 2 with
+ * RecoverError.
  *
  * Needs three threaded nodes: run_t9000_vcp.sh starts it with -st -sn -3.
  */
@@ -39,6 +42,7 @@ extern void t9_writehdr(u32 *), t9_setchmode(u32 *), t9_vout(u32 *), t9_vin_cnt(
 #define C_CPOKE     0x03
 #define C_START     0x10
 #define C_RESET     0x11
+#define C_RECOVER   0x13
 #define C_ERRORHS   0x60
 #define C_PEEK      0x74
 #define C_BOOT      0x76
@@ -210,6 +214,25 @@ void test_main(void)
     /* node 1 saw none of that as its own */
     dev = 0;
     check("errorcode1", c_cpeek(0x1004) == 0);
+
+    /* a fault on the chain (HRM 8.5.3): bad parity out of node 1's CLink1
+     * is a parity error at node 2's CLink0, which cannot report it but
+     * halts its output; node 1 sees a disconnect on CLink1 and reports #C2 */
+    check("wrongparity", c_cpoke(0xFE02, 8) == 0);
+    receive();
+    check("clink1-error", rlen == 2 && rsp[0] == M_ERROR && rsp[1] == 0xC2);
+    msg[0] = C_ERRORHS;
+    send(1);
+    check("clink1-disc", (c_cpeek(0xFE03) & 0x1B) == 0x11);
+    check("clink1-restart", c_cpoke(0xFE02, 3) == 0 && (c_cpeek(0xFE03) & 0x1B) == 0x02);
+    check("errorcode1b", c_cpeek(0x1004) == 0xC2);
+    /* node 2's CLink0 restarts on the next token; RecoverError resets the
+     * virtual link's acknowledge state, which the fault may have upset */
+    dev = 1;
+    msg[0] = C_RECOVER;
+    check("recover2", command(1, 2) == 0);
+    check("identify2b", c_identify() == id);
+    check("clink0-parity", (c_cpeek(0xFD03) & 0x0B) == 0x0B);
 
     uart_puts(pass ? "\nALL-PASS\n" : "\nFAILED\n");
 }
