@@ -19,7 +19,17 @@
 # Exit status is 0 only if every run rendered and matched its reference.
 #
 # The 16-node boot failure is fixed (it was the Link0In read shim in p.c
-# shadowing a worker's channel control word - see word_int()).  Idle nodes
+# shadowing a worker's channel control word - see word_int()), and so is
+# the 16-node wild jump to address 0 (the matching Link0Out write shim
+# dropped the word, see writeword_int()).
+#
+# The ray tracer itself can deadlock: when node 1's throughPut is handing
+# its buffered job to a renderer that still owes its pixels, and
+# loadBalance on node 0 is blocked sending the next job down, nothing
+# drains the results.  Real links make that window tiny; emulated nodes,
+# whose links are slow next to their CPUs, make it wide - shared-memory
+# processes (-sl) hit it at most sizes, threaded nodes now and then.  A
+# TIMEOUT whose log stops mid-render is that, not the link fabric.  Idle nodes
 # used to burn a full second of usleep(50) spinning; they now poll with a
 # few-millisecond timeout and 1ms slices, so large arrangements are no
 # longer pathologically slow.  Oversubscribed runs still take wall time,
@@ -200,12 +210,22 @@ run_one() {
     key=$(shm_key_for "$map")
     drop_shm "$key"          # a previous run may have died holding it
 
+    # Node 0 flushes every line the ray tracer prints.  Straight into a slow
+    # filesystem (a checkout on /mnt/c under WSL) each flush stalls node 0
+    # for milliseconds, which holds the farm long enough to tip it into a
+    # deadlock latent in the program itself: loadBalance blocked sending a
+    # job down while node 1's throughPut waits on a renderer whose pixels
+    # cannot get back up.  So t4 writes to local temp; the log is copied
+    # afterwards.
+    local runlog
+    runlog=$(mktemp "${TMPDIR:-/tmp}/testall-n$n.XXXXXX")
+
     PIDS=""
     local i rc wall start
     if [ "$THREADS" = 1 ]; then
         start=$SECONDS
         ( cd "$BIN_DIR" && printf '%s\n' "$model" |
-          timeout -k 5 "$timeout_s" "$T4" -st -s8 -sn "-$n" -sb "$btl" ) >"$log" 2>&1
+          timeout -k 5 "$timeout_s" "$T4" -st -s8 -sn "-$n" -sb "$btl" ) >"$runlog" 2>&1
         rc=$? wall=$(( SECONDS - start ))
     elif [ "$n" -gt 1 ]; then
         # Shared-memory links: node 1 creates the segment; nobody else may
@@ -219,6 +239,7 @@ run_one() {
             done
             if ! shm_exists "$key"; then
                 cleanup_pids
+                rm -f "$runlog"
                 RESULTS="$RESULTS$n|$model|FAIL|-|-|node 1 never created SHM $key\n"
                 printf '  %-4s %-6s %-9s %-7s %s\n' "$n" "$model" FAIL - "node 1 never created SHM segment"
                 FAILURES=$((FAILURES + 1))
@@ -238,12 +259,14 @@ run_one() {
     start=$SECONDS
     # -k: t4 installs a SIGTERM handler, so plain timeout can leave it running.
     ( cd "$BIN_DIR" && printf '%s\n' "$model" |
-      timeout -k 5 "$timeout_s" "$T4" -s8 $SL -sn 0 -sb "$btl" ) >"$log" 2>&1
+      timeout -k 5 "$timeout_s" "$T4" -s8 $SL -sn 0 -sb "$btl" ) >"$runlog" 2>&1
     rc=$? wall=$(( SECONDS - start ))
     fi
 
     cleanup_pids
     drop_shm "$key"
+    cat "$runlog" >"$log"
+    rm -f "$runlog"
 
     local reported detail verdict
     reported=$(sed -n 's/.*DONE, took *\([0-9.]*\) seconds.*/\1/p' "$log" | head -1)
