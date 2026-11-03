@@ -11821,8 +11821,12 @@ void writeword_int (uint32_t ptr, uint32_t value)
 		return;
 	}
 
-	/* Preserve the architectural Link0Out channel word in -ss mode. */
-	if (unlikely(!serve && ptr == LINK0_OUT)) {
+	/* Link0Out is the byte-stream MMIO shim only where Link0In is (see
+	 * word_int()): a standalone run with no server and no network.  On a
+	 * network node it is the guest's channel word, and dropping the write
+	 * left 0 there for linkcomms to schedule as a process once a Link0
+	 * output finished. */
+	if (unlikely(!serve && nodeid < 0 && ptr == LINK0_OUT)) {
 		static int mmio_word_log_count = 0;
 		if (link0_trace_enabled && mmio_word_log_count < 8) {
 		if (mmio_trace_enabled) {
@@ -12275,7 +12279,8 @@ INLINE void writebyte_int (uint32_t ptr, u_char value)
 		return;
 	}
 
-	if (unlikely(!serve && ptr == LINK0_OUT)) {
+	/* Same rule as writeword_int(). */
+	if (unlikely(!serve && nodeid < 0 && ptr == LINK0_OUT)) {
 		mmio_iserver_write_byte(value);
 		return;
 	}
