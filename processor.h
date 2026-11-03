@@ -70,7 +70,12 @@ extern uint32_t CoreSize;
 #define IsT800  (Txxx == 800 || Txxx == 806)
 #define IsT806  (Txxx == 806)
 #define IsT414  (Txxx == 414)
+#define IsT425  (Txxx == 425)
 #define IsTVS   (Txxx == 1144)
+
+/* -s414 / -s425: 414 or 425 to stop on a secondary instruction that part
+ * lacks, 0 to execute every instruction t4 knows (see p.c). */
+extern int t4_isa_strict;
 
 #define HiPriority	0x00000000
 #define LoPriority	0x00000001

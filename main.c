@@ -480,6 +480,8 @@ int main (int argc, char **argv)
                 printf("    -s4                  Select T414 mode. (default)\n");
                 printf("    -s8                  Select T800 mode.\n");
                 printf("    -s806                Select T806 mode (T800 @ 200MHz).\n");
+                printf("    -s414, -s425         Select a T414 or T425 (no FPU) that stops on any\n");
+                printf("                         instruction it lacks; -s4 runs them all.\n");
 #ifndef NDEBUG
                 printf("    -sg                  Halt on uninitialized memory read.\n");
 #endif
@@ -549,7 +551,21 @@ int main (int argc, char **argv)
 		{
 			switch (argv[arg][2])
 			{
-				case '4': if (argv[arg][3]!='\0')
+				case '4': if (!strcmp (argv[arg] + 2, "414") ||
+					      !strcmp (argv[arg] + 2, "425"))
+					  {
+                                                /* a strict T414 or T425:
+                                                 * see t4xx_has_opr().  Both
+                                                 * load at #80000070, where
+                                                 * transputer-netload puts
+                                                 * every image (a T414's own
+                                                 * MemStart is #80000048). */
+                                                Txxx = t4_isa_strict = atoi (argv[arg] + 2);
+                                                CoreSize    = (Txxx == 425 ? 4 : 2) * 1024;
+                                                MemStart    = 0x80000070;
+                                                ExtMemStart = Txxx == 425 ? 0x80001000 : 0x80000800;
+					  }
+					  else if (argv[arg][3]!='\0')
 					  {
 						cmdline_cat (CommandLineMost, argv[arg]);
 						cmdline_cat (CommandLineMost, " ");
@@ -984,7 +1000,9 @@ int main (int argc, char **argv)
                                 cmdargs[1] = "-sl";
                                 cmdargs[2] = "-sn";
                                 cmdargs[3] = snid;
-                                cmdargs[4] = (Txxx == 806) ? "-s806" : (Txxx == 800) ? "-s8" : NULL;
+                                cmdargs[4] = (Txxx == 806) ? "-s806" : (Txxx == 800) ? "-s8" :
+                                             (t4_isa_strict == 414) ? "-s414" :
+                                             (t4_isa_strict == 425) ? "-s425" : NULL;
                                 cmdargs[5] = NULL;
                                 if ((xputers[i] = SpawnVP ("t4", cmdargs)) < 0)
                                 {

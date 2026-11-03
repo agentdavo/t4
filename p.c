@@ -184,6 +184,7 @@ int shlink_free (void){return EINVAL;}
 
 /* Processor specific parameters. */
 int Txxx = 414;
+int t4_isa_strict = 0;
 uint32_t MemStart    = 0x80000048;
 
 /* Memory space. */
@@ -2218,6 +2219,10 @@ static void t4_fill_combinations(void)
 {
         int i;
         memset(combinations, 0, sizeof(combinations));
+        /* -s414/-s425 check each instruction on its own (t4xx_has_opr):
+         * a fused pair would hide an FPU or T425 instruction */
+        if (t4_isa_strict)
+                return;
         for (i = 0; NO_ICODE != combined[i].code0; i++)
                 combinations[(combined[i].code0 << 10) + combined[i].code1] = (u_char)(1 + i);
 }
@@ -3846,6 +3851,39 @@ u_short ProfileCode (u_char instrCode, uint32_t oprCode)
         return ret;
 }
 
+/* Does the part -s414/-s425 selects have secondary instruction `op`?  The
+ * T414 has the base set, its floating-point support (unpacksn, roundsn,
+ * postnormsn, ldinf, cflerr) and fmul; the T425 adds dup, the move2d
+ * group, crcword/crcbyte, bitcnt, the bit reversals, wsubdb, pop, the
+ * timer enables, ldmemstartval, the j0 breakpoints, lddevid and start
+ * (Norcroft xpuops.h; Compiler Writer's Guide D.4).  Neither has an FPU
+ * or any T9000 instruction - gtu included, which t4 runs in other modes. */
+static int t4xx_has_opr (int32_t op)
+{
+	switch (op) {
+	case 0x11: case 0x14:
+		return 0;
+	case 0x63: case 0x6C: case 0x6D: case 0x71: case 0x72: case 0x73:
+		return 1;
+	case 0x5A: case 0x5B: case 0x5C: case 0x5D: case 0x5E:
+	case 0x74: case 0x75: case 0x76: case 0x77: case 0x78: case 0x79:
+	case 0x7A: case 0x7B: case 0x7C: case 0x7D: case 0x7E: case 0x81:
+	case 0xB1: case 0xB2: case 0xB3: case 0xB4: case 0x17C: case 0x1FF:
+		return t4_isa_strict == 425;
+	}
+	return op >= 0 && op <= 0x59;
+}
+
+/* Stop on a secondary the selected T4xx lacks, rather than run it */
+static void t4xx_bad_opr (int32_t op)
+{
+	printf ("-E-EMU414: Error - #%X (%s) is not a T%d instruction\n",
+	        (uint32_t)op, mnemonic (0xF0, op, AReg, 0), t4_isa_strict);
+	maybe_log_nearest_sym (IPtr, "not-t4xx");
+	processor_state ();
+	handler (-1);
+}
+
 /* Next heartbeat_counter value at which run_insn_hooks() is due; 0 makes
  * the first instruction resolve the hooks' settings. */
 static uint64_t insn_hook_next;
@@ -4212,7 +4250,7 @@ void mainloop (void)
 	 * settled by now.  One loop-invariant test keeps every one of them off
 	 * the common path; production runs pay a register test, not loads. */
 	rare_hooks = !production_quiet || stop_iptr || dcache_enabled > 0 ||
-	             t9k.enabled ||
+	             t9k.enabled || t4_isa_strict ||
 #ifndef EMUDEBUG
 	             fast_block_enabled || fast_primary_enabled ||
 #endif
@@ -5653,6 +5691,11 @@ FastDispatch:
 		case 0xf0: /* opr   */
 
 	PROFILEINSTR(add_profile (0x100 + OReg));
+	/* -s414/-s425: an instruction that part lacks stops the run */
+	if (unlikely(rare_hooks && t4_isa_strict) && !t4xx_has_opr ((int32_t)OReg)) {
+		t4xx_bad_opr ((int32_t)OReg);
+		break;
+	}
 	/* T9000: privileged secondaries trap when running as P-process. */
 	if (unlikely(t9k_prot.is_p))
 		t9k_check_priv_op(OReg);
