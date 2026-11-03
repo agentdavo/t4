@@ -39,4 +39,20 @@ int  t4_node_any_ready(void);
 void t4_net_request_stop(void);
 int  t4_net_stop_requested(void);
 
+/* Node time in a threaded network (t4_fabric.c).  T4_LOCKSTEP=1
+ * (t4_ls_stamps) orders link events by it; T4_LOCKSTEP_WINDOW=W
+ * (t4_ls_window) keeps every running node within about W instructions of
+ * the slowest.  Both are off by default; t4_ls_active is either.
+ * t4_ls_tick() runs in the timer block when there is a window, the
+ * park/unpark pair around a node's idle waits and its mainloop(). */
+extern int t4_ls_active, t4_ls_stamps, t4_ls_window;
+void t4_ls_tick(void);
+void t4_ls_park(void);
+void t4_ls_unpark(void);
+/* the node's time, a jump forward to t, and whether a message stamped
+ * `stamp` has reached the node yet */
+uint64_t t4_ls_now(void);
+void t4_ls_advance(uint64_t t);
+int  t4_ls_visible(uint64_t stamp);
+
 #endif

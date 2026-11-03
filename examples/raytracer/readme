@@ -61,5 +61,13 @@ Moving done ! 42 before the pixels is no fix: the controller can then
 block feeding a worker whose renderer is still sending, and the farm
 deadlocks.  ../transputer-raytracer is the reworked version.
 
+T4_LOCKSTEP=1 makes every image exact: it orders link events by each
+node's instruction count, so a descheduled node no longer lets the others
+overtake it (../../THREADED-NODES.md, "Node time").  28 of 28 runs, every
+arrangement and model, under host load:
+
+	T4_LOCKSTEP=1 SPYNET=raytrace10.map; export T4_LOCKSTEP SPYNET
+	echo 3 | t4 -st -s8 -sn -10 -sb raytrace10.btl
+
 The occam compiler itself (oc) mis-compiled this source on t4 until
 7cb262c, which fixed t4's fused eqc;cj pair.

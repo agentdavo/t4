@@ -1136,3 +1136,62 @@ PR1 ──► PR2 ──► PR3 ──► PR5 ──► PR6 ──► PR7/PR8
               └──► PR4 ──┘
 ```
 
+
+## Node time: `T4_LOCKSTEP` (2026-11-03)
+
+Threaded nodes run free.  The host schedules each node's thread, and one
+it deschedules for a few milliseconds falls millions of instructions
+behind the rest of the network, an order of events transputers of one
+speed cannot produce.  A program that relies on their relative speed
+then fails on t4 only: the INMOS ray tracer's farm
+(`examples/raytracer/readme`) loses a job, and an 8 x 8 patch, when the
+worker that rendered it is descheduled between sending its pixels and
+signalling `done`.
+
+Both switches are off by default; the code is in `t4_fabric.c` ("node
+time") and `p.c` (`sch_visible`, `start_process`).
+
+- **`T4_LOCKSTEP=1`** gives each node a time, the instructions it has
+  executed plus an offset, and orders link events by it.  A packet in a
+  link mailbox carries its sender's time and the acknowledge (the emptied
+  mailbox) the receiver's, in the `SCH_STAMP` slot unless `T4_T9K_NET`
+  uses it.  A running node sees either only once its own time has reached
+  the stamp; a node with nothing to run (in `start_process`'s idle loop,
+  or not yet booted) is parked, takes it at once and jumps to it.  Every
+  link event then happens no earlier than the event that caused it,
+  whatever the host does.
+- **`T4_LOCKSTEP_WINDOW=W`** also keeps every running node within about W
+  instructions of the slowest, checked every 64 instructions in the timer
+  block; parked nodes hold nobody back and rejoin at the network's
+  low-water mark.  It bounds how far a node can run on before a slower
+  node's message reaches it, which the stamps cannot, but it is costly.
+
+Measured (2026-11-03, threaded, host load 10-29):
+
+| | without | `T4_LOCKSTEP=1` |
+|---|---|---|
+| original tracer, 3-34 nodes x models 1-4 | 11 and 22 of 28 images lack a patch (two sweeps) | 28 of 28 exact |
+| original tracer, 10 nodes, modes interleaved | 0 of 8 exact, renders 1-14 s | 8 of 8, 2-16 s |
+| C port (`transputer-raytracer/c`), 16 / 64 nodes | exact, 0.7-1.0 / 1.7-2.2 s | exact, 1.4-2.0 / 1.6-1.8 s |
+| reworked occam tracer (`transputer-raytracer/bin`), 8 / 16 nodes | 8 nodes mostly pass, 16 time out | all time out |
+| t4 suite, `tests/net` (8 scripts) | pass | pass |
+
+`T4_LOCKSTEP_WINDOW=256` alone also made the original tracer exact but
+rendered it 5-15 times slower, and two of 16 runs hit the 300 s limit.
+The reworked occam tracer has the farm deadlock `testall.sh` describes
+(a renderer that owes pixels while the controller is blocked sending it
+the next job), and the same change made to the original tracer deadlocks
+it too; with link events in causal order the deadlocking interleaving is
+the one that happens.  Single-node runs are unchanged (Dhrystone 1.18 s
+against 1.17 s).
+
+Limits.  Time is instructions, not cycles, and a link transfer takes
+none, so the order is that of a network with instantaneous links; a
+latency per packet would be the next step.  An idle node's time stops
+until a message reaches it, so a node that is often idle runs behind one
+that is not: its messages reach a busier node "early", and a busy node
+must execute up to the stamps of messages and acknowledges from busier
+ones before it sees them.  That is probably the 16-node C port's
+slowdown (not traced).  Not
+covered: `-sl` nodes (processes) and `ipc://` links, and an acknowledge
+through a C104 carries no time.

@@ -5,6 +5,9 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #if defined(__linux__)
 #include <unistd.h>
@@ -136,6 +139,210 @@ int t4_net_stop_requested(void)
         return atomic_load(&t4_net_quit_flag) != 0;
 }
 
+/* ---- node time (T4_LOCKSTEP, T4_LOCKSTEP_WINDOW) --------------------------
+ *
+ * Each node of a threaded network is a host thread, scheduled as the host
+ * likes: one descheduled for a few milliseconds lets the rest of the
+ * network run millions of instructions past it, an order of events that
+ * transputers of one speed cannot produce.  A program whose correctness
+ * rests on the relative speed of its processors - the INMOS ray tracer's
+ * farm does (examples/raytracer/readme) - then fails on t4 only.
+ *
+ * A node's time is the instructions it has executed, plus an offset.  A
+ * node with nothing to run, or not yet booted, is parked.
+ *
+ * T4_LOCKSTEP=1 orders link events by that time.  A packet in a link
+ * mailbox carries its sender's time and the mailbox's acknowledge
+ * (emptying it) the receiver's, both in the SCH_STAMP slot unless
+ * T4_T9K_NET uses it.  A running node sees either only once its own time
+ * has reached the stamp; a parked one takes it at once and jumps to it
+ * (p.c, sch_visible).  So every link event happens no earlier than the
+ * event that caused it, whatever the host does.  The ray tracer's farm at
+ * 10 nodes under host load: every image exact (8 of 8; 0 of 8 without),
+ * at about the same speed.
+ *
+ * T4_LOCKSTEP_WINDOW=W also bounds the skew: every timer tick (64
+ * instructions) a node publishes its time and waits while it is more than
+ * W ahead of the slowest running node.  A parked node holds nobody back
+ * and rejoins no earlier than the network's low-water mark, the largest
+ * minimum any node has seen; every running node is at or above that mark,
+ * so a node's last minimum stays a lower bound of the current one and is
+ * rescanned only when the node gets W past it.  (A node that unparks while
+ * another scans without it can rejoin just under a mark the scan then
+ * raises; the bound is loose by that much.)  It bounds how far a node can
+ * have run on before a message from a slower one reaches it, which the
+ * stamps cannot - but it costs: W=256 made the same farm render 5-15 times
+ * slower, and the stamps alone already make it exact.
+ *
+ * Time is instructions, not cycles, and a link transfer takes none.
+ * Threaded networks only: -sl nodes are processes, which this does not
+ * reach, and a packet through a C104 keeps its sender's stamp but its
+ * acknowledge carries none. */
+typedef struct t4_ls_node {
+        _Atomic uint64_t time;
+        _Atomic int      parked;
+        uint64_t         offset;        /* owner only */
+        uint64_t         floor;         /* owner only: <= the current minimum */
+} __attribute__((aligned(64))) t4_ls_node_t;
+
+int t4_ls_active, t4_ls_stamps, t4_ls_window;
+static t4_ls_node_t *ls_nodes;
+static _Atomic uint64_t ls_lwm;
+extern volatile sig_atomic_t t4_sig_pending;
+
+static void ls_create(int nnodes)
+{
+        const char *e;
+        void *p;
+        int i;
+
+        e = getenv("T4_LOCKSTEP");
+        t4_ls_stamps = e && *e && *e != '0';
+        e = getenv("T4_LOCKSTEP_WINDOW");
+        t4_ls_window = e && *e ? atoi(e) : 0;
+        if (t4_ls_window < 0)
+                t4_ls_window = 0;
+        if (!t4_ls_stamps && !t4_ls_window)
+                return;
+        if (posix_memalign(&p, 64, (size_t)nnodes * sizeof(t4_ls_node_t))) {
+                t4_ls_stamps = t4_ls_window = 0;
+                return;
+        }
+        t4_ls_active = 1;
+        ls_nodes = p;
+        memset(ls_nodes, 0, (size_t)nnodes * sizeof(t4_ls_node_t));
+        for (i = 0; i < nnodes; i++)
+                atomic_store(&ls_nodes[i].parked, 1);
+        atomic_store(&ls_lwm, 0);
+}
+
+/* The time of the slowest running node other than `self`, or UINT64_MAX */
+static uint64_t ls_min(int self)
+{
+        uint64_t m = UINT64_MAX, t;
+        int i;
+
+        for (i = 0; i < t4_fabric->nnodes; i++) {
+                if (i == self ||
+                    atomic_load_explicit(&ls_nodes[i].parked, memory_order_acquire))
+                        continue;
+                t = atomic_load_explicit(&ls_nodes[i].time, memory_order_relaxed);
+                if (t < m)
+                        m = t;
+        }
+        return m;
+}
+
+static void ls_raise_lwm(uint64_t m)
+{
+        uint64_t old = atomic_load_explicit(&ls_lwm, memory_order_relaxed);
+
+        while (old < m &&
+               !atomic_compare_exchange_weak_explicit(&ls_lwm, &old, m,
+                                                      memory_order_relaxed,
+                                                      memory_order_relaxed))
+                ;
+}
+
+void t4_ls_tick(void)
+{
+        int self = t4cpu->cpu_nodeid;
+        t4_ls_node_t *n;
+        uint64_t now, m;
+        int spins = 0;
+
+        if (!ls_nodes || self < 0 || self >= t4_fabric->nnodes)
+                return;
+        n = &ls_nodes[self];
+        now = t4cpu->s_heartbeat_counter + n->offset;
+        atomic_store_explicit(&n->time, now, memory_order_relaxed);
+        if (now <= n->floor + (uint64_t)t4_ls_window)
+                return;
+        for (;;) {
+                m = ls_min(self);
+                if (m == UINT64_MAX) {          /* nobody else is running */
+                        n->floor = now;
+                        return;
+                }
+                ls_raise_lwm(m);
+                n->floor = m;
+                if (now <= m + (uint64_t)t4_ls_window)
+                        return;
+                if (t4_net_stop_requested() || t4_sig_pending ||
+                    (t4_fabric->events && t4_fabric->events[self]))
+                        return;
+                /* give the host CPU to the node we wait for */
+                if (++spins < 32)
+                        sched_yield();
+                else {
+                        struct timespec ts = { 0, 20000 };
+                        nanosleep(&ts, NULL);
+                }
+        }
+}
+
+uint64_t t4_ls_now(void)
+{
+        int self = t4cpu->cpu_nodeid;
+
+        if (!ls_nodes || self < 0 || self >= t4_fabric->nnodes)
+                return 0;
+        return t4cpu->s_heartbeat_counter + ls_nodes[self].offset;
+}
+
+void t4_ls_advance(uint64_t t)
+{
+        int self = t4cpu->cpu_nodeid;
+        uint64_t now;
+
+        if (!ls_nodes || self < 0 || self >= t4_fabric->nnodes)
+                return;
+        now = t4cpu->s_heartbeat_counter + ls_nodes[self].offset;
+        if (t > now)
+                ls_nodes[self].offset += t - now;
+}
+
+int t4_ls_visible(uint64_t stamp)
+{
+        int self = t4cpu->cpu_nodeid;
+        t4_ls_node_t *n;
+
+        if (!ls_nodes || self < 0 || self >= t4_fabric->nnodes)
+                return 1;
+        n = &ls_nodes[self];
+        return atomic_load_explicit(&n->parked, memory_order_relaxed) ||
+               t4cpu->s_heartbeat_counter + n->offset >= stamp;
+}
+
+void t4_ls_park(void)
+{
+        int self = t4cpu->cpu_nodeid;
+
+        if (ls_nodes && self >= 0 && self < t4_fabric->nnodes)
+                atomic_store_explicit(&ls_nodes[self].parked, 1,
+                                      memory_order_release);
+}
+
+void t4_ls_unpark(void)
+{
+        int self = t4cpu->cpu_nodeid;
+        t4_ls_node_t *n;
+        uint64_t now, lwm;
+
+        if (!ls_nodes || self < 0 || self >= t4_fabric->nnodes)
+                return;
+        n = &ls_nodes[self];
+        now = t4cpu->s_heartbeat_counter + n->offset;
+        lwm = atomic_load_explicit(&ls_lwm, memory_order_relaxed);
+        if (now < lwm) {
+                n->offset += lwm - now;
+                now = lwm;
+        }
+        n->floor = lwm;
+        atomic_store_explicit(&n->time, now, memory_order_relaxed);
+        atomic_store_explicit(&n->parked, 0, memory_order_release);
+}
+
 t4_fabric_t *t4_fabric_create(int nnodes)
 {
         t4_fabric_t *f;
@@ -143,6 +350,7 @@ t4_fabric_t *t4_fabric_create(int nnodes)
 
         if (nnodes < 1)
                 return NULL;
+        ls_create(nnodes);
         f = calloc(1, sizeof(*f));
         if (!f)
                 return NULL;

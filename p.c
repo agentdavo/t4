@@ -2837,6 +2837,35 @@ int handleboot (Channel *chan, u_char *data, int ndata)
         return 1;
 }
 
+/* T4_LOCKSTEP stamps a link mailbox's packet with its sender's time and its
+ * acknowledge (the emptied mailbox) with the receiver's, in the SCH_STAMP
+ * slot, which T4_T9K_NET uses for itself when it is on (t4_fabric.c). */
+static int sch_stamped (Channel *chan)
+{
+        return t4_ls_stamps && chan->schbuf && !(t9k.enabled && t9k.net_on);
+}
+
+static uint64_t sch_stamp (Channel *chan)
+{
+        uint64_t t;
+
+        memcpy (&t, &chan->schbuf[SCH_STAMP], 8);
+        return t;
+}
+
+static void sch_set_stamp (Channel *chan, uint64_t t)
+{
+        memcpy (&chan->schbuf[SCH_STAMP], &t, 8);
+}
+
+/* Whether a full In mailbox's packet, or an empty Out mailbox's
+ * acknowledge, has reached this node yet.  Read after the length word,
+ * which orders the stamp. */
+static int sch_visible (Channel *chan)
+{
+        return !sch_stamped (chan) || t4_ls_visible (sch_stamp (chan));
+}
+
 int channel_ready (Channel *chan)
 {
         struct nn_pollfd pfd[1];
@@ -2851,7 +2880,7 @@ int channel_ready (Channel *chan)
         }
         if (chan->schbuf)
         {
-                ret = 0 != SCHLength(chan);
+                ret = 0 != SCHLength(chan) && sch_visible (chan);
                 goto Exit;
         }
 
@@ -2894,6 +2923,9 @@ static int channel_recv (Channel *chan, u_char *data, int doWait, int hold)
                 {
                         ret = SCHLength(chan);
                         memcpy (data, &chan->schbuf[SCH_DATA], ret);
+                        /* taken no earlier than it was sent */
+                        if (sch_stamped (chan))
+                                t4_ls_advance (sch_stamp (chan));
                         if (t9k.enabled && t9k.net_on)
                         {
                                 /* the sender's ready cycle, beside the data
@@ -2905,6 +2937,8 @@ static int channel_recv (Channel *chan, u_char *data, int doWait, int hold)
                         }
                         if (!hold)
                         {
+                                if (sch_stamped (chan))
+                                        sch_set_stamp (chan, t4_ls_now ());
                                 SCHSetLength(chan, 0);
                                 t4_wake_node_id(chan->peer);
                         }
@@ -2981,6 +3015,8 @@ int channel_recvmemP (Channel *chan, u_char *data, int doMemWrite, int doWait)
                 chan->Address += n; chan->Length -= n;
                 if (0 == chan->npend && chan->schbuf)
                 {
+                        if (sch_stamped (chan))   /* the acknowledge's time */
+                                sch_set_stamp (chan, t4_ls_now ());
                         SCHSetLength(chan, 0);
                         t4_wake_node_id(chan->peer);
                 }
@@ -3025,6 +3061,12 @@ int channel_sendP (Channel *chan, u_char *data, int ndata, int doWait)
                         }
 #endif
                         memcpy (&chan->schbuf[SCH_DATA], data, ndata);
+                        /* sent no earlier than the last one was taken */
+                        if (sch_stamped (chan))
+                        {
+                                t4_ls_advance (sch_stamp (chan));
+                                sch_set_stamp (chan, t4_ls_now ());
+                        }
                         if (t9k.enabled && t9k.net_on)
                         {
                                 uint64_t ready = t9k_net_ready (chan->linkno, (uint32_t)ndata);
@@ -3346,6 +3388,11 @@ int linkcomms (char *where, int doBoot, int timeOut)
                                         doadd = 0 != SCHLength(channels[i]);
                                 else
                                         doadd = 0 == SCHLength(channels[i]);
+                                doadd = doadd && sch_visible (channels[i]);
+                                /* an idle node takes the time it arrived: an
+                                 * ALT it wakes must see it in its disc too */
+                                if (doadd && sch_stamped (channels[i]))
+                                        t4_ls_advance (sch_stamp (channels[i]));
                                 if (doadd)
                                 {
                                         pfd[i].revents = pfd[i].events;
@@ -3436,7 +3483,11 @@ int linkcomms (char *where, int doBoot, int timeOut)
                                         channels[i]->ackwait = 1;
                         }
                         else
+                        {
                                 channels[i]->ackwait = 0;   /* taken */
+                                if (sch_stamped (channels[i]))
+                                        t4_ls_advance (sch_stamp (channels[i]));
+                        }
                 }
                 /* Still processing message? */
                 if (channels[i]->Length || channels[i]->ackwait)
@@ -4544,6 +4595,9 @@ void mainloop (void)
                         } else {
                                 update_time();
                         }
+                        /* T4_LOCKSTEP_WINDOW: wait while far ahead of the slowest node */
+                        if (t4_ls_window)
+                                t4_ls_tick();
 
                         {
                                 /* Every 1024 timer ticks ≈ rare host I/O */
@@ -10805,6 +10859,7 @@ int run_process (void)
 int start_process (void)
 {
         int active, links_active;
+        int ls_parked = FALSE;
 
         /* IntEnabled is always TRUE.
          * if ((ProcPriority == LoPriority) && !IntEnabled)
@@ -10823,6 +10878,13 @@ int start_process (void)
                         return 1;
                 if (0 == run_process ())
                         break;
+                /* nothing to run: parked, a node takes a message's time
+                 * and holds nobody back (T4_LOCKSTEP) */
+                if (t4_ls_active && !ls_parked)
+                {
+                        t4_ls_park ();
+                        ls_parked = TRUE;
+                }
                 /* nothing to run: wait for a process the VCP holds */
                 if (t9k.net_npend) {
                         t9k_net_release (1);
@@ -10897,6 +10959,9 @@ int start_process (void)
                         t4_signal_exit (sig);
                 }
         } while (active);
+
+        if (ls_parked)
+                t4_ls_unpark ();
 
         if (!active)
         {

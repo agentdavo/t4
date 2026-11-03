@@ -170,9 +170,11 @@ static void *t4_node_thread(void *arg)
         }
         /* a T9000 control system restarts a stopped CPU (Run, Reboot) */
         t4_in_mainloop = 1;
-        do
+        do {
+                t4_ls_unpark();         /* T4_LOCKSTEP: running from here */
                 mainloop();
-        while (t9k_ctl_after_halt());
+                t4_ls_park();
+        } while (t9k_ctl_after_halt());
         t4_in_mainloop = 0;
         t9k_report();
         return NULL;
@@ -1233,9 +1235,11 @@ int main (int argc, char **argv)
 	/* Now start the emulator; a T9000 control system may restart a
 	 * stopped CPU (Run, Reboot). */
 	t4_in_mainloop = 1;
-	do
+	do {
+	        t4_ls_unpark ();        /* T4_LOCKSTEP: running from here */
 	        mainloop ();
-	while (t9k_ctl_after_halt ());
+	        t4_ls_park ();
+	} while (t9k_ctl_after_halt ());
 	t4_in_mainloop = 0;
         if (want_threads)
                 t4_join_thread_nodes();
