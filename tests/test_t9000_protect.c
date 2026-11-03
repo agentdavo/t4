@@ -4,13 +4,15 @@
  */
 #include "t9000_protect.h"
 #include "processor.h"
+#include "cpu_state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
 
-/* Stubs for symbols referenced from t9000_protect.c */
-uint32_t IPtr, WPtr, AReg, BReg, CReg, OReg, XReg, EReg, WdescReg;
+/* Stubs for symbols referenced from t9000_protect.c and t9000_pmi.c */
+cpu_t t4_cpu0;
+T4_THREAD_LOCAL cpu_t *t4cpu = &t4_cpu0;
 int Txxx = 9000;
 uint32_t MemSize, MemWordMask, MemByteMask, MemStart, ExtMemStart, CoreSize, CLineTagsSize;
 
@@ -34,6 +36,15 @@ void UpdateWdescReg(uint32_t w)
 {
 	WdescReg = w;
 	WPtr = w & ~3u;
+}
+
+uint32_t t4_insn_start(void)
+{
+	return IPtr;
+}
+
+void t4_icache_context(void)
+{
 }
 
 static int fails;
@@ -95,6 +106,32 @@ int main(void)
 
 	expect(t9k_is_privileged_op(0x07) == 1, "in is privileged");
 	expect(t9k_is_privileged_op(0x00) == 0, "rev is not privileged");
+
+	/* Block ranges (move): accessible exactly when both ends are */
+	t9k_prot.region[0] = t9k_make_region(0x20000000u, 4096, 1, 0, 0, 0);
+	c = t9k_probe_range(0x00000100u, 0x100, T9K_ACC_WRITE, &pa);
+	expect(c == 0 && pa == 0x20000100u, "range inside region ok");
+	c = t9k_probe_range(0x00000F00u, 0x200, T9K_ACC_READ, &pa);
+	expect(c == T9K_TRAP_ACCESS, "range past region end faults");
+	c = t9k_probe_range(0x00000F00u, 0x100, T9K_ACC_READ, &pa);
+	expect(c == 0 && pa == 0x20000F00u, "range up to region end ok");
+	t9k_prot.region[0] = t9k_make_region(0x20000000u, 4096, 1, 0, 0, 1);
+	c = t9k_probe_range(0x00000100u, 4, T9K_ACC_READ, &pa);
+	expect(c == T9K_TRAP_ACCESS, "device-only range faults for move");
+	c = t9k_probe_range(0x00000100u, 4, T9K_ACC_READ | T9K_ACC_DEV, &pa);
+	expect(c == 0, "device-only range ok for devmove");
+
+	/* Quarters an Icache may keep across a mode change */
+	t9k_prot.region[0] = t9k_make_region(0x20000000u, 4096, 0, 1, 0, 0);
+	t9k_prot.region[2] = 0xA0000003u;	/* Linux: whole Q2 onto itself, W|X */
+	t9k_prot.region[3] = 0xE0000001u;	/* whole Q3 onto itself, no X */
+	expect(t9k_fetch_transparent() == 0x4u, "only an identity X quarter is transparent");
+	t9k_prot.region[2] = 0xE0000003u;	/* Q2 relocated onto Q3 */
+	expect(t9k_fetch_transparent() == 0x0u, "a relocated quarter is not");
+	t9k_prot.region[2] = 0xA000000Bu;	/* device-only */
+	expect(t9k_fetch_transparent() == 0x0u, "a device-only quarter is not");
+	t9k_prot.is_p = 0;
+	expect(t9k_fetch_transparent() == 0xFu, "L-mode fetches every quarter unchanged");
 
 	/* leave_p clears P without trap (spawn longjmp path) */
 	t9k_prot.is_p = 1;

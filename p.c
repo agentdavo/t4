@@ -2085,6 +2085,160 @@ Again:  if (x + n > MAX_ICACHE)
 
 #endif
 
+/*
+ * T9000 protected mode fetches from logical addresses (ISM 9.3): each one
+ * is translated and needs execute permission.  That is checked when an
+ * instruction is decoded into the Icache, so a hit costs nothing, and the
+ * Icache is keyed by the address IPtr holds.  It therefore keeps only what
+ * the current mode would fetch the same way: after a change of mode or of
+ * the region descriptors (t4_icache_context) it is emptied unless every
+ * quarter it holds instructions from is fetched unchanged and executable
+ * in the new mode, and nothing in it came through a relocating region.
+ * Linux's full-quarter identity region 2 never empties it.
+ */
+static T4_THREAD_LOCAL unsigned ic_quarters;   /* quarters the Icache holds code from */
+static T4_THREAD_LOCAL int ic_reloc;           /* fetched where logical != physical */
+static T4_THREAD_LOCAL uint32_t fetch_start;   /* the instruction being decoded */
+
+void t4_icache_context (void)
+{
+        int i;
+
+        if (!ic_reloc && !(ic_quarters & ~t9k_fetch_transparent ()))
+                return;
+        for (i = 0; i < MAX_ICACHE+1; i++)
+        {
+                Icache[i].ip  = IC_NOADDR;
+                Icache[i].Pcode = 0x3ff;
+        }
+        ic_quarters = 0;
+        ic_reloc = 0;
+}
+
+/* A P-process store to a relocated logical address must also drop the
+ * Icache entries keyed by that address. */
+static INLINE void t9k_store_la (uint32_t la, uint32_t pa, uint32_t n)
+{
+        if (unlikely(ic_reloc) && la != pa)
+                InvalidateRange (la, n);
+}
+
+/* code_byte() in protected mode.  A fetch that fails is an AccessViolation
+ * taken in the fetch stage, which leaves ps.Eptr and ps.sIptr both at the
+ * instruction being fetched (ISM 13.2.2), its first prefix byte. */
+static uint32_t t9k_fetch_pa (uint32_t la)
+{
+        uint32_t pa;
+
+        if (t9k_probe (la, T9K_ACC_EXEC, &pa) == 0 &&
+            (pa >= MemStart ||
+             (t4_sd_boot_enabled () &&
+              (pa - BOOTBANK_BASE < BOOTBANK_SIZE ||
+               (pa >= SD_BASE && pa < SD_LIMIT)))))
+        {
+                ic_quarters |= 1u << (la >> 30);
+                if (pa != la)
+                        ic_reloc = 1;
+                return pa;
+        }
+        if (t9k_prot.debug)
+                fprintf (stderr, "[T9K-PROT] fetch at 0x%08X not executable, instruction at 0x%08X\n",
+                         la, fetch_start);
+        if (Icache[IHASH(fetch_start)].ip == fetch_start)
+                Icache[IHASH(fetch_start)].ip = IC_NOADDR;     /* half decoded */
+        IPtr = fetch_start;
+        t9k_prot.last_fault_la = la;
+        t9k_p_trap (T9K_TRAP_ACCESS, fetch_start);
+        return la;      /* not reached: t9k_p_trap longjmps to the mainloop */
+}
+
+/* The first byte of the instruction being executed, for ps.Eptr.  Nothing
+ * records it per instruction - that would cost every instruction - but the
+ * instruction came from the Icache entry that starts there and ends
+ * (NextIPtr) at the opcode byte IPtr points at until the instruction
+ * finishes.  For a pair fused by T4COMBINATIONS this is the second one.
+ * Only traps call it. */
+uint32_t t4_insn_start (void)
+{
+        uint32_t k;
+
+        for (k = 0; k < 32; k++) {
+                uint32_t s = IPtr - k;
+
+                if (Icache[IHASH(s)].ip == s && Icache[IHASH(s)].NextIPtr == IPtr)
+                        return s;
+        }
+        return IPtr;
+}
+
+/* move and devmove (dev = T9K_ACC_DEV), and each row of move2dall, in
+ * protected mode: "AccessViolation signalled in a P-process if any address
+ * accessed is protected" (ISM).  The two ranges are cut where either
+ * crosses into another quarter, each part is translated as a whole, and
+ * every part is checked before a byte moves, so a violation leaves memory
+ * as it was. */
+static void t9k_move (uint32_t dst, uint32_t src, uint32_t len, int dev)
+{
+        struct { uint32_t d, s, pd, ps, n; } part[8];  /* < 2^31 bytes: <= 5 */
+        uint32_t done = 0;
+        int i, np = 0, save;
+
+        while (done < len) {
+                uint32_t s = src + done, d = dst + done, n = len - done;
+                uint32_t qs = 0x40000000u - (s & 0x3FFFFFFFu);
+                uint32_t qd = 0x40000000u - (d & 0x3FFFFFFFu);
+                int c;
+
+                if (n > qs)
+                        n = qs;
+                if (n > qd)
+                        n = qd;
+                c = t9k_probe_range (s, n, T9K_ACC_READ | dev, &part[np].ps);
+                if (c)
+                        t9k_prot.last_fault_la = s;
+                else if ((c = t9k_probe_range (d, n, T9K_ACC_WRITE | dev, &part[np].pd)))
+                        t9k_prot.last_fault_la = d;
+                if (c) {
+                        if (t9k_prot.debug)
+                                fprintf (stderr, "[T9K-PROT] %s 0x%08X <- 0x%08X, %u bytes: AccessViolation\n",
+                                         dev ? "devmove" : "move", dst, src, len);
+                        t9k_p_trap ((uint32_t)c, t4_insn_start ());
+                }
+                part[np].d = d;
+                part[np].s = s;
+                part[np].n = n;
+                np++;
+                done += n;
+        }
+        save = t9k_prot.phys_bypass;
+        t9k_prot.phys_bypass = 1;       /* its byte paths must not translate */
+        for (i = 0; i < np; i++) {
+                movebytes_int (part[i].pd, part[i].ps, part[i].n);
+                t9k_store_la (part[i].d, part[i].pd, part[i].n);
+        }
+        t9k_prot.phys_bypass = save;
+}
+
+/* The 2D moves' framebuffer fast path takes their addresses as physical.
+ * In protected mode it may do so only when the whole block - rows from a,
+ * stride apart, width bytes each - is accessible and maps onto itself, as
+ * the framebuffer does under Linux's identity region 2. */
+static int t9k_block_identity (uint32_t a, uint32_t stride, uint32_t rows,
+                               uint32_t width, int access)
+{
+        uint64_t span = (uint64_t)(rows - 1) * stride + width;
+        uint32_t pa;
+
+        if (INT32(stride) < 0 || (a & 0x3FFFFFFFu) + span > 0x40000000u)
+                return 0;               /* the block leaves its quarter */
+        return t9k_probe_range (a, (uint32_t)span, access, &pa) == 0 && pa == a;
+}
+
+#define M2D_FAST_OK() \
+        (!t9k_prot.is_p || \
+         (t9k_block_identity (CReg, m2dSourceStride, m2dLength, AReg, T9K_ACC_READ) && \
+          t9k_block_identity (BReg, m2dDestStride, m2dLength, AReg, T9K_ACC_WRITE)))
+
 /* T4_WATCH_ADDR as writeword_int() last read it; 0 until then.  The inline
  * fast paths below defer to the *_int versions unless it is known unset. */
 static uint32_t ram_watch_addr;
@@ -4846,27 +5000,14 @@ ProductionFetch:
         if (unlikely(IPtr != Icache[islot].ip))
         {
                 /* Checked when an address is first cached: a hit
-                 * is an address that already passed. */
-		if (IPtr < MemStart &&
+                 * is an address that already passed.  A P-process's
+                 * logical addresses are checked byte by byte as
+                 * code_byte() translates them: one that runs off its
+                 * regions is an AccessViolation to the supervisor. */
+		if (IPtr < MemStart && !t9k_prot.is_p &&
 		    !(t4_sd_boot_enabled() &&
 		      (IPtr - BOOTBANK_BASE < BOOTBANK_SIZE ||
 		       (IPtr >= SD_BASE && IPtr < SD_LIMIT)))) {
-			/* A P-process that runs off its regions is an AccessViolation
-			 * (ISM 9.5): the machine traps to the supervisor, which is
-			 * exactly the case protection exists to contain.  Killing the
-			 * host instead loses the supervisor's diagnosis and turns a
-			 * contained guest fault into a dead emulator.  L-mode has no
-			 * supervisor to trap to, so it still halts below. */
-			if (t9k_in_p()) {
-				fprintf(stderr,
-					"[T9K-PROT] P-process left RAM: IPtr=0x%08X "
-					"WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X "
-					"— AccessViolation to supervisor\n",
-					IPtr, WPtr, AReg, BReg, CReg);
-				fflush(stderr);
-				t9k_p_trap(T9K_TRAP_ACCESS, IPtr);
-				/* not reached: t9k_p_trap longjmps to the mainloop */
-			}
 			fault_history_dump("execution left configured RAM");
 			/* Fatal: continuing would fetch from a negative mem[] index
 			 * (host SIGSEGV) or spin in garbage until timeout.  Stop with
@@ -4884,6 +5025,8 @@ ProductionFetch:
 			exit(2);
 		}
                 PROFILE(profile[PRO_ICMISS]++);
+                fetch_start = IPtr;
+                ic_quarters |= 1u << (IPtr >> 30);
                 Icache[islot].ip = IPtr;
                 SetCached(IPtr);
                 /* OReg is preserved across icache misses; do not reset here. */
@@ -4911,7 +5054,8 @@ FetchNext:
                  * Icache hit loaded garbage and hung early boot at "SLG".
                  * Re-enable only with T4_DCACHE=1 after filling Icache properly.
                  */
-                if (dcache_enabled > 0 && __builtin_expect(OReg == 0, 1)) {
+                if (dcache_enabled > 0 && __builtin_expect(OReg == 0, 1) &&
+                    !t9k_prot.is_p) {   /* reads mem[] untranslated */
                         dcache_entry_t *dc = dcache_lookup(&g_dcache, IPtr);
                         if (!dc)
                                 dc = dcache_fill(&g_dcache, IPtr, mem, MemByteMask);
@@ -6986,7 +7130,10 @@ DescheduleOutWord:
 		case 0x4a: /* move        */
                            if (INT32(AReg) > 0)
                            {
-                                movebytes_int (BReg, CReg, AReg);
+                                if (unlikely(t9k_prot.is_p))
+                                        t9k_move (BReg, CReg, AReg, 0);
+                                else
+                                        movebytes_int (BReg, CReg, AReg);
                                 CReg = CReg + WordsRead(CReg, AReg) * BytesPerWord;
                            }
                            else
@@ -7162,7 +7309,8 @@ DescheduleOutWord:
                                     fb_addr_in_range(m2dSourceAddress) &&
                                     fb_addr_in_range(m2dSourceAddress + (m2dLength-1) * m2dSourceStride + m2dWidth - 1) &&
                                     fb_addr_in_range(m2dDestAddress) &&
-                                    fb_addr_in_range(m2dDestAddress + (m2dLength-1) * m2dDestStride + m2dWidth - 1))
+                                    fb_addr_in_range(m2dDestAddress + (m2dLength-1) * m2dDestStride + m2dWidth - 1) &&
+                                    M2D_FAST_OK())
                                 {
                                     u_char *fb = vga_framebuffer;
                                     for (temp = 0; temp < m2dLength; temp++)
@@ -7183,9 +7331,15 @@ DescheduleOutWord:
                                 if (is_fb_flip)
                                     fprintf(stderr, "[MOVE2D_SLOW] fb_flip: dst=0x%08X src=0x%08X w=%d len=%d\n",
                                             m2dDestAddress, m2dSourceAddress, m2dWidth, m2dLength);
+                                /* protected: rows are checked one at a time,
+                                 * and an earlier row may have moved before a
+                                 * later one traps (the ISM leaves it open) */
                                 for (temp = 0; temp < m2dLength; temp++)
                                 {
-                                        movebytes_int (m2dDestAddress, m2dSourceAddress, m2dWidth);
+                                        if (unlikely(t9k_prot.is_p))
+                                                t9k_move (m2dDestAddress, m2dSourceAddress, m2dWidth, 0);
+                                        else
+                                                movebytes_int (m2dDestAddress, m2dSourceAddress, m2dWidth);
                                         m2dSourceAddress += m2dSourceStride;
                                         m2dDestAddress   += m2dDestStride;
                                 }
@@ -7207,7 +7361,8 @@ DescheduleOutWord:
                                     fb_addr_in_range(m2dSourceAddress) &&
                                     fb_addr_in_range(m2dSourceAddress + (m2dLength-1) * m2dSourceStride + m2dWidth - 1) &&
                                     fb_addr_in_range(m2dDestAddress) &&
-                                    fb_addr_in_range(m2dDestAddress + (m2dLength-1) * m2dDestStride + m2dWidth - 1))
+                                    fb_addr_in_range(m2dDestAddress + (m2dLength-1) * m2dDestStride + m2dWidth - 1) &&
+                                    M2D_FAST_OK())
                                 {
                                     u_char *fb = vga_framebuffer;
                                     for (temp = 0; temp < m2dLength; temp++)
@@ -7254,7 +7409,8 @@ DescheduleOutWord:
                                     fb_addr_in_range(m2dSourceAddress) &&
                                     fb_addr_in_range(m2dSourceAddress + (m2dLength-1) * m2dSourceStride + m2dWidth - 1) &&
                                     fb_addr_in_range(m2dDestAddress) &&
-                                    fb_addr_in_range(m2dDestAddress + (m2dLength-1) * m2dDestStride + m2dWidth - 1))
+                                    fb_addr_in_range(m2dDestAddress + (m2dLength-1) * m2dDestStride + m2dWidth - 1) &&
+                                    M2D_FAST_OK())
                                 {
                                     u_char *fb = vga_framebuffer;
                                     for (temp = 0; temp < m2dLength; temp++)
@@ -10011,8 +10167,12 @@ DescheduleOutWord:
 		case 0xFFFFFFD4u: /* devmove - device block move (T9000) */
                            /* Same data movement as move; the device ordering
                             * guarantees are trivially met (no reordering). */
-                           if (INT32(AReg) > 0)
-                               movebytes_int (BReg, CReg, AReg);
+                           if (INT32(AReg) > 0) {
+                               if (unlikely(t9k_prot.is_p))
+                                   t9k_move (BReg, CReg, AReg, T9K_ACC_DEV);
+                               else
+                                   movebytes_int (BReg, CReg, AReg);
+                           }
                            AReg = BReg = CReg = Undefined_p;
 			   IPtr++;
 			   break;
@@ -10145,7 +10305,7 @@ DescheduleOutWord:
 			   handler (-1);
 			   break;
 		case T9K_OP_SYSCALL: /* OReg -8 — system call (T9000, mem 60F8) */
-			   t9k_syscall();
+			   t9k_syscall(Icache[islot].ip);
 			   break;
 		case T9K_OP_GOPROT: /* OReg -6 — go protected (T9000, mem 60FA) */
 			   /* Areg = PDS, Breg = RODS (physical while in L) */
@@ -11179,6 +11339,8 @@ INLINE void update_time (void)
 
 static INLINE u_char code_byte(uint32_t ptr)
 {
+        if (unlikely(t9k_prot.is_p))
+                ptr = t9k_fetch_pa (ptr);
         /* Positive addresses are never RAM/core (both live in the signed-
          * negative half), so XiP fetch from the SD windows costs normal
          * execution a single never-taken branch. */
@@ -11593,8 +11755,11 @@ void writeword_int (uint32_t ptr, uint32_t value)
 	static uint32_t watch_addr = 0;
 
 	/* T9000: translate (+ write check in P-mode). L-mode still relocates Q3. */
-	if (unlikely(t9k_prot.active && !t9k_prot.phys_bypass))
+	if (unlikely(t9k_prot.active && !t9k_prot.phys_bypass)) {
+		uint32_t la = ptr;
 		ptr = t9k_translate(ptr, T9K_ACC_WRITE);
+		t9k_store_la(la, ptr, 4);
+	}
 
 	/* Keep the write watchpoint ahead of the normal-RAM fast return. */
 	if (!watch_addr) {
@@ -12085,8 +12250,11 @@ u_char byte (uint32_t ptr)
 /* Write a byte to memory. */
 INLINE void writebyte_int (uint32_t ptr, u_char value)
 {
-	if (unlikely(t9k_prot.active && !t9k_prot.phys_bypass))
+	if (unlikely(t9k_prot.active && !t9k_prot.phys_bypass)) {
+		uint32_t la = ptr;
 		ptr = t9k_translate(ptr, T9K_ACC_WRITE);
+		t9k_store_la(la, ptr, 1);
+	}
 
 	/* Fast path: RAM below historical MMIO cliff; FB carveout redirected. */
 	if (likely((uint32_t)(ptr - ExtMemStart) < (uint32_t)(ram_fast_limit - ExtMemStart))) {

@@ -16,6 +16,9 @@
 #                       network: node 2 is controlled through node 1
 #   test_t9000_pstack   one node: P-process stack extension on demand and
 #                       device-access-only regions (ISM 9.3, 9.5)
+#   test_t9000_pmode    one node: P-process instruction fetch (execute
+#                       permission, relocated code), move/devmove/move2dall
+#                       through the regions, and ps.Eptr for each trap
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).
@@ -146,5 +149,6 @@ run_test test_t9000_ctl_chain \
 
 # The supervisor restarts trapped call/ajw/gajw itself; the node halts.
 run_test test_t9000_pstack "$TESTS/test_t9000_pstack.c" 20s
+run_test test_t9000_pmode "$TESTS/test_t9000_pmode.c" 20s
 
 exit $(( failures > 0 ))

@@ -98,6 +98,17 @@ void t9k_check_wptr(uint32_t new_wptr, uint32_t insn_start);
 /* Non-trapping probe (for tests): 0 ok, non-zero trap cause */
 int t9k_probe(uint32_t la, int access, uint32_t *pa_out);
 
+/* t9k_probe() for the len > 0 bytes at la, which must lie in one address
+ * quarter: 0 with *pa_out the physical start, or the trap cause.  The
+ * range then maps onto contiguous physical memory. */
+int t9k_probe_range(uint32_t la, uint32_t len, int access, uint32_t *pa_out);
+
+/* Bit q set when every address in quarter q is fetched, executable, from
+ * the same physical address: all four in L-mode; in P-mode the quarters
+ * whose region is the whole quarter mapped onto itself with execute
+ * permission and not device-only. */
+unsigned t9k_fetch_transparent(void);
+
 /* Build a region descriptor (size must be power of two, >= 256) */
 uint32_t t9k_make_region(uint32_t phys_base, uint32_t size,
 			 int write, int exec, int top, int device);
@@ -116,11 +127,14 @@ void t9k_load_rods(const uint32_t rods[4]);
 void t9k_resume_p(const uint32_t region[4], uint32_t pstate,
 		  uint32_t wdesc_stub, uint32_t supervisor_iptr);
 
-/* syscall in P -> trap to supervisor; in L -> soft note (THDS not fully modelled) */
-void t9k_syscall(void);
+/* syscall in P -> trap to supervisor; in L -> soft note (THDS not fully
+ * modelled).  insn_start is the address of the instruction's first byte. */
+void t9k_syscall(uint32_t insn_start);
 
-/* Take P-process trap with cause; restores supervisor and longjmps */
-void t9k_p_trap(uint32_t cause, uint32_t fault_la);
+/* Take P-process trap with cause; restores supervisor and longjmps.  eptr
+ * is what ps.Eptr receives: the address of the trap causing instruction
+ * (ISM 10.2), or as ISM 13.2.2 sets out for the trap. */
+void t9k_p_trap(uint32_t cause, uint32_t eptr);
 
 /* Privileged secondary OReg? (ISM §9.2 subset) */
 int t9k_is_privileged_op(uint32_t oreg);
@@ -131,5 +145,12 @@ void t9k_check_priv_op(uint32_t oreg);
 /* Physical-memory helpers used while filling PDS (bypass) */
 uint32_t t9k_phys_word(uint32_t pa);
 void t9k_phys_writeword(uint32_t pa, uint32_t v);
+
+/* Provided by the interpreter (p.c): the first byte of the instruction
+ * being executed, for ps.Eptr; and the Icache's check after the mode or the
+ * region descriptors change, which drops instructions the new mode would
+ * fetch from elsewhere or may not execute. */
+uint32_t t4_insn_start(void);
+void t4_icache_context(void);
 
 #endif /* T9000_PROTECT_H */

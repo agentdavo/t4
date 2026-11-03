@@ -31,6 +31,13 @@ static void t9k_update_active(void)
 	t9k_prot.active = t9k_prot.enabled && (t9k_prot.is_p || live);
 }
 
+/* After a change of mode or of the region descriptors */
+static void t9k_context_changed(void)
+{
+	t9k_update_active();
+	t4_icache_context();
+}
+
 void t9k_protect_init(void)
 {
 	const char *e;
@@ -79,20 +86,14 @@ static int desc_size_n(uint32_t d)
 	int n;
 	if (d == T9K_NULL_REGION || d == 0x80000000u)
 		return -1;
-	/* Find the size bit: first 1 in bits [4..30] that is the n-1 marker.
-	 * Spec: bit n-1 set, bits 4..n-2 clear. Scan n from 8..31. */
-	for (n = 8; n <= 31; n++) {
-		uint32_t size_bit = 1u << (n - 1);
-		/* bits 4..n-2 must be 0: mask from bit 4 to bit n-2 */
-		uint32_t mid = 0;
-		if (n > 5) {
-			int b;
-			for (b = 4; b <= n - 2; b++)
-				mid |= 1u << b;
-		}
-		if ((d & size_bit) && !(d & mid))
+	/* Spec: bit n-1 set, bits 4..n-2 clear, n >= 8 - so bit n-1 is the
+	 * lowest set bit above bit 3, and bits 4..6 are clear.  This runs on
+	 * every P-process memory access and instruction fetch. */
+	if (d & 0x70u)
+		return -1;
+	for (n = 8; n <= 31; n++)
+		if (d & (1u << (n - 1)))
 			return n;
-	}
 	return -1;
 }
 
@@ -225,6 +226,39 @@ int t9k_probe(uint32_t la, int access, uint32_t *pa_out)
 	return translate_one(la, access, pa_out);
 }
 
+/* A region is contiguous both logically and physically, so a range in one
+ * quarter is accessible exactly when its two ends are.  (The PMI is asked
+ * about the two ends only.) */
+int t9k_probe_range(uint32_t la, uint32_t len, int access, uint32_t *pa_out)
+{
+	uint32_t pa = 0, pz = 0;
+	int c = t9k_probe(la, access, &pa);
+
+	if (c == 0)
+		c = t9k_probe(la + len - 1, access, &pz);
+	if (c == 0 && pz - pa != len - 1)	/* L-mode: relocation splits it */
+		c = T9K_TRAP_ACCESS;
+	if (c == 0)
+		*pa_out = pa;
+	return c;
+}
+
+unsigned t9k_fetch_transparent(void)
+{
+	unsigned q, mask = 0;
+
+	if (!t9k_in_p())
+		return 0xFu;
+	for (q = 0; q < 4; q++) {
+		uint32_t d = t9k_prot.region[q];
+		/* size 2^30, relocated onto quarter q, executable, not device */
+		if (desc_size_n(d) == 30 && (d >> 30) == q &&
+		    (d & (T9K_DESC_X | T9K_DESC_DEV)) == T9K_DESC_X)
+			mask |= 1u << q;
+	}
+	return mask;
+}
+
 uint32_t t9k_translate(uint32_t la, int access)
 {
 	uint32_t pa;
@@ -247,7 +281,9 @@ uint32_t t9k_translate(uint32_t la, int access)
 			fprintf(stderr,
 				"[T9K-PROT] ACCESS fault la=0x%08X acc=%d cause=%d\n",
 				la, access, c);
-		t9k_p_trap((uint32_t)c, la);
+		/* ps.Eptr is the instruction, not the address (ISM 10.2) */
+		t9k_prot.last_fault_la = la;
+		t9k_p_trap((uint32_t)c, t4_insn_start());
 		/* not reached */
 		return 0;
 	}
@@ -347,7 +383,9 @@ void t9k_check_priv_op(uint32_t oreg)
 		if (t9k_prot.debug)
 			fprintf(stderr, "[T9K-PROT] PRIV oreg=0x%X IPtr=0x%08X\n",
 				oreg, IPtr);
-		t9k_p_trap(T9K_TRAP_PRIV, IPtr);
+		/* ISM 13.2.2: "the stored error pointer is the address of the
+		 * next instruction to be executed" - IPtr is at the opr byte */
+		t9k_p_trap(T9K_TRAP_PRIV, IPtr + 1);
 	}
 }
 
@@ -371,6 +409,7 @@ void t9k_check_wptr(uint32_t new_wptr, uint32_t insn_start)
 		fprintf(stderr, "[T9K-PROT] Wptr 0x%08X not writable, instruction at 0x%08X\n",
 			new_wptr, insn_start);
 	IPtr = insn_start;	/* ps.sIptr is undefined here; make it restartable */
+	t9k_prot.last_fault_la = new_wptr;
 	t9k_p_trap(T9K_TRAP_ACCESS, insn_start);
 }
 
@@ -407,7 +446,7 @@ static void t9k_ism_reason(uint32_t cause, uint32_t *reason, uint32_t *etype)
 	}
 }
 
-void t9k_p_trap(uint32_t cause, uint32_t fault_la)
+void t9k_p_trap(uint32_t cause, uint32_t eptr)
 {
 	uint32_t pds = t9k_prot.pstate_reg;
 	uint32_t stub = t9k_prot.wdesc_stub;
@@ -419,7 +458,6 @@ void t9k_p_trap(uint32_t cause, uint32_t fault_la)
 	}
 
 	t9k_prot.last_trap = cause;
-	t9k_prot.last_fault_la = fault_la;
 	t9k_prot.trap_count++;
 	t9k_prot.dev_access = 0;	/* a device instruction is abandoned */
 
@@ -428,7 +466,7 @@ void t9k_p_trap(uint32_t cause, uint32_t fault_la)
 		uint32_t cntl = t9k_phys_word(pds + 4 * T9K_PS_CNTL);
 		cntl = (cntl & 0xFFFF0000u) | (cause & 0xFFFFu);
 		t9k_phys_writeword(pds + 4 * T9K_PS_CNTL, cntl);
-		t9k_phys_writeword(pds + 4 * T9K_PS_EPTR, fault_la ? fault_la : IPtr);
+		t9k_phys_writeword(pds + 4 * T9K_PS_EPTR, eptr);
 		t9k_phys_writeword(pds + 4 * T9K_PS_SWPTR, WPtr);
 		t9k_phys_writeword(pds + 4 * T9K_PS_SIPTR, IPtr);
 		t9k_phys_writeword(pds + 4 * T9K_PS_SAREG, AReg);
@@ -440,7 +478,7 @@ void t9k_p_trap(uint32_t cause, uint32_t fault_la)
 
 	/* Restore supervisor L-process */
 	t9k_prot.is_p = 0;
-	t9k_update_active();
+	t9k_context_changed();
 	if (stub && stub != NotProcess_p) {
 		UpdateWdescReg(stub);
 		/* IPtr after goprot was stashed */
@@ -457,8 +495,8 @@ void t9k_p_trap(uint32_t cause, uint32_t fault_la)
 
 	if (t9k_prot.debug)
 		fprintf(stderr,
-			"[T9K-PROT] P-trap cause=%u la=0x%08X -> L IPtr=0x%08X WPtr=0x%08X A=0x%02X B=0x%02X\n",
-			cause, fault_la, IPtr, WPtr, reason, etype);
+			"[T9K-PROT] P-trap cause=%u Eptr=0x%08X -> L IPtr=0x%08X WPtr=0x%08X A=0x%02X B=0x%02X\n",
+			cause, eptr, IPtr, WPtr, reason, etype);
 
 	if (t9k_prot.jmp_valid)
 		longjmp(t9k_prot.jmp_env, 1);
@@ -475,7 +513,7 @@ void t9k_leave_p(void)
 	 */
 	if (t9k_prot.is_p) {
 		t9k_prot.is_p = 0;
-		t9k_update_active();
+		t9k_context_changed();
 		if (t9k_prot.debug)
 			fprintf(stderr,
 				"[T9K-PROT] leave_p IPtr=0x%08X WPtr=0x%08X traps=%u\n",
@@ -491,7 +529,7 @@ void t9k_load_rods(const uint32_t rods[4])
 		return;
 	for (i = 0; i < 4; i++)
 		t9k_prot.region[i] = rods[i];
-	t9k_update_active();
+	t9k_context_changed();
 	if (t9k_prot.debug)
 		fprintf(stderr,
 			"[T9K-PROT] load_rods R0=%08X R1=%08X R2=%08X R3=%08X is_p=%d\n",
@@ -509,7 +547,7 @@ void t9k_resume_p(const uint32_t region[4], uint32_t pstate,
 	t9k_prot.wdesc_stub = wdesc_stub;
 	t9k_prot.supervisor_iptr = supervisor_iptr;
 	t9k_prot.is_p = t9k_prot.enabled;
-	t9k_update_active();
+	t9k_context_changed();
 	if (t9k_prot.debug)
 		fprintf(stderr, "[T9K-PROT] resume interrupted P IPtr=0x%08X\n", IPtr);
 }
@@ -554,7 +592,7 @@ void t9k_goprot(uint32_t pds_phys, uint32_t rods_phys)
 	XReg = t9k_phys_word(pds_phys + 4 * T9K_PS_SXREG);
 
 	t9k_prot.is_p = 1;
-	t9k_update_active();
+	t9k_context_changed();
 
 	if (t9k_prot.debug)
 		fprintf(stderr,
@@ -567,15 +605,16 @@ void t9k_goprot(uint32_t pds_phys, uint32_t rods_phys)
 	/* Do not IPtr++ — IPtr already loaded from PDS as next P instruction. */
 }
 
-void t9k_syscall(void)
+void t9k_syscall(uint32_t insn_start)
 {
 	if (t9k_in_p()) {
 		if (t9k_prot.debug)
 			fprintf(stderr, "[T9K-PROT] syscall from P IPtr=0x%08X A=0x%08X\n",
 				IPtr, AReg);
-		/* ISM: Eptr = trap insn; siptr = next. Advance past syscall OPR. */
-		IPtr++; /* next after syscall for siptr save */
-		t9k_p_trap(T9K_TRAP_SYSCALL, IPtr - 1);
+		/* ISM 13.2.2: the state after the instruction - siptr is the
+		 * next one; Eptr is syscall itself (nfix 0; opr 8) */
+		IPtr++;
+		t9k_p_trap(T9K_TRAP_SYSCALL, insn_start);
 		return;
 	}
 	/* L-process syscall: would go to THDS; soft stub for Phase 1–2 */

@@ -73,9 +73,9 @@ t4-gdb : $(SRC)
 	ls -l t4
 
 # Host unit tests for protection translate (no full T4 guest)
-test-protect: t9000_protect.c t9000_protect.h
+test-protect: t9000_protect.c t9000_protect.h t9000_pmi.c
 	$(CC) -I. -O2 -Wall -DT9K_PROTECT_SELFTEST -o tests/test_t9000_protect \
-		tests/test_t9000_protect.c t9000_protect.c
+		tests/test_t9000_protect.c t9000_protect.c t9000_pmi.c
 	./tests/test_t9000_protect
 
 clean	:

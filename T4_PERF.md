@@ -30,7 +30,11 @@ fast and cache-resident; push host I/O off the critical path.
 8. **Memory accessors test `t9k_prot.active`, not `t9k_prot.enabled`.**
    `T4_PROTECT` defaults on, but translation can only change an address in
    P-mode or with a live region descriptor. Anything that changes `enabled`,
-   `is_p` or `region[]` must call `t9k_update_active()` (`t9000_protect.c`).
+   `is_p` or `region[]` must call `t9k_update_active()` (`t9000_protect.c`),
+   and when the machine is running also `t4_icache_context()` - together
+   `t9k_context_changed()`.  P-mode instruction fetch is translated and
+   checked only on an Icache miss, so the Icache must not keep what the new
+   mode would fetch from elsewhere or may not execute.
 9. **`mainloop()` locals and `setjmp()`.** A T9000 P-trap `longjmp`s back into
    `mainloop()`, so any local it modifies after the `setjmp()` is indeterminate
    there. Set such a local before the `setjmp()` and never change it
@@ -194,6 +198,20 @@ failures), BTL smoke and benchmark 7/7, P-mode trap smoke test and the
 protection unit test pass, `[WILDEXEC]` still halts a jump below MemStart,
 `T4_NOISY_BOOT_TRACE=1` prints the same 1,067 trace lines as before, and
 SIGTERM still stops a run at once.
+
+### Protected mode, 2026-11-03
+
+The Linux boot runs its userland as T9000 P-processes (`t9k_hard_p`), so
+every load and store there goes through `t9k_translate()`.  That cost two
+`getenv()` calls in `t9k_pmi_check_phys()` per access, and a descriptor-size
+decode that rebuilt a bit mask in a nested loop.  Checking P-mode
+instruction fetch, which adds ~2 million translations to a boot (one per
+byte the Icache decodes), first made it 5% slower; with the switches read
+once at `t9k_pmi_init()` and the decode a single scan, the boot to fbwm
+`DESKTOP_READY` went from 3.8-4.2 s to **1.25-1.6 s** (`vmlinux.btl` of
+2026-11-01, headless, from emulator start, 6 interleaved runs each).
+Dhrystone (L-mode) is unchanged.  No boot path empties the Icache: Linux's
+region 2 is its whole quarter mapped onto itself, executable.
 
 ### How to measure
 

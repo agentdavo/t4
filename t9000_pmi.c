@@ -16,6 +16,10 @@ static uint32_t pmi_priv_hi;
 static uint32_t pmi_text_lo;
 static uint32_t pmi_text_hi;
 
+/* T4_PMI_TEXT_ROM, T4_PMI_PRIV and T4_PMI_STRICT, read once:
+ * t9k_pmi_check_phys() runs on every P-process access and fetch. */
+static int pmi_text_rom, pmi_priv_deny, pmi_strict;
+
 /* Shared / always-allowed under P (devices + graphics + kernel image). */
 static int pmi_shared_ok(uint32_t pa)
 {
@@ -57,6 +61,9 @@ void t9k_pmi_init(void)
 		t9k_pmi.enabled = 0;
 	else
 		t9k_pmi.enabled = 1;
+	pmi_text_rom = getenv("T4_PMI_TEXT_ROM") != NULL;
+	pmi_priv_deny = getenv("T4_PMI_PRIV") != NULL;
+	pmi_strict = getenv("T4_PMI_STRICT") != NULL;
 
 	t9k_pmi_add_bank(0x80000000u, 0x40000000u, T9K_PMI_DRAM);   /* Q2: 1GiB high RAM/FB */
 	t9k_pmi_add_bank(0x7F000000u, 0x01000000u, T9K_PMI_ROM);    /* boot/SD XiP window */
@@ -113,12 +120,12 @@ int t9k_pmi_check_phys(uint32_t pa, int is_write)
 		 * (reloc remnants / composite applets); soft RX still applies
 		 * to uaccess.  Enable for strict RX experiments.
 		 */
-		if (getenv("T4_PMI_TEXT_ROM") && pmi_text_hi > pmi_text_lo &&
+		if (pmi_text_rom && pmi_text_hi > pmi_text_lo &&
 		    is_write && pa >= pmi_text_lo && pa < pmi_text_hi) {
 			t9k_pmi.errors++;
 			return 1;
 		}
-		if (pmi_priv_hi > pmi_priv_lo && getenv("T4_PMI_PRIV")) {
+		if (pmi_priv_hi > pmi_priv_lo && pmi_priv_deny) {
 			int in_priv = (pa >= pmi_priv_lo && pa < pmi_priv_hi);
 			if (!in_priv && !pmi_shared_ok(pa) &&
 			    pa >= 0x82000000u && pa < 0xC0000000u) {
@@ -145,7 +152,7 @@ int t9k_pmi_check_phys(uint32_t pa, int is_write)
 		}
 	}
 	/* No bank: allow for now (compat) unless strict */
-	if (getenv("T4_PMI_STRICT")) {
+	if (pmi_strict) {
 		t9k_pmi.errors++;
 		return 1;
 	}
