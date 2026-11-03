@@ -260,7 +260,10 @@ int t4_node_any_ready(void)
                 Channel *out = &t4cpu->s_Link[i].Out;
                 if (in->schbuf && SCHLength(in) != 0)
                         return 1;
-                if (out->schbuf && out->Length && SCHLength(out) == 0)
+                /* room for the next packet, or the acknowledge an out
+                 * waits for (ackwait): the far end has emptied it */
+                if (out->schbuf && (out->Length || out->ackwait) &&
+                    SCHLength(out) == 0)
                         return 1;
         }
         return t9k_ctl_ready();

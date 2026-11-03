@@ -146,7 +146,9 @@ been asked for.  On threaded (`-st`), shared-memory (`-sl`) and loopback
 links a packet stays in the far node's one-packet mailbox until the inputs
 there have taken every byte of it, and emptying the mailbox is the
 acknowledge: the sender's `out`, `outbyte` or `outword` deschedules and is
-rescheduled then (`Channel.ackwait` in `p.c`).  Until 2026-11-03 the output
+rescheduled then (`Channel.ackwait` in `p.c`); a threaded node idle in
+such an `out` is woken when the far end empties the mailbox
+(`t4_node_any_ready` counts `ackwait`).  Until 2026-11-03 the output
 completed as soon as the packet was in the mailbox, which let a sender run
 up to a message ahead of its receiver and allowed orderings that real links
 cannot produce (`tests/test_link_sync.c`).  Over nanomsg `ipc://` an output

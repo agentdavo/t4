@@ -582,7 +582,7 @@ int t4_node_idle_wait(cpu_t *c, int timeout_ms)
 }
 ```
 
-`node_channels_ready(c)` is the same predicate as the `linkcomms` walk (`SCHLength != 0` for In / `== 0` for an Out that has pending `Length`). In channels are published under this same `idle_mu` (mailbox owner is the receiver). Out channels live on the peer; the happens-before for POLLOUT is `t4_node_wake(sender)` (Issue 2), which holds this mutex. Re-checking Out `SCHLength` here is best-effort; `idle_gen` is not needed as a separate waiter snapshot if the loop predicate is “ready or quit.”
+`node_channels_ready(c)` (in the code, `t4_node_any_ready()`) is the same predicate as the `linkcomms` walk (`SCHLength != 0` for In / `== 0` for an Out that has pending `Length` or whose `out` is waiting for the far end to empty the mailbox, `ackwait`). Leaving `ackwait` out loses the wakeup when the far end empties the mailbox between the walk and the wait, and the `out` then completes only at the `LTO_IDLE` timeout. In channels are published under this same `idle_mu` (mailbox owner is the receiver). Out channels live on the peer; the happens-before for POLLOUT is `t4_node_wake(sender)` (Issue 2), which holds this mutex. Re-checking Out `SCHLength` here is best-effort; `idle_gen` is not needed as a separate waiter snapshot if the loop predicate is “ready or quit.”
 
 `linkcomms` still walks `SCHLength` after the wait to fill `revents`.
 

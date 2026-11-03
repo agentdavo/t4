@@ -32,3 +32,34 @@ On a Sun4, the program "/usr/bin/X11/mtvtoppm" creates a ppm-format file. Use
 a program such as "xv" to view this.
 
 	eg. mtvtoppm <ray.mtv | xv
+
+
+Running it on t4 (2026-11-03)
+
+The shipped raytraceN.btl files run as one threaded network, the model
+(1-4) on stdin and the network from the matching map:
+
+	SPYNET=raytrace10.map; export SPYNET
+	echo 3 | t4 -st -s8 -sn -10 -sb raytrace10.btl
+
+ray.mtv is the 256 x 256 scene of ../transputer-raytracer/pic/rayM.ppm.
+Every arrangement (3, 4, 6, 10, 11, 18, 34) finishes, but some images lack
+one 8 x 8 patch (64 pixels), occasionally two: 11 of 28 runs on a buffered
+t4, more as the host gets busier.  That is a race in the program, not in
+t4.  A worker holds two jobs and passes any further one down the chain;
+the last worker's onward channel is "soft", which raytraceT8.pgm loops back
+into its own pixelBypass, whose buffer takes the job for an unknown command
+and, compiled with -U, skips it.  A job gets that far when the controller
+has a finished patch back and sends the next job before the worker that
+rendered it has taken its renderer's done ! 42.  On transputers the done
+always wins (a few instructions against several link transfers); on t4 a
+node is a host thread, and one that the host deschedules in those few
+instructions lets the rest of the network overtake it.  Rebuilt without -U
+(on t4, with the D7205 tools in ../../itools/d7205), all four checked runs
+at 10 nodes stopped on the last worker at the seterr of buffer's IF.
+Moving done ! 42 before the pixels is no fix: the controller can then
+block feeding a worker whose renderer is still sending, and the farm
+deadlocks.  ../transputer-raytracer is the reworked version.
+
+The occam compiler itself (oc) mis-compiled this source on t4 until
+7cb262c, which fixed t4's fused eqc;cj pair.
