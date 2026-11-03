@@ -6786,6 +6786,10 @@ DescheduleOutWord:
 			   break;
 		case 0x2e: /* XXX dist        */
 			   EMUDBG2 ("-I-EMUDBG: dist(1): Time=%8X.\n", CReg);
+			   /* "If the process is still on the timer list, it is
+			    * removed" (ISM, dist): an ALT that a channel made
+			    * ready is still on it */
+			   purge_timer ();
 			   temp = ClockReg[ProcPriority];
 			   /* any guard but false is true (ISM enbc, disc, ...) */
 			   if ((BReg != false_t) &&
@@ -10632,7 +10636,6 @@ void t4_cpu_start (uint32_t wdesc, uint32_t iptr)
 void schedule (uint32_t wdesc)
 {
         uint32_t wptr, pri;
-	uint32_t temp;
 
         wptr = GetDescWPtr(wdesc);
         if (NotProcess_p == wptr)
@@ -10648,11 +10651,10 @@ void schedule (uint32_t wdesc)
         }
 #endif
 
-	/* Remove from timer queue if a ready alt. */
-        /* !!! XXX - READ OF NOT INITIALIZED MEMORY !!! */
-	temp = word_int (index (wptr, State_s));
-	if (temp == Ready_p)
-		purge_timer ();
+	/* A timer ALT that a channel made ready is still on the timer
+	 * list: its dist takes it off (ISM, dist), not this.  (This used to
+	 * purge_timer() here, which removes the running process, not the
+	 * one being scheduled.) */
 
         if (HiPriority == ProcPriority)
         {
@@ -11343,6 +11345,12 @@ void schedule_timerq (int prio)
 	        temp3 = word (index (TPtrLoc[prio], Time_s));
 		while ((INT32(ClockReg[prio] - temp3) > 0) && (TPtrLoc[prio] != NotProcess_p))
 		{
+		        /* a timer ALT's time has come: a guard is ready, so a
+		         * channel that becomes ready before the process runs
+		         * must not schedule it again (ISM 8.7: only a Waiting
+		         * ALT is descheduled) */
+		        if (word (index (TPtrLoc[prio], State_s)) == Waiting_p)
+		                writeword (index (TPtrLoc[prio], State_s), Ready_p);
 		        schedule (TPtrLoc[prio] | prio);
 
 			TPtrLoc[prio] = word (index (TPtrLoc[prio], TLink_s));

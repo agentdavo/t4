@@ -161,6 +161,9 @@ run_test test_t9000_pmode "$TESTS/test_t9000_pmode.c" 20s
 run_test test_fused_cj "$TESTS/test_fused_cj.c $TESTS/test_fused_cj_fn.S" 10s
 # Without the fix the channel ALT waits for ever: 10s is the verdict.
 run_test test_alt_guard "$TESTS/test_alt_guard.c $TOP/lib/transputer-conc.c" 10s
+# A timer ALT leaves the timer list whichever guard won, and is queued
+# once.  Without the fixes t4 spins or hangs: 10s is the verdict.
+run_test test_timer_alt "$TESTS/test_timer_alt.c $TOP/lib/transputer-conc.c" 10s
 
 # Byte-stream links between two threaded nodes, Link1 and Link2 both cabled.
 # Node 1 stops once it has echoed, so this run ends at the timeout.
