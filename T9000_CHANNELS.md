@@ -139,6 +139,20 @@ with `stconf` on `VCPLinkNMode`.  In byte-stream mode the link carries T4's
 existing OS-link messages, i.e. the T9000 behaves as if an IMS C100 joined
 it to a T8-series neighbour (HRM 11.5).
 
+A byte-stream output completes only once the far process has input all of
+the message (ISM 8.4.2, 12.2.2): an OS-link acknowledges a byte only to a
+ready input (HRM, C100 section 1.3.1), so a link holds nothing that has not
+been asked for.  On threaded (`-st`), shared-memory (`-sl`) and loopback
+links a packet stays in the far node's one-packet mailbox until the inputs
+there have taken every byte of it, and emptying the mailbox is the
+acknowledge: the sender's `out`, `outbyte` or `outword` deschedules and is
+rescheduled then (`Channel.ackwait` in `p.c`).  Until 2026-11-03 the output
+completed as soon as the packet was in the mailbox, which let a sender run
+up to a message ahead of its receiver and allowed orderings that real links
+cannot produce (`tests/test_link_sync.c`).  Over nanomsg `ipc://` an output
+still completes once nanomsg has accepted it: that transport has no shared
+word to acknowledge with, and would need acknowledge messages of its own.
+
 ## Routing switch: IMS C104 (HRM part 1 ch.7, part 3 ch.2)
 
 A threaded network (`-st -sn -N`) can contain IMS C104 packet routing
@@ -535,6 +549,14 @@ same FFN on an 8-node hypercube of byte-stream links takes 6.73 ms.
   1's CLink1: a parity error at node 2's CLink0, a disconnect back at node
   1 reported as #C2; the controller restarts CLink1 and resynchronises
   node 2 with RecoverError.
+* `tests/test_link_sync.c` - two threaded nodes, byte-stream Link1 and
+  Link2.  Node 1 inputs a word on Link2, waits 200 ms, then inputs an item
+  on Link1; node 0's output of that item must still be outstanding when its
+  Link2 output has completed (byte-stream mode, above).
+* `tests/test_alt_guard.c` and `tests/test_fused_cj.c` - not T9000: an ALT
+  guard of 2 is true and a false guard's `disc` leaves the channel word
+  alone (ISM `enbc`, `disc`, `enbs`, `diss`); and the `eqc;cj` and `gt;cj`
+  pairs t4 fuses leave a taken jump's 0 in A, as `cj` does (ISM `cj`).
 
 Run them with `make -f Makefile.linux test-vcp` or `tests/run_t9000_vcp.sh`
 (`T4_BIN` picks the emulator).  They build with `transputer-tcc` and

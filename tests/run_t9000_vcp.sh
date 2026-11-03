@@ -19,6 +19,12 @@
 #   test_t9000_pmode    one node: P-process instruction fetch (execute
 #                       permission, relocated code), move/devmove/move2dall
 #                       through the regions, and ps.Eptr for each trap
+#   test_fused_cj       one node: the eqc;cj and gt;cj pairs t4 fuses leave
+#                       the stack as the two instructions would (ISM cj)
+#   test_link_sync      two threaded nodes: a byte-stream link output
+#                       completes only once the far process has input it
+#   test_alt_guard      one node: an ALT guard of 2 is true, and a false
+#                       guard's disc leaves the channel alone (ISM enbc, disc)
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).
@@ -150,5 +156,19 @@ run_test test_t9000_ctl_chain \
 # The supervisor restarts trapped call/ajw/gajw itself; the node halts.
 run_test test_t9000_pstack "$TESTS/test_t9000_pstack.c" 20s
 run_test test_t9000_pmode "$TESTS/test_t9000_pmode.c" 20s
+
+# Not T9000: the instruction pairs t4 fuses must not change the stack.
+run_test test_fused_cj "$TESTS/test_fused_cj.c $TESTS/test_fused_cj_fn.S" 10s
+# Without the fix the channel ALT waits for ever: 10s is the verdict.
+run_test test_alt_guard "$TESTS/test_alt_guard.c $TOP/lib/transputer-conc.c" 10s
+
+# Byte-stream links between two threaded nodes, Link1 and Link2 both cabled.
+# Node 1 stops once it has echoed, so this run ends at the timeout.
+printf '%s\n' 'Connect HOST to processor 0 link 0' \
+    'Connect processor 0 link 1 to processor 1 link 1' \
+    'Connect processor 0 link 2 to processor 1 link 2' >"$tmp/sync.map"
+run_test test_link_sync \
+    "$TESTS/test_link_sync.c $TOP/lib/transputer-conc.c" \
+    5s SPYNET="$tmp/sync.map" -- -st -sn -2
 
 exit $(( failures > 0 ))

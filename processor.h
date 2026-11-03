@@ -154,6 +154,8 @@ typedef struct _Channel_ {
         uint32_t DBuffReg;    /* link data buffer; only testhardchan sees it */
         int  npend, pendoff;  /* In: bytes of the last packet the in that  */
         u_char pend[MAX_DATA];/* took it did not want, kept for the next */
+        int  ackwait;         /* Out: the last packet is in the far mailbox;
+                               * the out completes once it has been taken */
 } Channel;
 
 typedef struct _LinkIface_ {

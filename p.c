@@ -2877,7 +2877,9 @@ Exit:
         return 0;
 }
 
-int channel_recvP (Channel *chan, u_char *data, int doWait)
+/* hold: copy a mailbox packet but leave the mailbox full; see
+ * channel_recvmemP. */
+static int channel_recv (Channel *chan, u_char *data, int doWait, int hold)
 {
         int ret;
 
@@ -2901,8 +2903,11 @@ int channel_recvP (Channel *chan, u_char *data, int doWait)
                                 memcpy (&ready, &chan->schbuf[SCH_STAMP], 8);
                                 t9k_net_received (chan->linkno, ready, (uint32_t)ret);
                         }
-                        SCHSetLength(chan, 0);
-                        t4_wake_node_id(chan->peer);
+                        if (!hold)
+                        {
+                                SCHSetLength(chan, 0);
+                                t4_wake_node_id(chan->peer);
+                        }
                 }
         }
         else if (t9k.enabled && t9k.net_on)
@@ -2940,6 +2945,11 @@ int channel_recvP (Channel *chan, u_char *data, int doWait)
         return ret;
 }
 
+int channel_recvP (Channel *chan, u_char *data, int doWait)
+{
+        return channel_recv (chan, data, doWait, FALSE);
+}
+
 int channel_recvmemP (Channel *chan, u_char *data, int doMemWrite, int doWait)
 {
         int ret, n;
@@ -2948,12 +2958,17 @@ int channel_recvmemP (Channel *chan, u_char *data, int doMemWrite, int doWait)
         /* A link is a byte stream: an in takes exactly the bytes it asked
          * for, wherever the sender's packets happen to break.  The part of a
          * packet past the end of the in waits in pend for the next in -
-         * delivering the whole packet would write past the in's buffer. */
+         * delivering the whole packet would write past the in's buffer.
+         * A mailbox stays full until the ins have taken all of the packet:
+         * emptying it is the acknowledge that completes the sender's out
+         * (an OS-link acknowledges a byte only to a ready input: HRM,
+         * C100 section 1.3.1). */
         if (doMemWrite && (chan->npend || chan->Length < MAX_DATA))
         {
                 if (0 == chan->npend)
                 {
-                        ret = channel_recvP (chan, chan->pend, doWait);
+                        ret = channel_recv (chan, chan->pend, doWait,
+                                            NULL != chan->schbuf);
                         if (ret < 0)
                                 return ret;
                         chan->npend = ret;
@@ -2964,6 +2979,11 @@ int channel_recvmemP (Channel *chan, u_char *data, int doMemWrite, int doWait)
                 writebytes_int (chan->Address, chan->pend + chan->pendoff, n);
                 chan->pendoff += n; chan->npend -= n;
                 chan->Address += n; chan->Length -= n;
+                if (0 == chan->npend && chan->schbuf)
+                {
+                        SCHSetLength(chan, 0);
+                        t4_wake_node_id(chan->peer);
+                }
                 return n;
         }
 
@@ -3255,7 +3275,8 @@ int linkcomms (char *where, int doBoot, int timeOut)
                         continue;
 
                 linkWdesc = word (Link[i].Out.LinkAddress);
-                if ((GetDescWPtr(linkWdesc) != NotProcess_p) && Link[i].Out.Length)
+                if ((GetDescWPtr(linkWdesc) != NotProcess_p) &&
+                    (Link[i].Out.Length || Link[i].Out.ackwait))
                 {
                         pfd[npfd].fd = Link[i].Out.sock;
                         pfd[npfd].events = NN_POLLOUT;
@@ -3405,10 +3426,20 @@ int linkcomms (char *where, int doBoot, int timeOut)
                 else if (pfd[i].revents & NN_POLLOUT)
                 {
                         revents = NN_POLLOUT;
-                        ndata = channel_sendmemP (channels[i], TRUE);
+                        if (channels[i]->Length)
+                        {
+                                ndata = channel_sendmemP (channels[i], TRUE);
+                                /* the out completes when the far end has
+                                 * taken the last packet (ISM 12.2.2), and
+                                 * a mailbox shows that by emptying */
+                                if (0 == channels[i]->Length && channels[i]->schbuf)
+                                        channels[i]->ackwait = 1;
+                        }
+                        else
+                                channels[i]->ackwait = 0;   /* taken */
                 }
                 /* Still processing message? */
-                if (channels[i]->Length)
+                if (channels[i]->Length || channels[i]->ackwait)
                         continue;
 
                 linkWdesc = word (channels[i]->LinkAddress);
@@ -3507,6 +3538,7 @@ Channel *reset_channel (uint32_t addr)
 
         chan->Address = MostNeg;
         chan->Length  = 0;
+        chan->ackwait = 0;
         chan->CtrlByte = C_UNKNOWN;   /* a reset abandons any part-read packet */
 
         return chan;
@@ -3593,6 +3625,7 @@ void open_link_channel (Channel *chan, uint32_t addr, int theLink, int chanIn)
         chan->peer = -1;
         chan->npend = 0;
         chan->pendoff = 0;
+        chan->ackwait = 0;
 
         if (serve && 0 == theLink) /* host link */
                 return;
@@ -6193,6 +6226,16 @@ DescheduleOut:
                                         PROFILE(Link[TheLink(BReg)].Out.IOBytes += AReg);
                                         deschedule ();
                                 }
+                                else if (AReg && Link[TheLink(BReg)].Out.schbuf)
+                                {
+                                        /* In the far mailbox, but an out on
+                                         * an external channel waits until
+                                         * the receiver has it (ISM 8.4.2):
+                                         * linkcomms reschedules it then. */
+				        writeword (BReg, Wdesc);
+                                        Link[TheLink(BReg)].Out.ackwait = 1;
+                                        deschedule ();
+                                }
 			   }
 			   break;
 		case 0x0c: /* sub         */
@@ -6300,6 +6343,13 @@ DescheduleOutByte:
                                         PROFILE(Link[TheLink(BReg)].Out.IOBytes++);
                                         deschedule ();
                                 }
+                                else if (Link[TheLink(BReg)].Out.schbuf)
+                                {
+                                        /* as for out */
+				        writeword (BReg, Wdesc);
+                                        Link[TheLink(BReg)].Out.ackwait = 1;
+                                        deschedule ();
+                                }
 			   }
 			   break;
 		case 0x0f: /* outword     */
@@ -6402,6 +6452,13 @@ DescheduleOutWord:
                                         Link[TheLink(BReg)].Out.Address = WPtr;
                                         Link[TheLink(BReg)].Out.Length  = 4;
                                         PROFILE(Link[TheLink(BReg)].Out.IOBytes += 4);
+                                        deschedule ();
+                                }
+                                else if (Link[TheLink(BReg)].Out.schbuf)
+                                {
+                                        /* as for out */
+				        writeword (BReg, Wdesc);
+                                        Link[TheLink(BReg)].Out.ackwait = 1;
                                         deschedule ();
                                 }
 			   }
@@ -6730,7 +6787,8 @@ DescheduleOutWord:
 		case 0x2e: /* XXX dist        */
 			   EMUDBG2 ("-I-EMUDBG: dist(1): Time=%8X.\n", CReg);
 			   temp = ClockReg[ProcPriority];
-			   if ((BReg == true_t) &&
+			   /* any guard but false is true (ISM enbc, disc, ...) */
+			   if ((BReg != false_t) &&
                                (INT32(temp - CReg)>=0) &&
                                (word (index (WPtr, Temp_s)) == NoneSelected_o))
 			   {
@@ -6759,6 +6817,14 @@ DescheduleOutWord:
                                 }
                                 else
                                         AReg = false_t;
+                                IPtr++;
+                                break;
+                           }
+                           if (BReg == false_t)
+                           {
+                                /* a false guard: no action, not even on
+                                 * the channel word (ISM disc) */
+                                AReg = false_t;
                                 IPtr++;
                                 break;
                            }
@@ -6812,8 +6878,7 @@ DescheduleOutWord:
           				temp = TRUE;
 				}
           		   }
-			   if ((BReg == true_t) &&
-                               (temp == TRUE) &&
+			   if ((temp == TRUE) &&
                                (word (index (WPtr, Temp_s)) == NoneSelected_o))
 			   {
 				EMUDBG2 ("-I-EMUDBG: disc(4): Taking branch #%8X.\n", AReg);
@@ -6828,7 +6893,7 @@ DescheduleOutWord:
 			   IPtr++;
 			   break;
 		case 0x30: /* diss        */
-			   if ((BReg == true_t) && (word (index (WPtr, Temp_s)) == NoneSelected_o))
+			   if ((BReg != false_t) && (word (index (WPtr, Temp_s)) == NoneSelected_o))
 			   {
 				writeword (index (WPtr, Temp_s), AReg);
 				AReg = true_t;
@@ -7034,21 +7099,21 @@ DescheduleOutWord:
 			   break;
 		case 0x47: /* enbt        */
 			   EMUDBG2 ("-I-EMUDBG: enbt(1): Channel=%08X.\n", BReg);
-			   if ((AReg == true_t) && (word (index (WPtr, TLink_s)) == TimeNotSet_p))
+			   if ((AReg != false_t) && (word (index (WPtr, TLink_s)) == TimeNotSet_p))
 			   {
 				EMUDBG ("-I-EMUDBG: enbt(2): Time not yet set.\n");
 				/* Set ALT time to this guard's time. */
 				writeword (index (WPtr, TLink_s), TimeSet_p);
 				writeword (index (WPtr, Time_s), BReg);
 			   }
-			   else if ((AReg == true_t) &&
+			   else if ((AReg != false_t) &&
                                     (word (index (WPtr, TLink_s)) == TimeSet_p) &&
                                     (INT32(BReg - word (index (WPtr, Time_s))) >= 0))
 			   {
 				EMUDBG ("-I-EMUDBG: enbt(2): Time already set earlier than or equal to this one.\n");
 				/* ALT time is before this guard's time. Ignore. */
 			   }
-			   else if ((AReg == true_t) && (word (index (WPtr, TLink_s)) == TimeSet_p))
+			   else if ((AReg != false_t) && (word (index (WPtr, TLink_s)) == TimeSet_p))
 			   {
 				EMUDBG ("-I-EMUDBG: enbt(2): Time already set, but later than this one.\n");
 				/* ALT time is after this guard's time. Replace ALT time. */
@@ -7068,7 +7133,7 @@ DescheduleOutWord:
                                 break;
                            }
                            otherWdesc = word (BReg);
-			   if ((AReg == true_t) && (otherWdesc == NotProcess_p))
+			   if ((AReg != false_t) && (otherWdesc == NotProcess_p))
 			   {
 				EMUDBG ("-I-EMUDBG: enbc(2): Link or non-waiting channel.\n");
 				/* Link or unwaiting channel. */
@@ -7118,13 +7183,13 @@ DescheduleOutWord:
 				        writeword (BReg, Wdesc);
                                 }
 			   }
-			   else if ((AReg == true_t) && (otherWdesc == Wdesc))
+			   else if ((AReg != false_t) && (otherWdesc == Wdesc))
 			   {
 				EMUDBG ("-I-EMUDBG: enbc(2): This process enabled the channel.\n");
 				/* This process initialised the channel. Do nothing. */
 				;
 			   }
-			   else if (AReg == true_t)
+			   else if (AReg != false_t)
 			   {
 #ifndef NDEBUG
                                 if (IsLinkIn(BReg))
@@ -8784,7 +8849,10 @@ DescheduleOutWord:
 			   /* Preserve exact standalone semantics for:
 			    *   EQC Arg0; CJ Arg1
 			    * EQC sets AReg to 1 when equal, else 0.
-			    * CJ pops on non-zero (continue), jumps on zero (no pop). */
+			    * CJ pops on non-zero (continue), jumps on zero (no pop),
+			    * so a taken jump leaves the 0 in AReg (ISM cj, eqc).
+			    * occam code relies on it: without it the INMOS compiler
+			    * rejects valid source. */
 			   IPtr++;
 			   if (AReg == Arg0)
 			   {
@@ -8793,6 +8861,7 @@ DescheduleOutWord:
 			   }
 			   else
 			   {
+				AReg = false_t;
 				IPtr = IPtr + Arg1;
 			   }
 		           PROFILE(profile[PRO_INSTR]++);

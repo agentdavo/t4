@@ -940,7 +940,7 @@ Each thread could `nn_bind` `inproc://node%d-%d`. Avoids writing a fabric. Cost:
 
 ### E. Lock-free ring per link
 
-Higher throughput in principle. The hardware link is a blocking 1-packet mailbox; the raytracer is latency/occupancy bound, not GB/s bound. Higher bug surface for boot and ALT. Rejected for v1.
+Higher throughput in principle, but the hardware link has no queue to model: a link acknowledges a byte only to a ready input (HRM, C100 section 1.3.1), so an output completes only once the far process has input the message (ISM 8.4.2). t4 models that with the one-packet mailbox: the receiver empties it only when its inputs have taken the whole packet, and the sender's `out` waits for that (`Channel.ackwait`). The raytracer is latency/occupancy bound, not GB/s bound. Higher bug surface for boot and ALT. Rejected for v1.
 
 ### F. Cooperative fibers / one thread round-robining N nodes
 

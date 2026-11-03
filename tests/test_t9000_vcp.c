@@ -663,14 +663,19 @@ static void test_errors(void)
 
 /* ---- 7. byte-stream links 2 <-> 3 --------------------------------------- */
 
+static void bs_sender(void) { ChanOut(LINK2OUT, txbuf, 12); finish(31); }
+
 static void test_bytestream(void)
 {
     u32 st, b;
 
+    /* An out on a link completes only once the far end has input it
+     * (ISM 8.4.2), so the input is in another process. */
     fill(txbuf, 12, 41);
-    ChanOut(LINK2OUT, txbuf, 12);
+    PRun(PSetup(ws1, sizeof ws1, bs_sender) | PRI_LOW);
     ChanIn(LINK3IN, rxbuf, 12);
     check("bs-data", same(rxbuf, 12, 41));
+    check("bs-out-done", wait_done_n(1) == 31);
     st = ldchstatus((u32)LINK2OUT, &b, 0);
     check("bs-status", st == 0 && b == NOTPROC && !errflag());
 }
