@@ -1,0 +1,6 @@
+obj/
+bin256/
+*.ppm
+*.log
+boot-*.uart
+boot.uart
