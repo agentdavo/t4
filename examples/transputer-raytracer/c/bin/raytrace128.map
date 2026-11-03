@@ -1,0 +1,265 @@
+mkbtl.py : chain of 128 transputers for the C ray tracer
+
+
+Boot path for network
+
+  Boot processor 0 down link 0 from HOST
+  Boot processor 1 down link 1 from processor 0 link 2
+  Boot processor 2 down link 1 from processor 1 link 2
+  Boot processor 3 down link 1 from processor 2 link 2
+  Boot processor 4 down link 1 from processor 3 link 2
+  Boot processor 5 down link 1 from processor 4 link 2
+  Boot processor 6 down link 1 from processor 5 link 2
+  Boot processor 7 down link 1 from processor 6 link 2
+  Boot processor 8 down link 1 from processor 7 link 2
+  Boot processor 9 down link 1 from processor 8 link 2
+  Boot processor 10 down link 1 from processor 9 link 2
+  Boot processor 11 down link 1 from processor 10 link 2
+  Boot processor 12 down link 1 from processor 11 link 2
+  Boot processor 13 down link 1 from processor 12 link 2
+  Boot processor 14 down link 1 from processor 13 link 2
+  Boot processor 15 down link 1 from processor 14 link 2
+  Boot processor 16 down link 1 from processor 15 link 2
+  Boot processor 17 down link 1 from processor 16 link 2
+  Boot processor 18 down link 1 from processor 17 link 2
+  Boot processor 19 down link 1 from processor 18 link 2
+  Boot processor 20 down link 1 from processor 19 link 2
+  Boot processor 21 down link 1 from processor 20 link 2
+  Boot processor 22 down link 1 from processor 21 link 2
+  Boot processor 23 down link 1 from processor 22 link 2
+  Boot processor 24 down link 1 from processor 23 link 2
+  Boot processor 25 down link 1 from processor 24 link 2
+  Boot processor 26 down link 1 from processor 25 link 2
+  Boot processor 27 down link 1 from processor 26 link 2
+  Boot processor 28 down link 1 from processor 27 link 2
+  Boot processor 29 down link 1 from processor 28 link 2
+  Boot processor 30 down link 1 from processor 29 link 2
+  Boot processor 31 down link 1 from processor 30 link 2
+  Boot processor 32 down link 1 from processor 31 link 2
+  Boot processor 33 down link 1 from processor 32 link 2
+  Boot processor 34 down link 1 from processor 33 link 2
+  Boot processor 35 down link 1 from processor 34 link 2
+  Boot processor 36 down link 1 from processor 35 link 2
+  Boot processor 37 down link 1 from processor 36 link 2
+  Boot processor 38 down link 1 from processor 37 link 2
+  Boot processor 39 down link 1 from processor 38 link 2
+  Boot processor 40 down link 1 from processor 39 link 2
+  Boot processor 41 down link 1 from processor 40 link 2
+  Boot processor 42 down link 1 from processor 41 link 2
+  Boot processor 43 down link 1 from processor 42 link 2
+  Boot processor 44 down link 1 from processor 43 link 2
+  Boot processor 45 down link 1 from processor 44 link 2
+  Boot processor 46 down link 1 from processor 45 link 2
+  Boot processor 47 down link 1 from processor 46 link 2
+  Boot processor 48 down link 1 from processor 47 link 2
+  Boot processor 49 down link 1 from processor 48 link 2
+  Boot processor 50 down link 1 from processor 49 link 2
+  Boot processor 51 down link 1 from processor 50 link 2
+  Boot processor 52 down link 1 from processor 51 link 2
+  Boot processor 53 down link 1 from processor 52 link 2
+  Boot processor 54 down link 1 from processor 53 link 2
+  Boot processor 55 down link 1 from processor 54 link 2
+  Boot processor 56 down link 1 from processor 55 link 2
+  Boot processor 57 down link 1 from processor 56 link 2
+  Boot processor 58 down link 1 from processor 57 link 2
+  Boot processor 59 down link 1 from processor 58 link 2
+  Boot processor 60 down link 1 from processor 59 link 2
+  Boot processor 61 down link 1 from processor 60 link 2
+  Boot processor 62 down link 1 from processor 61 link 2
+  Boot processor 63 down link 1 from processor 62 link 2
+  Boot processor 64 down link 1 from processor 63 link 2
+  Boot processor 65 down link 1 from processor 64 link 2
+  Boot processor 66 down link 1 from processor 65 link 2
+  Boot processor 67 down link 1 from processor 66 link 2
+  Boot processor 68 down link 1 from processor 67 link 2
+  Boot processor 69 down link 1 from processor 68 link 2
+  Boot processor 70 down link 1 from processor 69 link 2
+  Boot processor 71 down link 1 from processor 70 link 2
+  Boot processor 72 down link 1 from processor 71 link 2
+  Boot processor 73 down link 1 from processor 72 link 2
+  Boot processor 74 down link 1 from processor 73 link 2
+  Boot processor 75 down link 1 from processor 74 link 2
+  Boot processor 76 down link 1 from processor 75 link 2
+  Boot processor 77 down link 1 from processor 76 link 2
+  Boot processor 78 down link 1 from processor 77 link 2
+  Boot processor 79 down link 1 from processor 78 link 2
+  Boot processor 80 down link 1 from processor 79 link 2
+  Boot processor 81 down link 1 from processor 80 link 2
+  Boot processor 82 down link 1 from processor 81 link 2
+  Boot processor 83 down link 1 from processor 82 link 2
+  Boot processor 84 down link 1 from processor 83 link 2
+  Boot processor 85 down link 1 from processor 84 link 2
+  Boot processor 86 down link 1 from processor 85 link 2
+  Boot processor 87 down link 1 from processor 86 link 2
+  Boot processor 88 down link 1 from processor 87 link 2
+  Boot processor 89 down link 1 from processor 88 link 2
+  Boot processor 90 down link 1 from processor 89 link 2
+  Boot processor 91 down link 1 from processor 90 link 2
+  Boot processor 92 down link 1 from processor 91 link 2
+  Boot processor 93 down link 1 from processor 92 link 2
+  Boot processor 94 down link 1 from processor 93 link 2
+  Boot processor 95 down link 1 from processor 94 link 2
+  Boot processor 96 down link 1 from processor 95 link 2
+  Boot processor 97 down link 1 from processor 96 link 2
+  Boot processor 98 down link 1 from processor 97 link 2
+  Boot processor 99 down link 1 from processor 98 link 2
+  Boot processor 100 down link 1 from processor 99 link 2
+  Boot processor 101 down link 1 from processor 100 link 2
+  Boot processor 102 down link 1 from processor 101 link 2
+  Boot processor 103 down link 1 from processor 102 link 2
+  Boot processor 104 down link 1 from processor 103 link 2
+  Boot processor 105 down link 1 from processor 104 link 2
+  Boot processor 106 down link 1 from processor 105 link 2
+  Boot processor 107 down link 1 from processor 106 link 2
+  Boot processor 108 down link 1 from processor 107 link 2
+  Boot processor 109 down link 1 from processor 108 link 2
+  Boot processor 110 down link 1 from processor 109 link 2
+  Boot processor 111 down link 1 from processor 110 link 2
+  Boot processor 112 down link 1 from processor 111 link 2
+  Boot processor 113 down link 1 from processor 112 link 2
+  Boot processor 114 down link 1 from processor 113 link 2
+  Boot processor 115 down link 1 from processor 114 link 2
+  Boot processor 116 down link 1 from processor 115 link 2
+  Boot processor 117 down link 1 from processor 116 link 2
+  Boot processor 118 down link 1 from processor 117 link 2
+  Boot processor 119 down link 1 from processor 118 link 2
+  Boot processor 120 down link 1 from processor 119 link 2
+  Boot processor 121 down link 1 from processor 120 link 2
+  Boot processor 122 down link 1 from processor 121 link 2
+  Boot processor 123 down link 1 from processor 122 link 2
+  Boot processor 124 down link 1 from processor 123 link 2
+  Boot processor 125 down link 1 from processor 124 link 2
+  Boot processor 126 down link 1 from processor 125 link 2
+  Boot processor 127 down link 1 from processor 126 link 2
+
+
+Connectivity for network
+
+  Connect HOST to processor 0 link 0
+  Connect processor 1 link 1 to processor 0 link 2
+  Connect processor 2 link 1 to processor 1 link 2
+  Connect processor 3 link 1 to processor 2 link 2
+  Connect processor 4 link 1 to processor 3 link 2
+  Connect processor 5 link 1 to processor 4 link 2
+  Connect processor 6 link 1 to processor 5 link 2
+  Connect processor 7 link 1 to processor 6 link 2
+  Connect processor 8 link 1 to processor 7 link 2
+  Connect processor 9 link 1 to processor 8 link 2
+  Connect processor 10 link 1 to processor 9 link 2
+  Connect processor 11 link 1 to processor 10 link 2
+  Connect processor 12 link 1 to processor 11 link 2
+  Connect processor 13 link 1 to processor 12 link 2
+  Connect processor 14 link 1 to processor 13 link 2
+  Connect processor 15 link 1 to processor 14 link 2
+  Connect processor 16 link 1 to processor 15 link 2
+  Connect processor 17 link 1 to processor 16 link 2
+  Connect processor 18 link 1 to processor 17 link 2
+  Connect processor 19 link 1 to processor 18 link 2
+  Connect processor 20 link 1 to processor 19 link 2
+  Connect processor 21 link 1 to processor 20 link 2
+  Connect processor 22 link 1 to processor 21 link 2
+  Connect processor 23 link 1 to processor 22 link 2
+  Connect processor 24 link 1 to processor 23 link 2
+  Connect processor 25 link 1 to processor 24 link 2
+  Connect processor 26 link 1 to processor 25 link 2
+  Connect processor 27 link 1 to processor 26 link 2
+  Connect processor 28 link 1 to processor 27 link 2
+  Connect processor 29 link 1 to processor 28 link 2
+  Connect processor 30 link 1 to processor 29 link 2
+  Connect processor 31 link 1 to processor 30 link 2
+  Connect processor 32 link 1 to processor 31 link 2
+  Connect processor 33 link 1 to processor 32 link 2
+  Connect processor 34 link 1 to processor 33 link 2
+  Connect processor 35 link 1 to processor 34 link 2
+  Connect processor 36 link 1 to processor 35 link 2
+  Connect processor 37 link 1 to processor 36 link 2
+  Connect processor 38 link 1 to processor 37 link 2
+  Connect processor 39 link 1 to processor 38 link 2
+  Connect processor 40 link 1 to processor 39 link 2
+  Connect processor 41 link 1 to processor 40 link 2
+  Connect processor 42 link 1 to processor 41 link 2
+  Connect processor 43 link 1 to processor 42 link 2
+  Connect processor 44 link 1 to processor 43 link 2
+  Connect processor 45 link 1 to processor 44 link 2
+  Connect processor 46 link 1 to processor 45 link 2
+  Connect processor 47 link 1 to processor 46 link 2
+  Connect processor 48 link 1 to processor 47 link 2
+  Connect processor 49 link 1 to processor 48 link 2
+  Connect processor 50 link 1 to processor 49 link 2
+  Connect processor 51 link 1 to processor 50 link 2
+  Connect processor 52 link 1 to processor 51 link 2
+  Connect processor 53 link 1 to processor 52 link 2
+  Connect processor 54 link 1 to processor 53 link 2
+  Connect processor 55 link 1 to processor 54 link 2
+  Connect processor 56 link 1 to processor 55 link 2
+  Connect processor 57 link 1 to processor 56 link 2
+  Connect processor 58 link 1 to processor 57 link 2
+  Connect processor 59 link 1 to processor 58 link 2
+  Connect processor 60 link 1 to processor 59 link 2
+  Connect processor 61 link 1 to processor 60 link 2
+  Connect processor 62 link 1 to processor 61 link 2
+  Connect processor 63 link 1 to processor 62 link 2
+  Connect processor 64 link 1 to processor 63 link 2
+  Connect processor 65 link 1 to processor 64 link 2
+  Connect processor 66 link 1 to processor 65 link 2
+  Connect processor 67 link 1 to processor 66 link 2
+  Connect processor 68 link 1 to processor 67 link 2
+  Connect processor 69 link 1 to processor 68 link 2
+  Connect processor 70 link 1 to processor 69 link 2
+  Connect processor 71 link 1 to processor 70 link 2
+  Connect processor 72 link 1 to processor 71 link 2
+  Connect processor 73 link 1 to processor 72 link 2
+  Connect processor 74 link 1 to processor 73 link 2
+  Connect processor 75 link 1 to processor 74 link 2
+  Connect processor 76 link 1 to processor 75 link 2
+  Connect processor 77 link 1 to processor 76 link 2
+  Connect processor 78 link 1 to processor 77 link 2
+  Connect processor 79 link 1 to processor 78 link 2
+  Connect processor 80 link 1 to processor 79 link 2
+  Connect processor 81 link 1 to processor 80 link 2
+  Connect processor 82 link 1 to processor 81 link 2
+  Connect processor 83 link 1 to processor 82 link 2
+  Connect processor 84 link 1 to processor 83 link 2
+  Connect processor 85 link 1 to processor 84 link 2
+  Connect processor 86 link 1 to processor 85 link 2
+  Connect processor 87 link 1 to processor 86 link 2
+  Connect processor 88 link 1 to processor 87 link 2
+  Connect processor 89 link 1 to processor 88 link 2
+  Connect processor 90 link 1 to processor 89 link 2
+  Connect processor 91 link 1 to processor 90 link 2
+  Connect processor 92 link 1 to processor 91 link 2
+  Connect processor 93 link 1 to processor 92 link 2
+  Connect processor 94 link 1 to processor 93 link 2
+  Connect processor 95 link 1 to processor 94 link 2
+  Connect processor 96 link 1 to processor 95 link 2
+  Connect processor 97 link 1 to processor 96 link 2
+  Connect processor 98 link 1 to processor 97 link 2
+  Connect processor 99 link 1 to processor 98 link 2
+  Connect processor 100 link 1 to processor 99 link 2
+  Connect processor 101 link 1 to processor 100 link 2
+  Connect processor 102 link 1 to processor 101 link 2
+  Connect processor 103 link 1 to processor 102 link 2
+  Connect processor 104 link 1 to processor 103 link 2
+  Connect processor 105 link 1 to processor 104 link 2
+  Connect processor 106 link 1 to processor 105 link 2
+  Connect processor 107 link 1 to processor 106 link 2
+  Connect processor 108 link 1 to processor 107 link 2
+  Connect processor 109 link 1 to processor 108 link 2
+  Connect processor 110 link 1 to processor 109 link 2
+  Connect processor 111 link 1 to processor 110 link 2
+  Connect processor 112 link 1 to processor 111 link 2
+  Connect processor 113 link 1 to processor 112 link 2
+  Connect processor 114 link 1 to processor 113 link 2
+  Connect processor 115 link 1 to processor 114 link 2
+  Connect processor 116 link 1 to processor 115 link 2
+  Connect processor 117 link 1 to processor 116 link 2
+  Connect processor 118 link 1 to processor 117 link 2
+  Connect processor 119 link 1 to processor 118 link 2
+  Connect processor 120 link 1 to processor 119 link 2
+  Connect processor 121 link 1 to processor 120 link 2
+  Connect processor 122 link 1 to processor 121 link 2
+  Connect processor 123 link 1 to processor 122 link 2
+  Connect processor 124 link 1 to processor 123 link 2
+  Connect processor 125 link 1 to processor 124 link 2
+  Connect processor 126 link 1 to processor 125 link 2
+  Connect processor 127 link 1 to processor 126 link 2

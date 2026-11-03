@@ -305,6 +305,22 @@ void so_write_nl(void);
 void so_write_int(int n, int width);
 void so_write_real32(float x, int ip, int dp);
 
+/* PRI ALT of two channels, and of three with guards: conc.h's
+ * straight-line forms where it has them, the array forms otherwise. */
+#ifdef ChanAlt2
+#define ALT2(c0, c1)                  ChanAlt2((c0), (c1))
+#define ALTG3(g0, c0, g1, c1, g2, c2) ChanAltGuarded3(g0, c0, g1, c1, g2, c2)
+#else
+#define ALT2(c0, c1) \
+    ({ Channel *alt_c_[2]; alt_c_[0] = (c0); alt_c_[1] = (c1); \
+       ChanAlt(alt_c_, 2); })
+#define ALTG3(g0, c0, g1, c1, g2, c2) \
+    ({ Channel *alt_c_[3]; int alt_g_[3]; \
+       alt_c_[0] = (c0); alt_c_[1] = (c1); alt_c_[2] = (c2); \
+       alt_g_[0] = (g0); alt_g_[1] = (g1); alt_g_[2] = (g2); \
+       ChanAltGuarded(alt_c_, alt_g_, 3); })
+#endif
+
 /* inlined by the compiler as `move`; there is no libc */
 void *memcpy(void *dst, const void *src, unsigned n);
 

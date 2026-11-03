@@ -467,17 +467,10 @@ static void loadBalance(void)
     int passActive = 1, farmActive = 1;
     int free = worker * 2;
     int command, size, xy[2];
-    Channel *chans[3];
-    int guards[3];
 
-    chans[0] = &a;
-    chans[1] = &ready;
-    chans[2] = &c;
     while (passActive || farmActive) {
-        guards[0] = passActive && free > 0;
-        guards[1] = qcount > 0;
-        guards[2] = 1;
-        switch (ChanAltGuarded(chans, guards, 3)) {
+        switch (ALTG3(passActive && free > 0, &a, qcount > 0, &ready,
+                      1, &c)) {
         case 0:
             command = ChanInInt(&a);
             if (command == c_render) {

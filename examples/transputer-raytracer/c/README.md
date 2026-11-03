@@ -19,8 +19,11 @@ which it does, for every model and every network size tried.
 |                        | `start.S`    | image entry                                    |
 
 `conc.h` supplies the occam primitives: `ChanIn`/`ChanOut` on soft channels
-and links, `ChanAlt`/`ChanAltGuarded` for `PRI ALT` (scan order is the
-priority), and `PSetup`/`PRun` with `PRI_HIGH`/`PRI_LOW` for `PRI PAR`.
+and links, `ChanAlt2`/`ChanAltGuarded3` for `PRI ALT` (scan order is the
+priority; `raytrace.h`'s `ALT2`/`ALTG3` fall back to `ChanAlt`/
+`ChanAltGuarded` with a `conc.h` that lacks them), and `PSetup`/`PRun` with
+`PRI_HIGH`/`PRI_LOW` for `PRI PAR`.  How the code TinyCC makes of it
+compares with the occam's, instruction by instruction: `CODEGEN.md`.
 
 ## Build
 
@@ -32,7 +35,7 @@ In WSL, with a built compiler tree (`transputer-tcc`, `include/`,
 
 `bin/raytraceN.btl` and `bin/raytraceN.map` come out for N = 1, 2, 4, 8,
 16, 32, 64, 128 and 256.  Every size boots the same image (`-mt800`, about
-31 KB); only the boot header differs.  The maps are `../bin/raytraceN.map`
+27 KB); only the boot header differs.  The maps are `../bin/raytraceN.map`
 where the occam build has one - the 16-node map chains on links 1 -> 0, the
 others on 2 -> 1 - and `mkbtl.py map N` writes 128 and 256 in the same form.
 Options: `RES` (a multiple of 256), `PATCH` (job edge, 8 or 16: 16 from 1024
@@ -83,3 +86,17 @@ to node 0 is the one it was booted through.
   `writeReal`, which nothing calls, is not ported.
 
 ## Results
+
+- **256 x 256**: every model, on every network size tried (1 to 256
+  nodes), renders `../pic/rayM.ppm` byte for byte.
+- **2048 x 2048**: `pic/rayM-2048.png`, rendered on 16 nodes (`bash run.sh
+  16 M`) with the BTLs in `bin/`, which TinyCC built at compiler main
+  5f3c9a77.  They are the same bytes as the first port's renders (TinyCC
+  4a446dbd), so none of the compiler work moved a pixel.  On t4, as
+  threads on a busy 20-core host, the 16-node renders reported 51 s (model 1),
+  65 s (2), 40 s (3) and 87 s (4) -
+  host time, so a rough guide only.
+- **Speed**: on one node, model 3 at 256 x 256 takes 1,061,832,482
+  instructions against the occam's 763 M (1.39x; the first port took
+  1813 M).  `CODEGEN.md` has where the difference was, what was a
+  programming issue and what a compiler one, and what is still open.

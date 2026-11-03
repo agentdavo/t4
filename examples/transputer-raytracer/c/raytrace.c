@@ -49,14 +49,11 @@ static void feedJob(int x, int y)
 
 static void throughPut(void)
 {
-    Channel *chans[2];
     int state, tag, x = 0, y = 0, size, ab[2];
 
-    chans[0] = &pixelTrigger;
-    chans[1] = fromPrev;
     state = active;
     while (state != closeDown) {
-        if (ChanAlt(chans, 2) == 0) {
+        if (ALT2(&pixelTrigger, fromPrev) == 0) {
             ChanInInt(&pixelTrigger);   /* should be guarded by busy .. */
             if (state & buffered) {
                 feedJob(x, y);
@@ -144,14 +141,11 @@ static int bypass(Channel *in, int command)
 
 static void pixelBypass(void)
 {
-    Channel *chans[2];
     int state;
 
-    chans[0] = &pixelOut;               /* fromThis */
-    chans[1] = fromNext;
     state = lubThis | lubOther;
     while (state != closeDown) {
-        if (ChanAlt(chans, 2) == 0) {
+        if (ALT2(&pixelOut, fromNext) == 0) {     /* fromThis first */
             if (bypass(&pixelOut, ChanInInt(&pixelOut)))
                 state ^= lubThis;
         } else {
