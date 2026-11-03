@@ -383,11 +383,13 @@ arrives even when the mailbox is full.
   #C2, a control-link error.  CLink0: nothing can be reported; its halted
   output is what the neighbour sees (HRM 8.5.3).
 * **Frozen until restarted.**  A halted link carries nothing - no VCP
-  packets, no byte-stream messages, no control packets - until software
+  packets, no byte-stream messages (an output started then waits, and not
+  even its first packet leaves), no control packets - until software
   starts it again: LinkNCommand/CLinkNCommand StartLink (ResetLink empties
   its buffers first), `resetch` on a byte-stream channel (reset and
-  restart, HRM 13.7.2), `setchmode` on a byte-stream channel, or a control
-  unit Reset 1 or 2.  CLink0 restarts on its next token (HRM 8.3.1); the
+  restart, HRM 13.7.2; on an input it also loses a packet the link had
+  received and nobody had input), `setchmode` on a byte-stream channel, or
+  a control unit Reset 1 or 2.  CLink0 restarts on its next token (HRM 8.3.1); the
   controller then resynchronises the device with RecoverError.
 
 Faults reach nodes of the threaded fabric (`-st`) and a stand-alone node's

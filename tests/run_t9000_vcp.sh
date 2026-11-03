@@ -26,7 +26,8 @@
 #   test_alt_guard      one node: an ALT guard of 2 is true, and a false
 #                       guard's disc leaves the channel alone (ISM enbc, disc)
 #   test_timer_alt      one node: a timer ALT a channel won leaves the timer
-#                       list (ISM dist), and one its time woke is queued once
+#                       list (ISM dist), one its time woke is queued once,
+#                       and one whose time has passed carries on (taltwt)
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).

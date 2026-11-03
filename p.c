@@ -3155,6 +3155,11 @@ int Psend_channel (Channel *chan, uint32_t address, uint32_t len)
 {
         if (len > MAX_DATA)
                 return 1;
+        /* a halted link transmits nothing, not even the first packet: the
+         * outputter waits, and linkcomms() skips the link until it is
+         * started again (HRM 13.7.2) */
+        if (t4cpu->s_link_halted & (1u << chan->linkno))
+                return 1;
 
         chan->Address = address;
         chan->Length  = len;
@@ -3593,6 +3598,18 @@ Channel *reset_channel (uint32_t addr)
         chan->CtrlByte = C_UNKNOWN;   /* a reset abandons any part-read packet */
 
         return chan;
+}
+
+/* resetch on a link input resets the link hardware (HRM 13.7.2, TCWG 8.3),
+ * so a packet that has arrived and not been input is lost.  reset_channel()
+ * cannot do this: linkcomms() resets a channel after every transfer. */
+void flush_link_input (Channel *chan)
+{
+        u_char tmp[MAX_DATA];
+
+        if (chan->schbuf || chan->sock >= 0)
+                (void)channel_recvP (chan, tmp, 0);
+        chan->npend = 0;
 }
 
 /* Single-node link loopback for exercising links without a network:
@@ -4267,6 +4284,7 @@ void mainloop (void)
         int rare_hooks;
         uint32_t temp, temp2;
         uint32_t otherWdesc, otherWPtr, otherPtr, altState;
+        Channel *rchan;
         uint32_t PrevError;
         u_char pixel;
         fpreal32_t sntemp1, sntemp2;
@@ -6532,9 +6550,14 @@ DescheduleOutWord:
                            {
 			        AReg = word (temp);
                                 /* on a byte-stream channel this resets
-                                 * and restarts the link (HRM 13.7.2) */
-                                if (NULL != reset_channel (temp))
+                                 * and restarts the link (HRM 13.7.2),
+                                 * and an input loses what the link held */
+                                if (NULL != (rchan = reset_channel (temp)))
+                                {
+                                        if (IsLinkIn(temp))
+                                                flush_link_input (rchan);
                                         t9k_ds_link_restart (TheLink(temp));
+                                }
                            }
 			   IPtr++;
 			   break;
@@ -7343,7 +7366,26 @@ DescheduleOutWord:
 #endif
 			   writeword (index (WPtr, Temp_s), NoneSelected_o);
 			   IPtr++;
-			   if ((word (index (WPtr, State_s))) != Ready_p)
+			   /* ISM taltwt, TCWG 10.5.2: a ready ALT records the time
+			    * its wait ended and carries on; one whose earliest
+			    * enabled time has already passed is ready, and carries
+			    * on too; with no timer guard enabled (TimeNotSet.p) it
+			    * waits as altwt does, off the timer list */
+			   if ((word (index (WPtr, State_s))) == Ready_p)
+			   {
+				writeword (index (WPtr, Time_s), ClockReg[ProcPriority]);
+			   }
+			   else if (word (index (WPtr, TLink_s)) == TimeNotSet_p)
+			   {
+				writeword (index (WPtr, State_s), Waiting_p);
+                                deschedule ();
+			   }
+			   else if (INT32(ClockReg[ProcPriority] - word (index (WPtr, Time_s))) > 0)
+			   {
+				writeword (index (WPtr, State_s), Ready_p);
+				writeword (index (WPtr, Time_s), ClockReg[ProcPriority]);
+			   }
+			   else
 			   {
 				/* No guards are ready, so deschedule process, after putting time in timer queue. */
 #ifdef EMUDEBUG

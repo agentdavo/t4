@@ -223,6 +223,7 @@ void print_profile (void);
 void open_channel  (uint32_t);
 void open_link_channel (Channel *chan, uint32_t addr, int theLink, int chanIn);
 Channel *reset_channel(uint32_t);
+void flush_link_input(Channel *);
 void alt_channel   (Channel*);
 int channel_ready  (Channel *chan);
 void close_channels(void);

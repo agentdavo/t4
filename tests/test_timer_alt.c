@@ -1,5 +1,6 @@
-/* A timer ALT leaves the timer list whichever guard wins, and is scheduled
- * once.  One node.  Expected: S\nALL-PASS\nH
+/* A timer ALT leaves the timer list whichever guard wins, is scheduled
+ * once, and does not wait for a time already past.  One node.
+ * Expected: S\nALL-PASS\nH
  *
  * A: dist removes the process from the timer list "if the process is still
  *    on the timer list" (ISM, dist) - as it is when a channel won.  t4's
@@ -13,6 +14,11 @@
  *    another process queued between the two entries (here one whose timer
  *    comes due a tick later), the second entry ran it again from wherever
  *    it had next descheduled: a timer wait ended early.
+ * C: taltwt with the earliest enabled time already past does not
+ *    deschedule: a timer guard is ready, so the process carries on (ISM
+ *    taltwt, TCWG 10.5.2).  t4 put it on the timer list anyway, so a
+ *    process it had just made ready ran first.  The probe and that
+ *    partner run at high priority, where nothing timeslices.
  *
  * test_main and the other process run at low priority, the peer at high
  * priority.  The ALTs are conc.h's ChanTimerAlt (lib/transputer-conc.c).
@@ -76,14 +82,47 @@ static void sleeper(void)
 
 static int sleeper_ws[PROC_WS_MIN / 4];
 
+/* C, high priority: the probe readies the partner, then ALTs on a time
+ * already past; the partner must not have run when the ALT returns. */
+static Channel cgo = NOPROCESS, cpoke = NOPROCESS, cdone = NOPROCESS;
+static volatile int cflag;
+
+static void cpartner(void)
+{
+    for (;;) {
+        ChanInInt(&cpoke);
+        cflag = 1;
+    }
+}
+
+static void cprobe(void)
+{
+    Channel *g;
+    int sel;
+
+    for (;;) {
+        ChanInInt(&cgo);
+        cflag = 0;
+        ChanOutInt(&cpoke, 1);          /* the partner is now queued */
+        g = &idle;
+        sel = ChanTimerAlt(Time() - 100, &g, 1);
+        ChanOutInt(&cdone, sel == -1 && cflag == 0);
+    }
+}
+
+static int cpartner_ws[PROC_WS_MIN / 4];
+static int cprobe_ws[PROC_WS_MIN / 2];
+
 void test_main(void)
 {
     Channel *g;
     int i, sel, v, start, d;
-    int okA = 1, okB = 1, okB2 = 1;
+    int okA = 1, okB = 1, okB2 = 1, okC = 1;
 
     PRun(PSetup(peer_ws, sizeof peer_ws, peer));
     PRun(PSetup(sleeper_ws, sizeof sleeper_ws, sleeper) | PRI_LOW);
+    PRun(PSetup(cpartner_ws, sizeof cpartner_ws, cpartner));
+    PRun(PSetup(cprobe_ws, sizeof cprobe_ws, cprobe));
 
     /* A: the channel wins, then a timer ALT from the same frame times out */
     for (i = 0; i < ROUNDS; i++) {
@@ -120,6 +159,14 @@ void test_main(void)
     }
     check("B-message", okB);
     check("B-scheduled-once", okB2);
+
+    /* C: a timer ALT on a time already past carries on */
+    for (i = 0; i < ROUNDS; i++) {
+        ChanOutInt(&cgo, 1);
+        if (!ChanInInt(&cdone))
+            okC = 0;
+    }
+    check("C-past-time-carries-on", okC);
 
     uart_puts(pass ? "\nALL-PASS\n" : "\nFAILED\n");
 }
