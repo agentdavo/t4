@@ -103,6 +103,10 @@ static pthread_t t4_wth[1024];
 static cpu_t *t4_wc[1024];
 static int t4_nworkers;
 
+/* Set while this thread runs mainloop(), which services t4_sig_pending
+ * (see handler()). */
+static T4_THREAD_LOCAL int t4_in_mainloop;
+
 /* T4_NODE_BTL=pattern, e.g. n%d.btl: a threaded node other than 0 loads its
  * own netload image (the file -sb takes) instead of waiting for boot code on
  * a link, so every node of a threaded network - C104 routers included - can
@@ -165,9 +169,11 @@ static void *t4_node_thread(void *arg)
                 return NULL;
         }
         /* a T9000 control system restarts a stopped CPU (Run, Reboot) */
+        t4_in_mainloop = 1;
         do
                 mainloop();
         while (t9k_ctl_after_halt());
+        t4_in_mainloop = 0;
         t9k_report();
         return NULL;
 }
@@ -183,7 +189,7 @@ static void t4_spawn_thread_nodes(int n)
         }
         /* before any node opens a link that may end at one */
         if (t4_fabric_start_routers(t4_fabric) < 0)
-                exit(-1);
+                handler(-1);
         t4_idle_init(&t4_cpu0);
         t4_fabric_set_cpu(t4_fabric, 0, &t4_cpu0);
         if (t9k.enabled)
@@ -953,8 +959,7 @@ int main (int argc, char **argv)
                         printf ("-I-EMU414: Reading network configuration from %s...\n", NetConfigName);
                 if (readNetConfig (NetIn) < 0)
                 {
-                        /* handler() only flags a signal now; stop here */
-                        exit (-1);
+                        handler (-1);
                 }
                 if (verbose)
                         printf ("-I-EMU414: Done.\n");
@@ -977,7 +982,7 @@ int main (int argc, char **argv)
 #endif
                         if (!want_threads && netRouterCount ()) {
                                 printf ("-E-EMU414: Router nodes need threaded nodes (-st)\n");
-                                exit (-1);
+                                handler (-1);
                         }
                         sprintf (SpyNet, "SPYNET=%s", NetConfigName);
                         putenv (SpyNet);
@@ -1021,7 +1026,7 @@ int main (int argc, char **argv)
                         /* a node started on its own (-sn without a count)
                          * would never see the routers of its map */
                         printf ("-E-EMU414: Router nodes need threaded nodes (-st -sn -N)\n");
-                        exit (-1);
+                        handler (-1);
                 }
         }
 
@@ -1227,9 +1232,11 @@ int main (int argc, char **argv)
 
 	/* Now start the emulator; a T9000 control system may restart a
 	 * stopped CPU (Run, Reboot). */
+	t4_in_mainloop = 1;
 	do
 	        mainloop ();
 	while (t9k_ctl_after_halt ());
+	t4_in_mainloop = 0;
         if (want_threads)
                 t4_join_thread_nodes();
 
@@ -1335,10 +1342,20 @@ volatile sig_atomic_t t4_sig_pending = 0;
  * time() is async-signal-safe. */
 static time_t t4_sig_first;
 
+void t4_signal_exit (int signal);
+
 void handler (int signal)
 {
-	time_t now = time (NULL);
+	time_t now;
 
+	/* handler(-1) is also T4's own stop on a fatal error.  Only mainloop()
+	 * services the flag, so outside it - starting up, booting a node,
+	 * shutting down - T4 would carry on past the error.  This is an
+	 * ordinary call, not a signal, so the exit path runs here, as it did
+	 * before signals were deferred. */
+	if (-1 == signal && !t4_in_mainloop)
+		t4_signal_exit (-1);
+	now = time (NULL);
 	if (t4_sig_pending) {
 		if (now - t4_sig_first >= 2)
 			_exit (-1);
