@@ -12,8 +12,10 @@
  *     header (1..255 bytes) | data (0..32 bytes) | token (EOP or EOM)
  *
  * The receiver strips 1 or 2 header bytes according to its VCPLinkNMode
- * HeaderLength bit, exactly as the hardware does; there is no IMS C104 in
- * the emulated network, so headers are local (header deletion) headers.
+ * HeaderLength bit, exactly as the hardware does.  Between two nodes there
+ * may be IMS C104 routers (t4_fabric.c): they route on the header with
+ * interval labelling and may delete it (HRM 7.2.1), so what arrives here
+ * is the header the last router left.
  */
 #include <stdio.h>
 #include <stdlib.h>
