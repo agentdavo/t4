@@ -17,18 +17,23 @@ exit (load-independent; t4's clock is the host's, so times are not):
 | + builtin operands pushed directly, straight-line ALT (compiler, conc.h) | 1062 M | 1.39x |
 | + indexed FP loads, `fpldnlsni`/`fpldnldbi` (compiler) | 1062 M | 1.39x |
 | + `x * 2.0` as `fpumulby2` on the T800 (compiler) | 1059 M | 1.39x |
+| + FP values kept on the FPU stack, as occam (compiler) | 954 M | 1.25x |
+| + squares as `fpdup; fpmul` (compiler) | 954 M | 1.25x |
 
 Exactly: 1,062,277,565 instructions before the indexed loads,
 1,061,832,482 after (they save 0.04% here, where most subscripts are
-constants and fold into the address) and 1,059,480,926 with `x * 2.0` as
-`fpumulby2`.  These are t4 dispatches; see the next section for real
-instruction counts and cycles.  Code size: the ray tracer is 14096
+constants and fold into the address), 1,059,480,926 with `x * 2.0` as
+`fpumulby2`, 953,702,409 with the FPU stack and 953,888,262 with the
+squares.  These are t4 dispatches; see the next section for real
+instruction counts and cycles (t4 fuses `ldlp; fpldnlmulsn` into one
+dispatch but not `fpdup; fpmul`, so the squares raise this count while
+the real one falls).  Code size: the ray tracer is 14096
 bytes of code in C (`raytrace.o`, was 19006), 12248 in occam
 (`raytrace.lku`, which also holds `writeReal`).  The compiler changes are
 on the compiler repo's main branch: a4dbeab2 (FA residency, constant
 subscripts), 54530ac1 (statement-end cleanup, builtin operands, `conc.h`)
-5f3c9a77 (indexed loads) and a621df2b (`fpumulby2`/`fpudivby2` on the
-T800).  `transputer/CLAUDE.md` there, "Using the
+5f3c9a77 (indexed loads), a621df2b (`fpumulby2`/`fpudivby2` on the
+T800), d355e94f (the FPU stack) and 0092bd43 (squares).  `transputer/CLAUDE.md` there, "Using the
 stacks well", turns what this comparison taught into rules for the
 backend.
 
@@ -39,13 +44,16 @@ backend.
 understate both programs by about 28%.  With fusion off and every executed
 instruction counted at its address, model 3 at 256 x 256 on one node is:
 
-| | occam | TinyCC (5f3c9a77) | C/occam |
+| | instructions | T800 cycles | cycles vs occam |
 |-|------:|------:|------:|
-| instructions | 1,058,821,118 | 1,458,633,335 | 1.38x |
-| T800 cycles | 2,947,336,424 | 3,576,878,024 | 1.21x |
+| occam | 1,058,821,118 | 2,947,336,424 | 1.00x |
+| TinyCC 5f3c9a77 | 1,458,633,335 | 3,576,878,024 | 1.21x |
+| a621df2b, `x * 2.0` as `fpumulby2` | 1,455,324,733 | 3,552,061,421 | 1.21x |
+| d355e94f, FP values kept on the FPU stack | 1,284,656,245 | 3,277,368,522 | 1.11x |
+| 0092bd43, squares as `fpdup; fpmul` | 1,284,142,073 | 3,265,578,901 | 1.11x |
 
-and with `x * 2.0` as `fpumulby2` (a621df2b), 1,455,324,733 instructions
-and 3,552,061,421 cycles (1.21x, -24.8 M).
+The tables below this one are the first measurement, at 5f3c9a77; "Where
+it stands now" after them is the last.
 
 Cycles are INMOS's per-instruction timings (`../../../utils/instructions.txt`,
 from the TCWG): on-chip RAM, one more cycle for every prefix byte, and the
@@ -81,7 +89,7 @@ loads and stores.  Where the 630 M cycles go, C minus occam:
   where occam's `fpadd` (6) finds both operands on the FPU stack, squares
   with `fpldnlmulsn` (13) where occam does `fpdup; fpmul` (12), and stores
   9 partial results a `TransLocal` call to occam's 3.  About +105 M.
-  Compiler: an FPU-stack allocator.
+  Compiler: an FPU-stack allocator.  Done in d355e94f and 0092bd43 (below).
 - **Global addresses**: `worldModel`, `tree`, `grunData`, `freeNode`,
   `lights`, ... are absolute addresses, each a 7-byte `ldc` (7 cycles),
   15 M times: 106 M cycles, where occam reaches the same arrays through
@@ -121,6 +129,56 @@ from memory, about 80 the parking (9 FP stores to 3, 18 more `ldl`, 19
 more `stl`, 15 more `ldlp`), and its loop control costs the same as
 occam's three `lend`s.
 
+### Where it stands now (0092bd43)
+
+318 M cycles, C minus occam:
+
+| opcode | occam | C | C - occam, cycles |
+|--------|------:|--:|------:|
+| `ldc` | 65.7 M | 74.3 M | +133 M |
+| `cj` | 30.9 M | 55.1 M | +87 M |
+| `stl` | 58.4 M | 143.2 M | +85 M |
+| `ldl` | 310.7 M | 343.7 M | +66 M |
+| `gt` | 2.1 M | 27.2 M | +50 M |
+| `adc` | 5.8 M | 46.2 M | +40 M |
+| `ldlp` | 56.8 M | 93.4 M | +37 M |
+| `eqc` | 11.0 M | 22.0 M | +22 M |
+| `fpordered` | 0 | 6.3 M | +19 M |
+| `j` | 7.8 M | 13.2 M | +15 M |
+| `rev` | 0.01 M | 13.3 M | +13 M |
+| `ldnlp` | 93.5 M | 62.2 M | -31 M |
+| `ldnl` | 57.5 M | 33.5 M | -48 M |
+| `lend` | 19.9 M | 0 | -174 M |
+
+The floating point is occam's: `fpdup` and `fpmul` 5,268,802 each in
+both, `fpldnlmulsn` 32.93 M in both, `fpadd` 18.5 M to occam's 18.9 M,
+FP stores 32.0 M to 31.7 M.  What is left is integer code:
+
+- **Parking**, `ldl`/`stl`/`ldlp`: +187 M (it was +402 M), less the
+  79 M occam spends reaching outer-scope variables.
+- **Constants**, `ldc`: +133 M, the global addresses and FP literals
+  above.
+- **Loops and conditions**: `cj`/`gt`/`adc`/`eqc`/`j` +214 M against
+  `lend` -174 M.  ellipsoidSect shows it is a wash: its five small loops
+  cost C about 220 cycles a call (`cj`, `gt`, `adc`, `j`) and occam about
+  200 (21.7 `lend`s, 191 cycles); its FP is occam's instruction for
+  instruction, and the 218 cycles a call it still loses are parking
+  (`ldl` +109, `stl` +72, `ldlp` +16).
+
+| routine | calls | occam | C | C/occam |
+|---------|------:|------:|--:|------:|
+| coneSect | 405,061 | 1706 | 1854 | 1.09 |
+| TransLocal | 1,725,284 | 325 | 345 | 1.06 |
+| ellipsoidSect | 360,594 | 1048 | 1266 | 1.21 |
+| sceneSect | 405,061 | 707 | 680 | 0.96 |
+| planeSect | 349,743 | 471 | 530 | 1.12 |
+| dotProduct | 1,557,135 | 82 | 91 | 1.11 |
+| shadeNode | 221,834 | 498 | 654 | 1.31 |
+| reflectRay | 219,529 | 425 | 487 | 1.15 |
+| normalize | 223,933 | 290 | 308 | 1.06 |
+| pointSample | 464,272 | 115 | 105 | 0.91 |
+| TransGlobal | 193,974 | 91 | 68 | 0.75 |
+
 Reproducing: `ophist_patch.py` adds a `T4_OPHIST=file` counter to a copy
 of t4's `p.c` (fusion off; every instruction counted at its address with
 its length and timing operand, written at exit); `oph.py` reads the INMOS
@@ -128,11 +186,12 @@ table, attributes the counts to routines and pairs them:
 
     git -C ../../.. archive master | tar -x -C /tmp/t4op
     python3 ophist_patch.py /tmp/t4op/p.c && make -C /tmp/t4op -f Makefile.linux t4
-    printf '3
-' | SPYNET=../bin/raytrace1.map T4_OPHIST=occam.txt         /tmp/t4op/t4 -st -s8 -sn -1 -sb ../bin/raytrace1.btl
-    printf '3
-' | SPYNET=bin256/raytrace1.map T4_OPHIST=c.txt         /tmp/t4op/t4 -st -s8 -sn -1 -sb bin256/raytrace1.btl
-    python3 oph.py ../../../utils/instructions.txt occam.txt occ_code.bin         0x80002B8C c.txt bin256/obj/raytrace.elf.tccsym out
+    printf '3\n' | SPYNET=../bin/raytrace1.map T4_OPHIST=occam.txt \
+        /tmp/t4op/t4 -st -s8 -sn -1 -sb ../bin/raytrace1.btl
+    printf '3\n' | SPYNET=bin256/raytrace1.map T4_OPHIST=c.txt \
+        /tmp/t4op/t4 -st -s8 -sn -1 -sb bin256/raytrace1.btl
+    python3 oph.py ../../../utils/instructions.txt occam.txt occ_code.bin \
+        0x80002B8C c.txt bin256/obj/raytrace.elf.tccsym out
 
 `occ_code.bin` is the occam's `raytrace.lku` as loaded (the
 `T4_DUMP_WORDS` dump under "Reproducing" below, as bytes).
