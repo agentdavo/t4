@@ -592,6 +592,18 @@ same FFN on an 8-node hypercube of byte-stream links takes 6.73 ms.
   guard of 2 is true and a false guard's `disc` leaves the channel word
   alone (ISM `enbc`, `disc`, `enbs`, `diss`); and the `eqc;cj` and `gt;cj`
   pairs t4 fuses leave a taken jump's 0 in A, as `cj` does (ISM `cj`).
+* `tests/test_timer_alt.c` - not T9000: timer ALTs and the timer lists.
+  Two fixes of 2026-11-04.  A timer ALT that a guard wakes comes off its
+  timer list then (`t4_wake_alt`): left on it until its `dist`, its time
+  could come first, and `schedule_timerq` queued it a second time, which
+  with another process queued between the two entries made the queue a
+  cycle that lost that process (ISM 8.7: a guard reschedules only a
+  waiting ALT).  That was the stall, a spin outside the instruction loop
+  that ignored SIGTERM, about one run in 30 on a loaded host.  And
+  `insert()` compared each step of its walk with the entry it was on, not
+  the next, so a wait put behind two others went to the end of the list
+  and woke with the later one.  Cases D and E check them; the e69f2a6
+  binary hangs in D and fails E every time.
 * `tests/test_timeslice_period.c` - two low priority processes spinning
   through a `j` take 32 turns, which must last 512 µs each at `-s9` and
   2048 µs at `-s806` (to 25%; measured within 1%), on one node and on

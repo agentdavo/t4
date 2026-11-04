@@ -19,6 +19,19 @@
  *    taltwt, TCWG 10.5.2).  t4 put it on the timer list anyway, so a
  *    process it had just made ready ran first.  The probe and that
  *    partner run at high priority, where nothing timeslices.
+ * D: B the other way round: a channel makes the waiting ALT ready, then a
+ *    high-priority process holds the processor until after the ALT's time,
+ *    so the time comes while the ALT is queued but has not run its dist.
+ *    It was still on its timer list, and schedule_timerq queued it again
+ *    (ISM 8.7: a guard reschedules only a waiting ALT); the second entry
+ *    ended a later timer wait early, or left the list linked through a
+ *    word the process was using, and t4 walked it for ever (about one run
+ *    in 30 of the old parts on a loaded host).  t4 now takes a woken ALT
+ *    off its timer list when it wakes it.
+ * E: the timer list stays in time order.  insert() compared each step
+ *    with the time of the entry it was on, not of the next, so a wait put
+ *    behind two others went to the end: 10, 20, 30 then 25 ms woke the
+ *    25 ms one with the 30 ms one.
  *
  * test_main and the other process run at low priority, the peer at high
  * priority.  The ALTs are conc.h's ChanTimerAlt (lib/transputer-conc.c).
@@ -44,10 +57,11 @@ static void check(const char *name, int ok)
 #define ROUNDS 8
 
 static Channel go = NOPROCESS;          /* main -> peer: which case */
+static Channel hgo = NOPROCESS;         /* peer -> holder (D) */
 static Channel c = NOPROCESS;           /* peer -> main, ALTed on */
 static Channel idle = NOPROCESS;        /* nobody ever uses it */
 
-enum { WAIT_THEN_SEND = 1, BUSY_THEN_SEND = 2 };
+enum { WAIT_THEN_SEND = 1, BUSY_THEN_SEND = 2, WAKE_THEN_HOLD = 3 };
 
 /* High priority: 1us ticks. */
 static void peer(void)
@@ -65,6 +79,8 @@ static void peer(void)
             while (TimeAfter(t, Time()))
                 ;
         }
+        if (op == WAKE_THEN_HOLD)
+            ChanOutInt(&hgo, 1);        /* the holder runs next (D) */
         ChanOutInt(&c, op);
     }
 }
@@ -113,16 +129,50 @@ static void cprobe(void)
 static int cpartner_ws[PROC_WS_MIN / 4];
 static int cprobe_ws[PROC_WS_MIN / 2];
 
+/* D, high priority: made ready by the peer just before the peer's output
+ * wakes main, it then has the processor for 3ms */
+static void holder(void)
+{
+    int t;
+
+    for (;;) {
+        ChanInInt(&hgo);
+        t = Time() + 3000;
+        while (TimeAfter(t, Time()))
+            ;
+    }
+}
+
+static int holder_ws[PROC_WS_MIN / 4];
+
+/* E, high priority: each waits the time it is sent, then notes its turn */
+static Channel ein[4] = { NOPROCESS, NOPROCESS, NOPROCESS, NOPROCESS };
+static volatile int eorder[4], ewoke;
+
+static void esleep(int n)
+{
+    ProcWait(ChanInInt(&ein[n]));
+    eorder[ewoke++] = n;
+}
+
+static void e0(void) { esleep(0); }
+static void e1(void) { esleep(1); }
+static void e2(void) { esleep(2); }
+static void e3(void) { esleep(3); }
+
+static int ews[4][PROC_WS_MIN / 4];
+
 void test_main(void)
 {
     Channel *g;
     int i, sel, v, start, d;
-    int okA = 1, okB = 1, okB2 = 1, okC = 1;
+    int okA = 1, okB = 1, okB2 = 1, okC = 1, okD = 1, okD2 = 1;
 
     PRun(PSetup(peer_ws, sizeof peer_ws, peer));
     PRun(PSetup(sleeper_ws, sizeof sleeper_ws, sleeper) | PRI_LOW);
     PRun(PSetup(cpartner_ws, sizeof cpartner_ws, cpartner));
     PRun(PSetup(cprobe_ws, sizeof cprobe_ws, cprobe));
+    PRun(PSetup(holder_ws, sizeof holder_ws, holder));
 
     /* A: the channel wins, then a timer ALT from the same frame times out */
     for (i = 0; i < ROUNDS; i++) {
@@ -167,6 +217,42 @@ void test_main(void)
             okC = 0;
     }
     check("C-past-time-carries-on", okC);
+
+    /* D: at 300us the peer readies the holder and its output wakes the
+     * ALT; the holder then has the processor for 3ms, past the sleeper's
+     * time (448us) and the ALT's (640us), so the sleeper queues behind the
+     * woken ALT; then a 100-tick wait must last 100 ticks.  Queued again
+     * by its time, the ALT linked the queue into a cycle that lost the
+     * sleeper, and the next round's output to it waited for ever. */
+    for (i = 0; i < ROUNDS; i++) {
+        d = Time() + 10;
+        ChanOutInt(&xgo, d - 3);
+        ChanOutInt(&go, WAKE_THEN_HOLD);
+        g = &c;
+        sel = ChanTimerAlt(d, &g, 1);
+        v = ChanInInt(&c);
+        if (sel != 0 || v != WAKE_THEN_HOLD)
+            okD = 0;
+        start = Time();
+        ProcWait(100);
+        if (Time() - start < 100)
+            okD2 = 0;
+    }
+    check("D-channel-wins", okD);
+    check("D-scheduled-once", okD2);
+
+    /* E: 10, 20, 30, then 25 ms; 40 ms is 625 low priority ticks */
+    PRun(PSetup(ews[0], sizeof ews[0], e0));
+    PRun(PSetup(ews[1], sizeof ews[1], e1));
+    PRun(PSetup(ews[2], sizeof ews[2], e2));
+    PRun(PSetup(ews[3], sizeof ews[3], e3));
+    ChanOutInt(&ein[0], 10000);
+    ChanOutInt(&ein[1], 20000);
+    ChanOutInt(&ein[2], 30000);
+    ChanOutInt(&ein[3], 25000);
+    ProcWait(625);
+    check("E-timer-order", ewoke == 4 && eorder[0] == 0 && eorder[1] == 1 &&
+          eorder[2] == 3 && eorder[3] == 2);
 
     uart_puts(pass ? "\nALL-PASS\n" : "\nFAILED\n");
 }

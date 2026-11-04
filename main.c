@@ -1098,6 +1098,8 @@ int main (int argc, char **argv)
                  * (SharedEvents).  It was 60 s, and -sl's polled links
                  * took longer than that to boot the 60th node of 80. */
                 extern u_char *SharedEvents;
+                extern volatile sig_atomic_t t4_sig_pending;
+                extern void t4_signal_exit (int);
                 const char *bw = getenv ("T4_BOOT_WAIT");
                 int maxwait = (bw && atoi (bw) > 0) ? atoi (bw) : 600;
 
@@ -1110,6 +1112,14 @@ int main (int argc, char **argv)
                                 temp = 1;
                         if (SharedEvents && SharedEvents[nodeid])
                                 temp = maxwait + 1;     /* node 0 has stopped */
+                        /* handler() only notes a signal outside mainloop() */
+                        if (t4_sig_pending)
+                        {
+                                int sig = (int) t4_sig_pending;
+
+                                t4_sig_pending = 0;
+                                t4_signal_exit (sig);
+                        }
                 } while ((temp++ < maxwait) && (0 == linkcomms ("boot", TRUE, LTO_BOOT)));
                 if (temp > maxwait)
                 {

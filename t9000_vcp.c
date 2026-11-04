@@ -30,6 +30,7 @@ extern int  channel_sendP (Channel *chan, u_char *data, int ndata, int doWait);
 extern int  channel_recvP (Channel *chan, u_char *data, int doWait);
 extern uint32_t t4_product_identity (void);
 extern void t4_wake (uint32_t wdesc);
+extern void t4_wake_alt (uint32_t wdesc);
 
 /* p.c's word()/writeword() are inline in release builds; these are the
  * out-of-line accessors behind them (translation and MMIO included). */
@@ -448,7 +449,7 @@ static void alt_ready (uint32_t wdesc)
                 return;
         writeword (slot, READY_P);
         if (st == WAITING_P)
-                t4_wake (wdesc);
+                t4_wake_alt (wdesc);    /* off its timer list too (p.c) */
 }
 
 /* ISM 8.8.2 'claim' on behalf of resource channel chan.  Returns 1 when a

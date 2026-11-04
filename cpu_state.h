@@ -94,6 +94,9 @@ typedef struct cpu_t {
          * CLink0-1); s_link_halted has bit n set while Link n is stopped. */
         _Atomic uint32_t s_line_err;
         uint8_t  s_link_halted;
+        /* the link this node is being booted on (handleboot), 0 until the
+         * first byte of its boot comes */
+        uint32_t s_BootLink;
 } cpu_t;
 
 extern T4_THREAD_LOCAL cpu_t *t4cpu;
@@ -153,6 +156,7 @@ int    cpu_setup_ram(cpu_t *c);
 #define Link          (t4cpu->s_Link)
 #define TimerEnableHi (t4cpu->s_TimerEnableHi)
 #define TimerEnableLo (t4cpu->s_TimerEnableLo)
+#define BootLink      (t4cpu->s_BootLink)
 #define EnableJ0BreakFlag (t4cpu->s_EnableJ0BreakFlag)
 #define TimesliceDisabled (t4cpu->s_TimesliceDisabled)
 #define IntsDisabled  (t4cpu->s_IntsDisabled)

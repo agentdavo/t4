@@ -360,7 +360,7 @@ Read from `p.c`, `main.c`, `server.c`, `netcfg.c`, `display_backend_sdl.c`, `tim
 | `vec_len, quant_fmt, tvx_*, m2d*` | `p.c:1610–1621` | TVX / move2d latches |
 | `t9k` (`t9k_state`) | `p.c:204` | Grouper; off unless `T4_T9000` |
 | `t9k_prot`, `t9k_pmi` | `t9000_protect.c:18`, `t9000_pmi.c:11` | **Must move.** `mainloop` does `setjmp(t9k_prot.jmp_env)` (`p.c:3608`). N threads sharing one `jmp_buf` is undefined. Raytracer is T800 so idle, but still per-node |
-| `BootLink`, `EnableJ0BreakFlag`, `ThReg`, `TimesliceDisabled`, `IntsDisabled` | `p.c` | |
+| `BootLink`, `EnableJ0BreakFlag`, `ThReg`, `TimesliceDisabled`, `IntsDisabled` | `p.c` | `BootLink` is `cpu_t.s_BootLink` since 2026-11-04: one for the process made every node listen for its boot on the first booted node's link |
 | `heartbeat_counter`, `loop,count1..3`, `delayCount1`, `speed_multiplier` | `p.c` | |
 | `instrprof, combinedprof` | `p.c:1853–1859` | Only `T4PROFILE` |
 | `nodeid`, `serve` | `main.c:93,98` | **Today process-global because one node per process.** Must become per-`cpu_t`. Node 0: `serve=1` if `-sb`/`-ss`. Workers: `serve=0`, `nodeid=i` |
@@ -1385,10 +1385,18 @@ N = 200 stalled the network: none of three runs finished in 120 s.  Not
 kept.
 
 At 80 nodes the chain boot, not the render, is most of a run: about 37 s
-at host load 5, 53-63 s at load 17-29, against 4-5 s of rendering.  Each
-booted node forwards the rest of the 260 KB image, in small chunks, a
-wake-up a hand-over; over the boot the nodes spend about 5% of a core
-each in futex calls.  Not looked into further.
+at host load 5, 53-63 s at load 17-29, against 4-5 s of rendering.  It
+grows faster than N (load 13-24: 8 nodes 0.5 s, 16 1.7 s, 32 9 s, 48
+26 s, 64 46 s, 80 68 s), because it is messages: in an 8-node boot node
+0 sends about 1,950, 1,605 of them a single byte and most of the rest 60
+(`T4_LOCKSTEP_DEBUG=2`), the INMOS loaders' protocol, and every node
+forwards all of its successors'.  At 80 nodes that is about 900,000
+messages through the chain, each a thread wake-up at both ends (7.2
+million voluntary context switches before the menu appears), so the boot
+is bound by how fast the host wakes threads and slows sharply when its
+cores are busy.  A real link moves a one-byte message in about a
+microsecond.  Spinning instead of sleeping would cut the wake-ups but
+costs more than it saves on an oversubscribed host (above).
 
 **Waiting to be booted.**  A node waited 60 tries of `LTO_BOOT` (1 s)
 for its boot code and then gave up: a threaded node stopped the whole
@@ -1402,12 +1410,24 @@ it is booted or the network stops, which it does when node 0 ends, so a
 node nobody boots still ends with the run.  A process waits up to
 `T4_BOOT_WAIT` seconds (default 600): it cannot always tell that its node
 0 has gone (only the processes node 0 started itself hear it, through
-SharedEvents, and those now stop waiting at once).  With that, all 80
+SharedEvents, and those now stop waiting at once), or until it is sent a
+signal.  With that, all 80
 `-sl` processes are booted; loading the configured program through them
 still had not finished after 15 minutes at host load 60-70 (80 processes
 polling their mailboxes, and another project's jobs on 14 of the 20
 cores), where 64 took 129 s at load about 10.  `-sl` polls; only
 threaded nodes sleep on their links.
+
+Waiting without a limit exposed a bug the limit had hidden: the link a
+node is being booted on (`BootLink`, the one `linkcomms()` then listens
+on alone) was one variable for the whole process.  Once the first node of
+a threaded network was booted through its Link1, every other node waited
+for its boot on Link1 only, so a node booted through any other link never
+was; it used to give up after 60 s, and now would wait as long as the
+network ran.  Every shipped network boots all of its nodes through the
+same link number, which is why nothing showed it.  `BootLink` is now per
+node (`cpu_t`), and `tests/test_boot_links.c` boots node 1 through Link1
+and node 2 through Link2 (node 2 never booted before).
 
 **Where the line falls.**  The count of jobs out when the fill stops
 hardly depends on N: 30-47 at 24 nodes over several runs, 35-45 at 32

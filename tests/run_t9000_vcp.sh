@@ -27,7 +27,9 @@
 #                       guard's disc leaves the channel alone (ISM enbc, disc)
 #   test_timer_alt      one node: a timer ALT a channel won leaves the timer
 #                       list (ISM dist), one its time woke is queued once,
-#                       and one whose time has passed carries on (taltwt)
+#                       one a channel woke is queued once when its time
+#                       comes before it runs, one whose time has passed
+#                       carries on (taltwt), and the list keeps time order
 #   test_thread_timeslice two threaded nodes: low priority processes are
 #                       timesliced, and the low priority clock keeps time
 #                       (TCWG 6.3.1)
@@ -41,6 +43,8 @@
 #   test_timer_sleep    two threaded nodes: a node waiting only on a timer
 #                       sleeps, a link wakes it, and the timers keep time
 #                       (checked by t4's host CPU time too)
+#   test_boot_links     three threaded nodes booted through different links:
+#                       each node keeps its own boot link
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).
@@ -235,5 +239,12 @@ run_test test_timer_sleep \
     "$TESTS/test_timer_sleep.c $TOP/lib/transputer-conc.c" \
     5s SPYNET="$tmp/sync.map" -- -st -sn -2
 cpu_below test_timer_sleep 0.8
+# Node 1 booted on Link1, node 2 on Link2.  Without the fix node 2 listens
+# on Link1 only and node 0 waits for ever: the timeout is the verdict.
+printf '%s\n' 'Connect HOST to processor 0 link 0' \
+    'Connect processor 0 link 1 to processor 1 link 1' \
+    'Connect processor 0 link 2 to processor 2 link 2' >"$tmp/boot3.map"
+run_test test_boot_links "$TESTS/test_boot_links.c $TOP/lib/transputer-conc.c" \
+    6s SPYNET="$tmp/boot3.map" -- -st -sn -3
 
 exit $(( failures > 0 ))

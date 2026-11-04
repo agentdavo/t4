@@ -1643,6 +1643,8 @@ T4_THREAD_LOCAL uint32_t m2dLength;             /* move2d length (no. of rows) *
 #define ClearInterrupt          (t4cpu->s_sh.wdesc = NotProcess_p)
 #define ReadInterrupt           (NotProcess_p != GetDescWPtr(t4cpu->s_sh.wdesc))
 void t4_wake (uint32_t wdesc);
+void t4_wake_alt (uint32_t wdesc);
+static void purge_timer_of (uint32_t wptr, int pri);
 static void shadow_save (void);
 static void shadow_resume (void);
 static void shadow_transfer (uint32_t from, uint32_t to, uint32_t ptr, int store);
@@ -2748,7 +2750,10 @@ void update_tod (struct timeval *tp)
 #define C_PEEK  1
 #define C_BOOT  2
 
-static uint32_t BootLink = 0;
+/* BootLink, the link a node is being booted on, is per node (cpu_state.h):
+ * one for the whole process let the first node booted in a threaded
+ * network make every other node wait on its link number only, so a node
+ * booted through another link was never booted (2026-11-04). */
 /*
  * Boot-protocol state.
  *
@@ -3275,7 +3280,10 @@ void alt_channel(Channel *chan)
 
 			writeword (index (linkWPtr, State_s), Ready_p);
                         if (Waiting_p == altState)
+                        {
+                                purge_timer_of (linkWPtr, GetDescPriority (linkWdesc));
                                 schedule (linkWdesc);
+                        }
                 }
         }
         else
@@ -6466,7 +6474,7 @@ OprOut:                    if (__builtin_expect (T9K_EXTCHAN(BReg), 0))
 							/* ISM 8.7.3: only a Waiting ALT is descheduled;
 							 * an Enabling one is running or queued. */
 							if (Waiting_p == altState)
-								t4_wake (otherWdesc);
+								t4_wake_alt (otherWdesc);
 						}
           				}
 					else
@@ -6584,7 +6592,7 @@ DescheduleOut:
 							/* ISM 8.7.3: only a Waiting ALT is descheduled;
 							 * an Enabling one is running or queued. */
 							if (Waiting_p == altState)
-								t4_wake (otherWdesc);
+								t4_wake_alt (otherWdesc);
 						}
           				}
 					else
@@ -6694,7 +6702,7 @@ DescheduleOutByte:
 							/* ISM 8.7.3: only a Waiting ALT is descheduled;
 							 * an Enabling one is running or queued. */
 							if (Waiting_p == altState)
-								t4_wake (otherWdesc);
+								t4_wake_alt (otherWdesc);
 						}
           				}
 					else
@@ -11114,7 +11122,8 @@ int run_process (void)
  * At most LTO_IDLE, as for an idle node; stopped clocks never come due. */
 static long timer_wait_us (void)
 {
-        long best = LTO_IDLE * 1000L, us;
+        int64_t best = LTO_IDLE * 1000L, us;   /* 64 bits: a low priority
+                                                * time can be 2^31 ticks off */
         int prio;
 
         if (Timers != TimersGo)
@@ -11124,8 +11133,8 @@ static long timer_wait_us (void)
                 if (TPtrLoc[prio] == NotProcess_p ||
                     !(prio == HiPriority ? TimerEnableHi : TimerEnableLo))
                         continue;
-                us = (long)INT32(word (index (TPtrLoc[prio], Time_s)) -
-                                 ClockReg[prio]) + 1;
+                us = (int64_t)INT32(word (index (TPtrLoc[prio], Time_s)) -
+                                    ClockReg[prio]) + 1;
                 if (prio == LoPriority)
                         us *= 64;
                 if (us < best)
@@ -11640,8 +11649,8 @@ void insert (uint32_t time)
 			{
 				ptr = nextptr;
 				nextptr = word (index (ptr, TLink_s));
-				if (nextptr != NotProcess_p)
-					timetemp = word (index (ptr, Time_s));
+				if (nextptr != NotProcess_p)	/* the next one's time */
+					timetemp = word (index (nextptr, Time_s));
 			}
 
 			/* Insert into list. */
@@ -11651,28 +11660,26 @@ void insert (uint32_t time)
 	}
 }
 
-/* Purge a process from the timer queue, if it is there. */
-void purge_timer (void)
+/* Take the process with workspace wptr off the timer list of priority
+ * pri, if it is there. */
+static void purge_timer_of (uint32_t wptr, int pri)
 {
         uint32_t ptr;
 	uint32_t oldptr;
 
-        if (Idle)
-                return;
-
 	/* Delete any entries at the beginning of the list. */
-	while (TPtrLoc[ProcPriority] == WPtr)
+	while (TPtrLoc[pri] == wptr)
 	{
-	        TPtrLoc[ProcPriority] = word (index (WPtr, TLink_s));
+	        TPtrLoc[pri] = word (index (wptr, TLink_s));
 	}
 
-	ptr = TPtrLoc[ProcPriority];
+	ptr = TPtrLoc[pri];
 	oldptr = ptr;
 
 	/* List exists. */
 	while (ptr != NotProcess_p)
 	{
-		if (ptr == WPtr)
+		if (ptr == wptr)
 		{
 			ptr = word (index (ptr, TLink_s));
 			writeword (index (oldptr, TLink_s), ptr);
@@ -11683,6 +11690,28 @@ void purge_timer (void)
 			ptr = word (index (ptr, TLink_s));
 		}
 	}	
+}
+
+/* Purge the current process from the timer queue, if it is there. */
+void purge_timer (void)
+{
+        if (Idle)
+                return;
+        purge_timer_of (WPtr, ProcPriority);
+}
+
+/* A guard of the waiting ALT wdesc has become ready (ISM 8.7: "any
+ * communication to a waiting alternative causes the ALT state to be set to
+ * Ready.p" and the process is rescheduled, once).  A timer ALT comes off
+ * its timer list here, not at its dist: left on it, its time could come
+ * before the process ran its dist, and schedule_timerq() would schedule it
+ * a second time, the running or queued process, and then follow a link
+ * word its code was by then using - a timer list ending in 0, walked for
+ * ever (test_timer_alt, about one run in 30 on a loaded host).  dist
+ * decides by the clock, not by the list, so it chooses as before. */
+void t4_wake_alt (uint32_t wdesc)
+{
+        t4_wake (wdesc);
 }
 
 
@@ -11702,6 +11731,8 @@ void schedule_timerq (int prio)
 		         * channel that becomes ready before the process runs
 		         * must not schedule it again (ISM 8.7: only a Waiting
 		         * ALT is descheduled) */
+		        if (word (index (TPtrLoc[prio], State_s)) == Ready_p)
+		                fprintf (stderr, "[TQ] scheduling a Ready ALT #%08X prio %d%c", TPtrLoc[prio], prio, 10);
 		        if (word (index (TPtrLoc[prio], State_s)) == Waiting_p)
 		                writeword (index (TPtrLoc[prio], State_s), Ready_p);
 		        schedule (TPtrLoc[prio] | prio);
