@@ -38,6 +38,9 @@
 #   test_idle_mailbox   two threaded nodes: an idle node sleeps while a
 #                       packet no process is waiting for sits in one of its
 #                       link mailboxes (checked by t4's host CPU time)
+#   test_timer_sleep    two threaded nodes: a node waiting only on a timer
+#                       sleeps, a link wakes it, and the timers keep time
+#                       (checked by t4's host CPU time too)
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).
@@ -225,5 +228,12 @@ run_test test_idle_mailbox \
     "$TESTS/test_idle_mailbox.c $TOP/lib/transputer-conc.c" \
     4s SPYNET="$tmp/sync.map" -- -st -sn -2
 cpu_below test_idle_mailbox 1.5
+# About 1.7 s of timer waits.  Without the fix node 0 spins through all of
+# them; with it the network sleeps.  Node 1 stops once it has sent its
+# word and node 0 halts, so the run ends at the timeout.
+run_test test_timer_sleep \
+    "$TESTS/test_timer_sleep.c $TOP/lib/transputer-conc.c" \
+    5s SPYNET="$tmp/sync.map" -- -st -sn -2
+cpu_below test_timer_sleep 0.8
 
 exit $(( failures > 0 ))

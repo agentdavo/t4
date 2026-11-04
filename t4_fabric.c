@@ -96,19 +96,24 @@ static void idle_wake(t4_idle_t *id)
         pthread_mutex_unlock(&id->mu);
 }
 
-static void idle_deadline(struct timespec *ts, int timeout_ms)
+static void idle_deadline_us(struct timespec *ts, long timeout_us)
 {
 #ifdef CLOCK_MONOTONIC
         clock_gettime(CLOCK_MONOTONIC, ts);
 #else
         clock_gettime(CLOCK_REALTIME, ts);
 #endif
-        ts->tv_sec += timeout_ms / 1000;
-        ts->tv_nsec += (timeout_ms % 1000) * 1000000L;
+        ts->tv_sec += timeout_us / 1000000L;
+        ts->tv_nsec += (timeout_us % 1000000L) * 1000L;
         if (ts->tv_nsec >= 1000000000L) {
                 ts->tv_sec++;
                 ts->tv_nsec -= 1000000000L;
         }
+}
+
+static void idle_deadline(struct timespec *ts, int timeout_ms)
+{
+        idle_deadline_us(ts, (long)timeout_ms * 1000L);
 }
 
 static t4_router_t *router_by_id(t4_fabric_t *f, int id)
@@ -522,11 +527,16 @@ int t4_node_any_ready(int doBoot)
 
 int t4_node_idle_wait(cpu_t *c, int timeout_ms, int doBoot)
 {
+        return t4_node_idle_wait_us(c, (long)timeout_ms * 1000L, doBoot);
+}
+
+int t4_node_idle_wait_us(cpu_t *c, long timeout_us, int doBoot)
+{
         t4_idle_t *id;
         unsigned gen;
         struct timespec ts;
 
-        if (!c || !c->idle || timeout_ms <= 0)
+        if (!c || !c->idle || timeout_us <= 0)
                 return 0;
         if (t4_node_any_ready(doBoot))
                 return 1;
@@ -541,8 +551,8 @@ int t4_node_idle_wait(cpu_t *c, int timeout_ms, int doBoot)
                 if (use_futex) {
                         struct timespec fts;
                         unsigned gen = fid->idle_gen;
-                        fts.tv_sec = timeout_ms / 1000;
-                        fts.tv_nsec = (timeout_ms % 1000) * 1000000L;
+                        fts.tv_sec = timeout_us / 1000000L;
+                        fts.tv_nsec = (timeout_us % 1000000L) * 1000L;
                         if (!t4_node_any_ready(doBoot) && fid->idle_gen == gen)
                                 syscall(SYS_futex, &fid->idle_gen, FUTEX_WAIT_PRIVATE,
                                         gen, &fts, NULL, 0);
@@ -557,7 +567,7 @@ int t4_node_idle_wait(cpu_t *c, int timeout_ms, int doBoot)
                 return 1;
         }
         gen = id->idle_gen;
-        idle_deadline(&ts, timeout_ms);
+        idle_deadline_us(&ts, timeout_us);
         while (id->idle_gen == gen && !t4_net_stop_requested()) {
                 int rc = pthread_cond_timedwait(&id->cv, &id->mu, &ts);
                 if (rc == ETIMEDOUT)

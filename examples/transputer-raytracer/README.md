@@ -36,6 +36,7 @@ Values are in seconds.
 - As the framebuffer (=the main program) now runs as a whole at prio high, the PRI PAR at line 90 has been changes to PAR. If you configure the framebuffer process as the only module on an processor I would revert this.
 - There is an makefile and a few different configuration files. 
 - In renderPixels the output sequence must be 'done ! 42' BEFORE pixelsOut.
+- (t4, 2026-11-04) outputBuffer in cntlsys.occ queues every job loadBalance has a credit for. With a single slot the farm could deadlock: loadBalance blocked sending a job while the pixels only it takes back waited behind a renderer on that job's path. On long chains it nearly always did (24 threaded t4 nodes and more; by t4's model of real T800 links, 48 real ones). The images in bin/ are rebuilt with it; see t4's THREADED-NODES.md.
 
 ### Other implementations
 

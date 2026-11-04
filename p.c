@@ -2829,7 +2829,19 @@ int handleboot (Channel *chan, u_char *data, int ndata)
                                 chan->CtrlByte = C_UNKNOWN;
                                 break;
                         case C_BOOT:
-                                UpdateWdescReg (chan->Address | ProcPriority);
+                                /* TCWG 9 (booting from a link): Wdesc =
+                                 * ffw BITOR 1, "low priority, with
+                                 * workspace pointer at first free word of
+                                 * memory".  This took the priority reset
+                                 * left, high, so booted code ran at high
+                                 * priority and its timers ticked 64 times
+                                 * too fast.  The first free word is the end
+                                 * of the code rounded up: the INMOS
+                                 * loaders (icollect's bootstrap) fail one
+                                 * word higher, as the TCWG's "smallest
+                                 * word address > MemStart + Codelength"
+                                 * would put it, and -sb rounds the same. */
+                                UpdateWdescReg (((chan->Address + 3) & ~3u) | LoPriority);
                                 chan->CtrlByte = C_UNKNOWN;
                                 return 0;
                 }
@@ -11088,6 +11100,40 @@ int run_process (void)
 	return (0);
 }
 
+/* How long a threaded node with nothing to run but a timer sleeps.  The
+ * idle loop below only sleeps (in linkcomms) when the timer queues are
+ * empty, so a node waiting on a timer went round it polling the links,
+ * and a 2 s tin cost 2 s of a host core.  It now sleeps until TIMER_POLL_US
+ * before its first timer is due, or a link wakes it, and polls only that
+ * last stretch, so that a timer fires as promptly as it did. */
+#define TIMER_POLL_US   200
+
+/* Microseconds until the first process on an enabled timer queue is due:
+ * the high priority clock ticks every 1us, the low priority one every 64us
+ * (TCWG 6.3.1), and a process is due once its clock has passed its time.
+ * At most LTO_IDLE, as for an idle node; stopped clocks never come due. */
+static long timer_wait_us (void)
+{
+        long best = LTO_IDLE * 1000L, us;
+        int prio;
+
+        if (Timers != TimersGo)
+                return best;
+        for (prio = HiPriority; prio <= LoPriority; prio++)
+        {
+                if (TPtrLoc[prio] == NotProcess_p ||
+                    !(prio == HiPriority ? TimerEnableHi : TimerEnableLo))
+                        continue;
+                us = (long)INT32(word (index (TPtrLoc[prio], Time_s)) -
+                                 ClockReg[prio]) + 1;
+                if (prio == LoPriority)
+                        us *= 64;
+                if (us < best)
+                        best = us;
+        }
+        return best;
+}
+
 /* Start a process. */
 int start_process (void)
 {
@@ -11182,6 +11228,15 @@ int start_process (void)
                         return 1;
                 if (t4_net_stop_requested())
                         return 1;
+                /* nothing to run but a timer: sleep until it is nearly due
+                 * (timer_wait_us); a link event wakes the node sooner */
+                if (t4cpu->idle && ProcessQEmpty && !TimerQEmpty)
+                {
+                        long us = timer_wait_us ();
+
+                        if (us > TIMER_POLL_US)
+                                t4_node_idle_wait_us (t4cpu, us - TIMER_POLL_US, FALSE);
+                }
                 /* A pending SIGINT/SIGTERM is normally serviced at
                  * ExecuteInstr, which an idle emulator never reaches: a
                  * guest parked on a timer that never fires kept

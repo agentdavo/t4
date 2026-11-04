@@ -568,19 +568,59 @@ PROC controlSystem ( CHAN OF ANY out, back, graphics, CHAN OF INT image, VAL INT
   :
 
   PROC outputBuffer ( CHAN OF ANY in, out )
-    INT command :
-    SEQ
-      in ? command
-      WHILE command <> c.stop
-        SEQ
-          IF
-            command = c.render
-              INT x, y :
-              SEQ
-                in  ? x; y
-                out ! command; x; y
-          in ? command
-      out ! command
+    -- A queue with room for every job loadBalance has a credit for, so
+    -- that loadBalance never waits to send one.  With a single slot it
+    -- did: once a renderer on a job's path had finished, its throughPut
+    -- waited for the renderer's pixels to go, the pixels waited for
+    -- loadBalance, and loadBalance waited here, so the farm deadlocked
+    -- (t4's THREADED-NODES.md, "The reworked tracer at 24 nodes and
+    -- more").  The prompter takes the jobs out one at a time.
+    VAL slots IS 256 :    -- two credits a worker, for up to 128 workers
+    CHAN OF INT request :
+    CHAN OF ANY reply :
+    PAR
+      [slots][2] INT queue :
+      INT head, count, command, dummy :
+      BOOL stopped, running :
+      SEQ
+        head, count := 0, 0
+        stopped, running := FALSE, TRUE
+        WHILE running
+          ALT
+            ((NOT stopped) AND (count < slots)) & in ? command
+              IF
+                command = c.render
+                  VAL tail IS (head + count) \ slots :
+                  SEQ
+                    in ? queue [tail][0]; queue [tail][1]
+                    count := count + 1
+                command = c.stop
+                  stopped := TRUE
+            (stopped OR (count > 0)) & request ? dummy
+              IF
+                count > 0
+                  SEQ
+                    reply ! c.render; queue [head][0]; queue [head][1]
+                    head, count := (head + 1) \ slots, count - 1
+                TRUE
+                  SEQ
+                    reply ! c.stop
+                    running := FALSE
+      INT command, x, y :
+      SEQ
+        command := c.render
+        WHILE command <> c.stop
+          SEQ
+            request ! 0
+            reply ? command
+            IF
+              command = c.render
+                SEQ
+                  reply ? x; y
+                  out ! command; x; y
+              TRUE
+                SKIP
+        out ! c.stop
   :
 
   PROC returnBuffer ( CHAN OF ANY in, out, [256] INT buffer )

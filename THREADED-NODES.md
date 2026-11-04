@@ -1265,7 +1265,9 @@ is from a current compiler.
 The hang is the farm deadlock `testall.sh` describes, reached during the
 opening fill, and it is the program's.  The spinning was a separate t4
 bug, now fixed: idle nodes holding a packet no process was ready for
-never slept.
+never slept.  The program is fixed too, later the same day ("The fix, in
+the program", below): every arrangement now renders under every link
+transport.
 
 **What every node waits on.**  `T4_NET_DUMP=1` prints, with the exit
 report (so `timeout -s INT` works), every node of a threaded network:
@@ -1325,12 +1327,23 @@ pixels and loadBalance earns another credit before it is through (the
 8-node runs that stop after some 850 jobs on a loaded host); that one is
 open on real hardware as well, only with a far narrower window.
 
-**What would fix it** is in the occam: an outputBuffer that can hold
-every credited job (2N), so that loadBalance never blocks sending one
-and always gets back to taking patches.  Swapping the `PRI ALT`'s guards
-is not enough, since loadBalance can still block in `out !` with a patch
-arriving behind it.  The images would have to be rebuilt with the INMOS
-toolset (`occ/makefile`, `mknumprocs.sh`); not done.
+**The fix, in the program.**  outputBuffer (`occ/cntlsys.occ`) is now a
+queue with room for every credited job (256 slots, two credits a worker
+for up to 128 workers) and a prompter that hands throughPut0 one job at
+a time, so loadBalance never blocks sending a job and always gets back to
+taking patches; the cycle has nothing left to close it.  Swapping the
+`PRI ALT`'s guards would not have been enough, since loadBalance could
+still block in `out !` with a patch arriving behind it.  A job is only
+held longer at node 0, never added, so the credits still bound how many
+jobs the workers hold.  The images were rebuilt with the INMOS D7205
+toolset, which runs on t4 (`~/d7205` in WSL, `occ/makefile` with
+`raytrace.cfs.temp`, as `mknumprocs.sh`, except that the 16-node image
+comes from `other/raytrace.cfs.c215`, a chain through links 1 and 0,
+which `mknumprocs.sh` would not make); rebuilt from the old source they
+reproduce `raytrace8.btl`, `raytrace16.btl` and their maps byte for byte,
+and every new map has the old network, so the new images differ by the
+queue alone.  Every arrangement now renders the reference
+image (table below).
 
 **Why the nodes spun.**  An idle node waits in `linkcomms()` on the
 links its processes are waiting on, and `t4_node_idle_wait()` first asks
@@ -1357,9 +1370,9 @@ handover now costs a thread wake-up, and a renderer's pixels take longer
 to clear.  At 16 nodes on the 20-core host (load 1-7, the two builds
 alternating) the farm finished 5 times in 25 with the fix and 12 in 23
 with only the predicate reverted; at 8 nodes 8 in 10 and 9 in 10; from 24
-nodes up both deadlock every time.  Spinning for a few tens of
-microseconds before sleeping might win the latency back without the
-cost of a hung run; not tried.
+nodes up both deadlock every time.  With the program fixed the farm
+cannot deadlock, so the wake-ups now cost only time; a spin of a few tens
+of microseconds before sleeping might win some back, not tried.
 
 **Where the line falls.**  The count of jobs out when the fill stops
 hardly depends on N: 30-47 at 24 nodes over several runs, 35-45 at 32
@@ -1375,8 +1388,9 @@ deadlock in the fill as well.  Node time counts instructions, not cycles,
 so that is an estimate, but it puts the fault in the program's design,
 not in how fast t4's links are.
 
-**Arrangements** (`testall.sh`, model 3, 20-core host at load 0-2
-unless noted; `--limit 60`, the window runs `--limit 400`):
+**Arrangements before the program fix** (`testall.sh`, model 3, 20-core
+host at load 0-2 unless noted; `--limit 60`, the window runs `--limit
+400`):
 
 | N | `--threads` | `--threads`, in-tree t4 (old predicate) | `--threads`, `T4_LOCKSTEP_WINDOW=256` | `--ipc` |
 |---|---|---|---|---|
@@ -1404,9 +1418,49 @@ killed, and at 80 the last five nodes gave up waiting (60 tries of
 `LTO_BOOT`).  A deadlocked threaded network is idle now: at 80 nodes
 all 81 threads sleep.
 
-**Still spinning: a timer wait.**  A threaded node whose only process
-waits on a timer does not sleep either: with the timer queue non-empty,
-`start_process()` polls the links with `LTO_COMM` (no wait) and goes
-round again, so a 2 s `tin` costs 2 s of host CPU (measured: 4.07 s of
-CPU in a 4.1 s run).  The ray tracer's farm has no timer waits, so this
-played no part here.  Not fixed.
+**Arrangements with the program fixed** (20-core host; every run
+rendered the reference image):
+
+| | t4 cbd2ad1, load 1-12 | with the timer, boot and `-s9` changes below, load 13-30 |
+|---|---|---|
+| `--threads`, sizes 1-80, models 1-4 | 52 of 52, 0-19 s a run (80 nodes 13-17 s) | 52 of 52, 3-112 s (80 nodes 48-112 s) |
+| `--ipc`, sizes 1-80, model 3 | 13 of 13, 2-7 s | 13 of 13, 3-10 s |
+| `-sl`, model 3 | 1-64 pass (5-129 s); 80 had not booted in 180 s | 2, 8, 24, 48 pass (9-81 s) |
+
+The second column's times are the host's load (another project took
+15 of the 20 cores), not the changes: the same images rendered in the
+same time with the old and the new boot, run alternately.
+
+**A timer wait spun too.**  A threaded node whose only process waited on
+a timer did not sleep either: with the timer queue non-empty,
+`start_process()` polled the links with `LTO_COMM` (no wait) and went
+round again, so a 2 s `tin` cost 2 s of host CPU (4.07 s of CPU in a
+4.1 s run).  It now sleeps until 200 us before its first timer is due
+(`timer_wait_us()`: the high priority clock ticks every 1us, the low
+every 64us, TCWG 6.3.1), or until a link wakes it, and polls only that
+last stretch, so a timer fires as promptly as before.  One node alone
+(no fabric) is unchanged.  `tests/test_timer_sleep.c`: a word that
+arrives while node 0 sleeps on a 2 s timer guard wins the ALT about
+200 ms in, and 1 s at low priority and 0.5 s at high priority end on
+time; 1.8 s of host CPU before, 0.3 s after.  The ray tracer's farm has
+no timer waits, so this played no part in its hang.
+
+**Link-booted code ran at high priority.**  Writing that test showed it:
+t4 started the code a node booted from a link with the priority reset
+had left, high.  The TCWG (chapter 9, booting from a link) gives `Wdesc
+= ffw BITOR 1`: "low priority, with workspace pointer at first free word
+of memory".  So a booted node's `tin` of 3125 ticks lasted 3 ms instead
+of 200 ms (`test_link_sync`'s node 1 says "200 ms at low priority, as
+booted"), and every worker of the ray tracer started its configured
+program at high priority, not the low priority its `PRI PAR` is written
+for.  `handleboot()` now boots at low priority; `test_timer_sleep` fails
+without it (its node 1 sends after ~50 low priority ticks).  The images
+are unchanged, but the farm shares the work out differently: the nodes
+near node 0 now render more of it (`testall.sh`'s imbalance, model 3:
+8 workers 140% where it was 7%, 16 workers 257% where it was 21%).  The
+first free word stays the end of the code rounded up to a word, as `-sb`
+(which loads node 0 from the file, already at low priority) rounds it:
+the TCWG also defines ffw as "the smallest word address > MemStart +
+Codelength", one word higher when the code ends on a word, and the INMOS
+loaders (icollect's bootstrap) wild-jump there, so they were written for
+the first reading.

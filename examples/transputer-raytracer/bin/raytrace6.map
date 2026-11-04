@@ -19,18 +19,18 @@ Load Start is 80000150,  HALT ON ERROR
 
   LOW priority process 'framebuf.p' 
     Code from 'cntlsys.lku', file offset 2
-                                             #8000087C  #80001568      3308
+                                             #800008B8  #80001670      3512
     Code from 'framebuf.lku', file offset 2
-                                             #80001568  #80002B88      5664
+                                             #80001670  #80002C90      5664
     Code from 'raytrace.lku', file offset 2
-                                             #80002B88  #80005B60     12248
+                                             #80002C90  #80005C68     12248
     Code from 'raytrace.clu', file offset 2
-                                             #80005B60  #80005BEC       140
-      Entry address                          #80005B61 
-    Workspace                                #80000150  #80000854      1796
-    Vectorspace                              #80005BEC  #80051A40    310868
+                                             #80005C68  #80005CF4       140
+      Entry address                          #80005C69 
+    Workspace                                #80000150  #80000890      1856
+    Vectorspace                              #80005CF4  #800522D0    312796
 
-  Parameter data                             #80051A40  #80051BD8       408
+  Parameter data                             #800522D0  #80052468       408
 
 
 Memory map for 'System[1]' processor 1 T800
