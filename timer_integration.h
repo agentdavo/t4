@@ -18,6 +18,7 @@ typedef struct {
     _Atomic int      *ptimeslice;
     _Atomic int      *pTimers;
     int                TimersGo_val; /* Value that means "timers running" */
+    int                timeslice_us; /* A timeslice period: 1024us, T9000 256us */
 
     /* Thread control */
     _Atomic int running;

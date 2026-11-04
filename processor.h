@@ -67,11 +67,17 @@ extern uint32_t CLineTagsSize;
 
 extern uint32_t CoreSize;
 
-#define IsT800  (Txxx == 800 || Txxx == 806)
+/* IsT800: the T800's instructions and FPU, which the T9000 (-s9) has too */
+#define IsT800  (Txxx == 800 || Txxx == 806 || Txxx == 9000)
 #define IsT806  (Txxx == 806)
+#define IsT9000 (Txxx == 9000)
 #define IsT414  (Txxx == 414)
 #define IsT425  (Txxx == 425)
 #define IsTVS   (Txxx == 1144)
+
+/* A timeslice period ends every 1024 ticks of the high priority clock
+ * (TCWG 6.3.1), on the T9000 every 256 (ISM 8.2.4, HRM 3.3). */
+#define TimeslicePeriodUs (IsT9000 ? 256 : 1024)
 
 /* -s414 / -s425: 414 or 425 to stop on a secondary instruction that part
  * lacks, 0 to execute every instruction t4 knows (see p.c). */

@@ -4463,6 +4463,7 @@ void mainloop (void)
 	if (Txxx == 414)      ProductIdentity = 0x00000000;  /* T414 */
 	else if (Txxx == 800) ProductIdentity = 0x00000005;  /* T800-20 */
 	else if (Txxx == 806) ProductIdentity = 0x00000806;  /* T806 (custom 200MHz) */
+	else if (Txxx == 9000) ProductIdentity = 300;        /* T9000 (ISM table A.14) */
 	else                  ProductIdentity = 0x00000000;
 
 	/* T806: Custom 200MHz T800 variant. */
@@ -4476,6 +4477,7 @@ void mainloop (void)
 		g_timer_bridge.ptimeslice = &timeslice;
 		g_timer_bridge.pTimers = &Timers;
 		g_timer_bridge.TimersGo_val = TimersGo;
+		g_timer_bridge.timeslice_us = TimeslicePeriodUs;
 		g_timer_threaded = timer_bridge_start(&g_timer_bridge);
 	} else
 		g_timer_threaded = 1;
@@ -11582,10 +11584,11 @@ INLINE void update_time (void)
                 if (TimerEnableLo)
                         schedule_timerq (LoPriority);
 
-		if (count3 > 16) /* ~ 1024us */
+		/* a timeslice period in 64us ticks: 16, on the T9000 4 */
+		if (count3 > TimeslicePeriodUs / 64)
 		{
-		        timeslice += (count3 / 16);
-		        count3     = count3 & 15;
+		        timeslice += (count3 / (TimeslicePeriodUs / 64));
+		        count3     = count3 % (TimeslicePeriodUs / 64);
 		}
 				
 #ifdef __MWERKS__

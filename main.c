@@ -488,6 +488,7 @@ int main (int argc, char **argv)
                 printf("    -s4                  Select T414 mode. (default)\n");
                 printf("    -s8                  Select T800 mode.\n");
                 printf("    -s806                Select T806 mode (T800 @ 200MHz).\n");
+                printf("    -s9                  Select T9000 mode (256us timeslice period).\n");
                 printf("    -s414, -s425         Select a T414 or T425 (no FPU) that stops on any\n");
                 printf("                         instruction it lacks; -s4 runs them all.\n");
 #ifndef NDEBUG
@@ -601,6 +602,22 @@ int main (int argc, char **argv)
 					  else
                                           {
                                                 Txxx=800;
+                                                CoreSize    = 4 * 1024;
+                                                MemStart    = 0x80000070;
+                                                ExtMemStart = 0x80001000;
+                                          }
+					  break;
+				case '9': if (argv[arg][3]!='\0')
+					  {
+						cmdline_cat (CommandLineMost, argv[arg]);
+						cmdline_cat (CommandLineMost, " ");
+					  }
+					  else
+                                          {
+                                                /* T9000: the T800's memory
+                                                 * map, the T9000's timeslice
+                                                 * period and device id */
+                                                Txxx=9000;
                                                 CoreSize    = 4 * 1024;
                                                 MemStart    = 0x80000070;
                                                 ExtMemStart = 0x80001000;
@@ -1006,7 +1023,8 @@ int main (int argc, char **argv)
                                 cmdargs[1] = "-sl";
                                 cmdargs[2] = "-sn";
                                 cmdargs[3] = snid;
-                                cmdargs[4] = (Txxx == 806) ? "-s806" : (Txxx == 800) ? "-s8" :
+                                cmdargs[4] = (Txxx == 9000) ? "-s9" :
+                                             (Txxx == 806) ? "-s806" : (Txxx == 800) ? "-s8" :
                                              (t4_isa_strict == 414) ? "-s414" :
                                              (t4_isa_strict == 425) ? "-s425" : NULL;
                                 cmdargs[5] = NULL;

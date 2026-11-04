@@ -31,6 +31,10 @@
 #   test_thread_timeslice two threaded nodes: low priority processes are
 #                       timesliced, and the low priority clock keeps time
 #                       (TCWG 6.3.1)
+#   test_timeslice_*    one node and two threaded nodes: a low priority
+#                       process is timesliced after two periods, 256us
+#                       each on a T9000 (-s9, ISM 8.2.4) and 1024us on a
+#                       T800 (TCWG 6.3.1)
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).
@@ -184,6 +188,16 @@ run_test test_link_sync \
 # run ends at the timeout either way.
 run_test test_thread_timeslice \
     "$TESTS/test_thread_timeslice.c $TOP/lib/transputer-conc.c" \
+    5s SPYNET="$tmp/sync.map" -- -st -sn -2
+# The timeslice period follows the part: -s9 after the -s806 every test
+# gets makes a T9000.  One node and a threaded network take separate paths
+# through the timer thread; the threaded runs end at the timeout.
+ts_src="$TESTS/test_timeslice_period.c $TOP/lib/transputer-conc.c"
+run_test test_timeslice_t9000 "$ts_src -DEXPECT_T9000=1" 10s -- -s9
+run_test test_timeslice_t800 "$ts_src -DEXPECT_T9000=0" 10s
+run_test test_timeslice_t9000_net "$ts_src -DEXPECT_T9000=1" \
+    5s SPYNET="$tmp/sync.map" -- -s9 -st -sn -2
+run_test test_timeslice_t800_net "$ts_src -DEXPECT_T9000=0" \
     5s SPYNET="$tmp/sync.map" -- -st -sn -2
 
 exit $(( failures > 0 ))

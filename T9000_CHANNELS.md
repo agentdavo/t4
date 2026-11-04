@@ -455,6 +455,23 @@ IsPprocess) plus bit 28 for T4's HaltOnError.
 `swapgstatus` (OReg -9) is not an ISM instruction and still stops the
 emulator with a message.
 
+## Timeslicing (ISM 8.2.4, 13.5; HRM 3.3)
+
+`-s9` selects the T9000 part: the T800's memory map (MemStart
+`#80000070`), instructions and FPU, `lddevid` 300 (ISM table A.14), and a
+timeslice period of 256 µs where every other part has the T800's 1024 µs
+(TCWG 6.3.1).  The other tests here run as `-s806`, a T800 core, which
+executes the T9000 instructions too.  A low priority process is
+descheduled at its next `j` or `lend` once two periods have ended since it
+started, so one that takes over from a timeslice runs for 512 µs on a
+T9000 and 2048 µs on a T800.  `settimeslice` and `intdis` suppress that,
+and `timeslice` forces one.
+
+Not modelled: for a P-process every interrupt point is a timeslicing point,
+and a timeslice traps to its supervisor (`t.Time`; ISM table 8.4, 10.3,
+13.5).  t4 timeslices a P-process only at `j` and `lend`, and reschedules
+it as it would an L-process.
+
 ## Network timing and C programs on every node
 
 **Booting.**  In a threaded network each node other than 0 normally waits
@@ -565,6 +582,10 @@ same FFN on an 8-node hypercube of byte-stream links takes 6.73 ms.
   guard of 2 is true and a false guard's `disc` leaves the channel word
   alone (ISM `enbc`, `disc`, `enbs`, `diss`); and the `eqc;cj` and `gt;cj`
   pairs t4 fuses leave a taken jump's 0 in A, as `cj` does (ISM `cj`).
+* `tests/test_timeslice_period.c` - two low priority processes spinning
+  through a `j` take 32 turns, which must last 32 x 512 µs at `-s9` and
+  32 x 2048 µs at `-s806` (to 25%; measured within 1%), on one node and on
+  two threaded nodes.  `lddevid` confirms the part.
 
 Run them with `make -f Makefile.linux test-vcp` or `tests/run_t9000_vcp.sh`
 (`T4_BIN` picks the emulator).  They build with `transputer-tcc` and

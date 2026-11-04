@@ -20,6 +20,7 @@ static int timer_thread_fn(void *arg)
     struct timeval last, now;
     int lo_accum = 0;
     int ts_accum = 0;
+    int ts_period = tb->timeslice_us > 0 ? tb->timeslice_us : 1024;
 
     gettimeofday(&last, NULL);
 
@@ -54,9 +55,9 @@ static int timer_thread_fn(void *arg)
                     }
                 }
                 ts_accum += (int)elapsed_us;
-                if (ts_accum >= 1024 && tb->ptimeslice) {
-                    *tb->ptimeslice += ts_accum / 1024;
-                    ts_accum &= 1023;
+                if (ts_accum >= ts_period && tb->ptimeslice) {
+                    *tb->ptimeslice += ts_accum / ts_period;
+                    ts_accum %= ts_period;
                 }
                 n = 0;
             }
@@ -64,8 +65,9 @@ static int timer_thread_fn(void *arg)
              * so the remainders carry over in one pair of accumulators.
              * Dividing each ~100us step alone gave the low priority clock
              * only one or two 64us ticks a step and the timeslice none
-             * (TCWG 6.3.1: a period ends every 1024us), so a low priority
-             * process was descheduled only when this thread overslept. */
+             * (TCWG 6.3.1: a period ends every 1024us; ISM 8.2.4: 256us
+             * on the T9000), so a low priority process was descheduled
+             * only when this thread overslept. */
             if (n > 0) {
                 int lo_ticks, ts_ticks;
 
@@ -73,8 +75,8 @@ static int timer_thread_fn(void *arg)
                 lo_ticks = lo_accum / 64;
                 lo_accum &= 63;
                 ts_accum += (int)elapsed_us;
-                ts_ticks = ts_accum / 1024;
-                ts_accum &= 1023;
+                ts_ticks = ts_accum / ts_period;
+                ts_accum %= ts_period;
                 for (i = 0; i < n; i++) {
                     cpu_t *c = list[i];
                     if (!c)
