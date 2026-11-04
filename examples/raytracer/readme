@@ -64,7 +64,9 @@ deadlocks.  ../transputer-raytracer is the reworked version.
 T4_LOCKSTEP=1 makes every image exact: it orders link events by each
 node's instruction count, so a descheduled node no longer lets the others
 overtake it (../../THREADED-NODES.md, "Node time").  28 of 28 runs, every
-arrangement and model, under host load:
+arrangement and model, under host load; 28 of 28 again on 2026-11-04,
+with the threaded timer fixed, when 14 of 28 lacked a patch without
+T4_LOCKSTEP:
 
 	T4_LOCKSTEP=1 SPYNET=raytrace10.map; export T4_LOCKSTEP SPYNET
 	echo 3 | t4 -st -s8 -sn -10 -sb raytrace10.btl

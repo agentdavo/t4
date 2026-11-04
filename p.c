@@ -2837,9 +2837,11 @@ int handleboot (Channel *chan, u_char *data, int ndata)
         return 1;
 }
 
-/* T4_LOCKSTEP stamps a link mailbox's packet with its sender's time and its
- * acknowledge (the emptied mailbox) with the receiver's, in the SCH_STAMP
- * slot, which T4_T9K_NET uses for itself when it is on (t4_fabric.c). */
+/* T4_LOCKSTEP stamps a link mailbox's packet with the time it reaches the
+ * receiver (its sender's, plus the transfer time T4_LOCKSTEP_LINK gives)
+ * and its acknowledge (the emptied mailbox) with the time that reaches the
+ * sender, in the SCH_STAMP slot, which T4_T9K_NET uses for itself when it
+ * is on (t4_fabric.c). */
 static int sch_stamped (Channel *chan)
 {
         return t4_ls_stamps && chan->schbuf && !(t9k.enabled && t9k.net_on);
@@ -2864,6 +2866,50 @@ static void sch_set_stamp (Channel *chan, uint64_t t)
 static int sch_visible (Channel *chan)
 {
         return !sch_stamped (chan) || t4_ls_visible (sch_stamp (chan));
+}
+
+/* When a transfer on a link could start: no earlier than `t`, nor than the
+ * process waiting on it began to wait.  A busy node notices a packet or an
+ * acknowledge only once its own time has passed the stamp, perhaps far
+ * past it; a process that had been waiting would have had it at once. */
+static uint64_t sch_posted (Channel *chan, uint64_t t)
+{
+        uint64_t p = chan->ls_post ? chan->ls_post : t4_ls_now ();
+
+        return p > t ? p : t;
+}
+
+static void sch_trace (const char *what, Channel *chan, int len,
+                       uint64_t from, uint64_t to)
+{
+        fprintf (stderr, "[LS] n%d t=%llu L%d %s len=%d post=%llu %llu -> %llu\n",
+                 t4cpu->cpu_nodeid, (unsigned long long)t4_ls_now (),
+                 chan->linkno, what, len, (unsigned long long)chan->ls_post,
+                 (unsigned long long)from, (unsigned long long)to);
+}
+
+/* An In mailbox emptied: its acknowledge reaches the sender T4_LOCKSTEP_LINK's
+ * A after the packet was taken */
+static void sch_stamp_ack (Channel *chan)
+{
+        uint64_t a = sch_stamp (chan), t = sch_posted (chan, a) + t4_ls_ack;
+
+        if (t4_ls_trace)
+                sch_trace ("take", chan, 0, a, t);
+        sch_set_stamp (chan, t);
+}
+
+/* An Out mailbox filled: sent no earlier than the last packet was taken,
+ * arriving B*n+P later */
+static void sch_stamp_send (Channel *chan, int ndata)
+{
+        uint64_t a = sch_stamp (chan), t;
+
+        t4_ls_advance (a);
+        t = sch_posted (chan, a) + t4_ls_pkt + (uint64_t)t4_ls_byte * ndata;
+        if (t4_ls_trace)
+                sch_trace ("send", chan, ndata, a, t);
+        sch_set_stamp (chan, t);
 }
 
 int channel_ready (Channel *chan)
@@ -2938,7 +2984,9 @@ static int channel_recv (Channel *chan, u_char *data, int doWait, int hold)
                         if (!hold)
                         {
                                 if (sch_stamped (chan))
-                                        sch_set_stamp (chan, t4_ls_now ());
+                                        sch_stamp_ack (chan);
+                                else if (t4_ls_trace)
+                                        sch_trace ("take", chan, 0, 0, 0);
                                 SCHSetLength(chan, 0);
                                 t4_wake_node_id(chan->peer);
                         }
@@ -3015,8 +3063,10 @@ int channel_recvmemP (Channel *chan, u_char *data, int doMemWrite, int doWait)
                 chan->Address += n; chan->Length -= n;
                 if (0 == chan->npend && chan->schbuf)
                 {
-                        if (sch_stamped (chan))   /* the acknowledge's time */
-                                sch_set_stamp (chan, t4_ls_now ());
+                        if (sch_stamped (chan))
+                                sch_stamp_ack (chan);
+                        else if (t4_ls_trace)
+                                sch_trace ("take", chan, 0, 0, 0);
                         SCHSetLength(chan, 0);
                         t4_wake_node_id(chan->peer);
                 }
@@ -3061,12 +3111,10 @@ int channel_sendP (Channel *chan, u_char *data, int ndata, int doWait)
                         }
 #endif
                         memcpy (&chan->schbuf[SCH_DATA], data, ndata);
-                        /* sent no earlier than the last one was taken */
                         if (sch_stamped (chan))
-                        {
-                                t4_ls_advance (sch_stamp (chan));
-                                sch_set_stamp (chan, t4_ls_now ());
-                        }
+                                sch_stamp_send (chan, ndata);
+                        else if (t4_ls_trace)
+                                sch_trace ("send", chan, ndata, 0, 0);
                         if (t9k.enabled && t9k.net_on)
                         {
                                 uint64_t ready = t9k_net_ready (chan->linkno, (uint32_t)ndata);
@@ -3159,6 +3207,11 @@ int Psend_channel (Channel *chan, uint32_t address, uint32_t len)
          * outputter waits, and linkcomms() skips the link until it is
          * started again (HRM 13.7.2) */
         if (t4cpu->s_link_halted & (1u << chan->linkno))
+                return 1;
+        if (sch_stamped (chan))
+                chan->ls_post = t4_ls_now ();
+        /* nor before the last packet's acknowledge has come back */
+        if (chan->schbuf && !sch_visible (chan))
                 return 1;
 
         chan->Address = address;
@@ -3595,6 +3648,7 @@ Channel *reset_channel (uint32_t addr)
         chan->Address = MostNeg;
         chan->Length  = 0;
         chan->ackwait = 0;
+        chan->ls_post = 0;
         chan->CtrlByte = C_UNKNOWN;   /* a reset abandons any part-read packet */
 
         return chan;
@@ -4613,8 +4667,9 @@ void mainloop (void)
                         } else {
                                 update_time();
                         }
-                        /* T4_LOCKSTEP_WINDOW: wait while far ahead of the slowest node */
-                        if (t4_ls_window)
+                        /* T4_LOCKSTEP: publish this node's time, and with
+                         * a window wait while far ahead of the slowest */
+                        if (t4_ls_active)
                                 t4_ls_tick();
 
                         {
@@ -6173,6 +6228,8 @@ OprIn:                     if (__builtin_expect (T9K_EXTCHAN(BReg), 0))
                                 {
 DescheduleIn:
 				        writeword (BReg, Wdesc);
+                                        if (t4_ls_stamps && 0 == Link[TheLink(BReg)].In.ls_post)
+                                                Link[TheLink(BReg)].In.ls_post = t4_ls_now ();
                                         Link[TheLink(BReg)].In.Address = CReg;
                                         Link[TheLink(BReg)].In.Length  = AReg;
                                         PROFILE(Link[TheLink(BReg)].In.IOBytes += AReg);
@@ -6970,6 +7027,8 @@ DescheduleOutWord:
 			   {
 				EMUDBG ("-I-EMUDBG: disc(3): Not taking this branch.\n");
 				AReg = false_t;
+                                if (IsLinkIn(CReg))     /* not waiting for it after all */
+                                        Link[TheLink(CReg)].In.ls_post = 0;
 			   }
 			   IPtr++;
 			   break;
@@ -7238,6 +7297,8 @@ DescheduleOutWord:
                                 {
 
 					EMUDBG2 ("-I-EMUDBG: enbc(3): Link%dIn.\n", link);
+                                        if (t4_ls_stamps)       /* waiting from here */
+                                                Link[link].In.ls_post = t4_ls_now ();
                                         if (0 == channel_ready (&Link[link].In))
                                         {
 						EMUDBG ("-I-EMUDBG: enbc(4): Ready link: (W-3)=Ready_p\n");

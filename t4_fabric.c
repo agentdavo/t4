@@ -139,7 +139,7 @@ int t4_net_stop_requested(void)
         return atomic_load(&t4_net_quit_flag) != 0;
 }
 
-/* ---- node time (T4_LOCKSTEP, T4_LOCKSTEP_WINDOW) --------------------------
+/* ---- node time (T4_LOCKSTEP, T4_LOCKSTEP_WINDOW, T4_LOCKSTEP_LINK) --------
  *
  * Each node of a threaded network is a host thread, scheduled as the host
  * likes: one descheduled for a few milliseconds lets the rest of the
@@ -152,14 +152,25 @@ int t4_net_stop_requested(void)
  * node with nothing to run, or not yet booted, is parked.
  *
  * T4_LOCKSTEP=1 orders link events by that time.  A packet in a link
- * mailbox carries its sender's time and the mailbox's acknowledge
- * (emptying it) the receiver's, both in the SCH_STAMP slot unless
- * T4_T9K_NET uses it.  A running node sees either only once its own time
- * has reached the stamp; a parked one takes it at once and jumps to it
- * (p.c, sch_visible).  So every link event happens no earlier than the
- * event that caused it, whatever the host does.  The ray tracer's farm at
- * 10 nodes under host load: every image exact (8 of 8; 0 of 8 without),
- * at about the same speed.
+ * mailbox carries the time it reaches the receiver and the mailbox's
+ * acknowledge (emptying it) the time that reaches the sender, both in the
+ * SCH_STAMP slot unless T4_T9K_NET uses it.  A running node sees either
+ * only once its own time has reached the stamp; a parked one takes it at
+ * once and jumps to it (p.c, sch_visible).  So every link event happens no
+ * earlier than the event that caused it, whatever the host does.  The ray
+ * tracer's farm at 10 nodes under host load: every image exact (8 of 8; 0
+ * of 8 without), at about the same speed.
+ *
+ * A transfer is stamped from when it could start, not from when a busy
+ * node noticed it could: the packet from when its out was executed or the
+ * last acknowledge came back, the acknowledge from when the packet arrived
+ * or the process that takes it began to wait (Channel.ls_post: the in, or
+ * the enbc of the ALT that chose it).  T4_LOCKSTEP_LINK=B,P,A adds a
+ * transfer time, in instructions: B a byte plus P a packet to the packet's
+ * stamp, A to the acknowledge's.  It is 0,0,0 by default; a T800 at 20 MHz
+ * with 20 Mbit/s links is about 3,0,1 (0.58us a byte at ~3.5 cycles an
+ * instruction).  Neither changed the reworked occam tracer's deadlock
+ * (THREADED-NODES.md).
  *
  * T4_LOCKSTEP_WINDOW=W also bounds the skew: every timer tick (64
  * instructions) a node publishes its time and waits while it is more than
@@ -174,7 +185,11 @@ int t4_net_stop_requested(void)
  * stamps cannot - but it costs: W=256 made the same farm render 5-15 times
  * slower, and the stamps alone already make it exact.
  *
- * Time is instructions, not cycles, and a link transfer takes none.
+ * Time is instructions, not cycles.  Timeslices still come from the host's
+ * clock (timer_integration.c), so how many instructions a low priority
+ * process gets before it is timesliced depends on the host.
+ * T4_LOCKSTEP_DEBUG=1 prints every node's time when the network stops,
+ * and how much of it was jumped; 2 also prints every link send and take.
  * Threaded networks only: -sl nodes are processes, which this does not
  * reach, and a packet through a C104 keeps its sender's stamp but its
  * acknowledge carries none. */
@@ -183,9 +198,12 @@ typedef struct t4_ls_node {
         _Atomic int      parked;
         uint64_t         offset;        /* owner only */
         uint64_t         floor;         /* owner only: <= the current minimum */
+        uint64_t         by_stamp;      /* owner only: time jumped to stamps */
+        uint64_t         by_rejoin;     /* owner only: time jumped on unparking */
 } __attribute__((aligned(64))) t4_ls_node_t;
 
-int t4_ls_active, t4_ls_stamps, t4_ls_window;
+int t4_ls_active, t4_ls_stamps, t4_ls_window, t4_ls_trace;
+uint32_t t4_ls_byte, t4_ls_pkt, t4_ls_ack;
 static t4_ls_node_t *ls_nodes;
 static _Atomic uint64_t ls_lwm;
 extern volatile sig_atomic_t t4_sig_pending;
@@ -202,6 +220,15 @@ static void ls_create(int nnodes)
         t4_ls_window = e && *e ? atoi(e) : 0;
         if (t4_ls_window < 0)
                 t4_ls_window = 0;
+        e = getenv("T4_LOCKSTEP_LINK");         /* byte,packet,ack */
+        if (e && *e) {
+                unsigned b = 0, p = 0, a = 0;
+
+                sscanf(e, "%u,%u,%u", &b, &p, &a);
+                t4_ls_byte = b; t4_ls_pkt = p; t4_ls_ack = a;
+        }
+        e = getenv("T4_LOCKSTEP_DEBUG");        /* 2: every stamp */
+        t4_ls_trace = e && atoi(e) >= 2;
         if (!t4_ls_stamps && !t4_ls_window)
                 return;
         if (posix_memalign(&p, 64, (size_t)nnodes * sizeof(t4_ls_node_t))) {
@@ -256,7 +283,7 @@ void t4_ls_tick(void)
         n = &ls_nodes[self];
         now = t4cpu->s_heartbeat_counter + n->offset;
         atomic_store_explicit(&n->time, now, memory_order_relaxed);
-        if (now <= n->floor + (uint64_t)t4_ls_window)
+        if (!t4_ls_window || now <= n->floor + (uint64_t)t4_ls_window)
                 return;
         for (;;) {
                 m = ls_min(self);
@@ -298,8 +325,10 @@ void t4_ls_advance(uint64_t t)
         if (!ls_nodes || self < 0 || self >= t4_fabric->nnodes)
                 return;
         now = t4cpu->s_heartbeat_counter + ls_nodes[self].offset;
-        if (t > now)
+        if (t > now) {
                 ls_nodes[self].offset += t - now;
+                ls_nodes[self].by_stamp += t - now;
+        }
 }
 
 int t4_ls_visible(uint64_t stamp)
@@ -336,11 +365,36 @@ void t4_ls_unpark(void)
         lwm = atomic_load_explicit(&ls_lwm, memory_order_relaxed);
         if (now < lwm) {
                 n->offset += lwm - now;
+                n->by_rejoin += lwm - now;
                 now = lwm;
         }
         n->floor = lwm;
         atomic_store_explicit(&n->time, now, memory_order_relaxed);
         atomic_store_explicit(&n->parked, 0, memory_order_release);
+}
+
+/* T4_LOCKSTEP_DEBUG=1: every node's time when the network stops (as last
+ * published, so up to a timer tick old), and how much of it was jumped.
+ * Read from one thread while the others may still run: for a person. */
+void t4_ls_report(void)
+{
+        const char *e = getenv("T4_LOCKSTEP_DEBUG");
+        static _Atomic int done;
+        int i;
+
+        if (!ls_nodes || !t4_fabric || !e || !*e || *e == '0' ||
+            atomic_exchange(&done, 1))
+                return;
+        for (i = 0; i < t4_fabric->nnodes; i++) {
+                t4_ls_node_t *n = &ls_nodes[i];
+
+                fprintf(stderr, "-I-EMU414: node %d time %llu%s: %llu jumped "
+                        "to stamps, %llu on rejoining\n", i,
+                        (unsigned long long)atomic_load(&n->time),
+                        atomic_load(&n->parked) ? " (parked)" : "",
+                        (unsigned long long)n->by_stamp,
+                        (unsigned long long)n->by_rejoin);
+        }
 }
 
 t4_fabric_t *t4_fabric_create(int nnodes)

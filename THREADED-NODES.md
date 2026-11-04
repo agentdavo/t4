@@ -753,6 +753,8 @@ Threaded mode (PR 4, also the `start_process` gate):
 - `start_process` calls `update_time()` only when `!g_timer_threaded`. Same PR that walks the array.
 - Do **not** read `TPtrLoc` from the timer thread (racy). Rely on `cond_timedwait(LTO_IDLE)` as the timer fallback. The raytracer’s idle path is **link** wakeup, not timer. Timedwait of 5 ms (`LTO_IDLE`) is the safety net, same bound as today.
 
+**Fixed 2026-11-04: carry the remainders.** The walk as first written gave each node `elapsed_us / 64` low priority ticks and `elapsed_us / 1024` timeslice periods per ~100 µs step, each step divided on its own. So the low priority clock ran at 64–85% of the high priority one, and a timeslice period ended only when the timer thread overslept a millisecond: a low priority process that kept running (a renderer) held the processor from every other low priority process on its node until it blocked. TCWG 6.3.1 has a period end every 1024 µs and the running process descheduled at its next `j`/`lend` after two. The walk now carries both remainders between steps, as the single-node path always did (`timer_integration.c`). Test: `tests/test_thread_timeslice.c` (in `run_t9000_vcp.sh`): with the old walk its first part spins for ever, 3 runs of 3 even at host load 10, and with the new one it passes. It was found chasing the reworked ray tracer's deadlock ("Node time", below), but that tracer does not show it: at host load 10-13 it passed 39 of 40 runs at 8 and 16 nodes with the fix and 40 of 40 without.
+
 `timer.c` is not in `Makefile.linux` `SRC`; `timer_integration.c` is. Extend the latter. Mixing C11 `thrd_create` (timer) with POSIX `pthread_create` (nodes) is accepted; always link `-pthread` on Linux.
 
 ### Signals, quit, and fatal errors
@@ -1153,13 +1155,28 @@ time") and `p.c` (`sch_visible`, `start_process`).
 
 - **`T4_LOCKSTEP=1`** gives each node a time, the instructions it has
   executed plus an offset, and orders link events by it.  A packet in a
-  link mailbox carries its sender's time and the acknowledge (the emptied
-  mailbox) the receiver's, in the `SCH_STAMP` slot unless `T4_T9K_NET`
-  uses it.  A running node sees either only once its own time has reached
-  the stamp; a node with nothing to run (in `start_process`'s idle loop,
-  or not yet booted) is parked, takes it at once and jumps to it.  Every
-  link event then happens no earlier than the event that caused it,
-  whatever the host does.
+  link mailbox carries the time it reaches the receiver and the
+  acknowledge (the emptied mailbox) the time that reaches the sender, in
+  the `SCH_STAMP` slot unless `T4_T9K_NET` uses it.  A running node sees
+  either only once its own time has reached the stamp; a node with nothing
+  to run (in `start_process`'s idle loop, or not yet booted) is parked,
+  takes it at once and jumps to it.  Every link event then happens no
+  earlier than the event that caused it, whatever the host does.  Since
+  2026-11-04 a transfer is stamped from when it could start, not from when
+  a busy node noticed that it could: the packet from its `out` or the last
+  acknowledge, the acknowledge from the packet's arrival or the moment the
+  process that takes it began to wait (`Channel.ls_post`, set by `in` and
+  by the `enbc` of the ALT that chose the link).
+- **`T4_LOCKSTEP_LINK=B,P,A`** (2026-11-04) adds a transfer time, in
+  instructions: a packet of n bytes reaches the far end B·n+P after it is
+  sent, its acknowledge the sender A after the packet is taken.  0,0,0 by
+  default.  A 20 MHz T800 on 20 Mbit/s links is about 3,0,1 (0.58 µs a
+  byte at the ray tracer's ~3.9 cycles per t4 instruction).
+- **`T4_LOCKSTEP_DEBUG=1`** prints every node's time when the network
+  stops (also on a signal, so a `timeout` run reports where each node
+  was) and how much of it was jumped; **`=2`** also prints every link send
+  and take with its stamps.  The trace runs with stamps off too (given a
+  window, so that nodes have a time).
 - **`T4_LOCKSTEP_WINDOW=W`** also keeps every running node within about W
   instructions of the slowest, checked every 64 instructions in the timer
   block; parked nodes hold nobody back and rejoin at the network's
@@ -1173,7 +1190,7 @@ Measured (2026-11-03, threaded, host load 10-29):
 | original tracer, 3-34 nodes x models 1-4 | 11 and 22 of 28 images lack a patch (two sweeps) | 28 of 28 exact |
 | original tracer, 10 nodes, modes interleaved | 0 of 8 exact, renders 1-14 s | 8 of 8, 2-16 s |
 | C port (`transputer-raytracer/c`), 16 / 64 nodes | exact, 0.7-1.0 / 1.7-2.2 s | exact, 1.4-2.0 / 1.6-1.8 s |
-| reworked occam tracer (`transputer-raytracer/bin`), 8 / 16 nodes | 8 nodes mostly pass, 16 time out | all time out |
+| reworked occam tracer (`transputer-raytracer/bin`), 8 / 16 nodes, before the timer fix (below) | 8 nodes mostly pass, 16 time out | all time out |
 | t4 suite, `tests/net` (8 scripts) | pass | pass |
 
 `T4_LOCKSTEP_WINDOW=256` alone also made the original tracer exact but
@@ -1182,16 +1199,61 @@ The reworked occam tracer has the farm deadlock `testall.sh` describes
 (a renderer that owes pixels while the controller is blocked sending it
 the next job), and the same change made to the original tracer deadlocks
 it too; with link events in causal order the deadlocking interleaving is
-the one that happens.  Single-node runs are unchanged (Dhrystone 1.18 s
-against 1.17 s).
+the one that happens (2026-11-04: more, below).  Single-node runs are
+unchanged (Dhrystone 1.18 s against 1.17 s).
 
 Limits.  Time is instructions, not cycles, and a link transfer takes
-none, so the order is that of a network with instantaneous links; a
-latency per packet would be the next step.  An idle node's time stops
-until a message reaches it, so a node that is often idle runs behind one
-that is not: its messages reach a busier node "early", and a busy node
-must execute up to the stamps of messages and acknowledges from busier
-ones before it sees them.  That is probably the 16-node C port's
-slowdown (not traced).  Not
-covered: `-sl` nodes (processes) and `ipc://` links, and an acknowledge
-through a C104 carries no time.
+none unless `T4_LOCKSTEP_LINK` gives it one.  Timeslices still come from
+the host's clock, so how many instructions a low priority process runs
+before it is timesliced depends on the host.  Without a window a running
+node may run ahead of the others as far as the host lets it, and its
+stamps then hold back every node it talks to: a slower node sees its
+messages and acknowledges only once its own clock has caught up.  That is
+probably the 16-node C port's slowdown (not traced).  Not covered: `-sl`
+nodes (processes) and
+`ipc://` links, and an acknowledge through a C104 carries no time.
+
+### Transfer time, and the reworked tracer (2026-11-04)
+
+`T4_LOCKSTEP_LINK` was added to see whether a transfer time would end the
+reworked occam tracer's deadlock under stamps.  It did not: 8 and 16
+nodes, models 1 and 3, timed out at 0,0,0, at 3,0,1 and at 30,100,10,
+and stamping from the posting time did not change that either.
+
+`T4_LOCKSTEP_DEBUG` shows what the deadlock looks like.  Every node is
+parked; at 8 nodes node 0 (the controller) is at about 0.28 M
+instructions, two workers at 1.1-1.2 M, and the last three never had a
+job.  The trace has node 0 sending the farm's opening jobs in bursts of
+three, 25-40 thousand of its instructions apart, where without stamps
+they go out a few thousand apart, so the farm deadlocks the way
+`testall.sh` describes before it is full.  The acknowledges node 0 waits
+for carry its own send times, so the gaps are inside node 0; why stamps
+open them is not established.  A window closes them:
+`T4_LOCKSTEP_WINDOW=2000` with the stamps completes model 3 at 8 nodes in
+3.6 s and model 1 in 11 s (0.9 s and about 3 s with node time off);
+`=20000` still deadlocks.
+
+Looking for it turned up the threaded timer's lost timeslices ("Timer",
+above), which this tracer turned out not to depend on, and showed that
+24 and 40 nodes hang with node time off on every build tried (the
+current tree, a63dd76 and the in-tree binary): node 0 sends 47 jobs, no
+patch comes back, and the nodes keep spinning.  Not investigated.
+
+Measured 2026-11-04 (threaded; the original-tracer sweep under 8 busy
+loops, host load 12-14; the rest at load 0-13):
+
+| | without | `T4_LOCKSTEP=1` |
+|---|---|---|
+| original tracer, 3-34 nodes x models 1-4 | 14 of 28 images lack a patch; renders 243 s in all | 28 of 28 exact; 299 s |
+| C port, 16 / 64 nodes (three runs each) | exact, 0.68-0.84 / 2.0-3.6 s | exact, 1.30-1.37 / 1.43-1.57 s |
+| reworked occam tracer, 8 / 16 nodes, models 1 and 3 | 39 of 40 pass (40 of 40 without the timer fix) | all time out |
+| t4 suite (`run_t9000_vcp.sh`, 12 tests) | pass | pass |
+| `tests/net` (8 scripts), compiler built 2026-11-03 17:53 | pass | pass |
+
+The lost patch of the original tracer is still a race only the stamps
+close.  The `tests/net` scripts build their guests with the compiler
+checkout (`TCC_DIR`).  The in-place `transputer-tcc` there was then a
+stale build of 2026-11-02 that predates the `__vxfer` builtin: it linked
+the call to address 0 (the warning is hidden by the scripts'
+`2>/dev/null`), and five of the eight wild-jumped on every t4.  That row
+is from a current compiler.

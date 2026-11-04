@@ -156,7 +156,8 @@ still completes once nanomsg has accepted it: that transport has no shared
 word to acknowledge with, and would need acknowledge messages of its own.
 With `T4_LOCKSTEP=1` a threaded network also orders these packets and
 acknowledges by node time, carried in the mailbox's `SCH_STAMP` slot when
-`T4_T9K_NET` is off (`THREADED-NODES.md`, "Node time").
+`T4_T9K_NET` is off, plus a transfer time if `T4_LOCKSTEP_LINK` gives one
+(`THREADED-NODES.md`, "Node time").
 
 ## Routing switch: IMS C104 (HRM part 1 ch.7, part 3 ch.2)
 

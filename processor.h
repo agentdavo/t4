@@ -156,6 +156,9 @@ typedef struct _Channel_ {
         u_char pend[MAX_DATA];/* took it did not want, kept for the next */
         int  ackwait;         /* Out: the last packet is in the far mailbox;
                                * the out completes once it has been taken */
+        uint64_t ls_post;     /* T4_LOCKSTEP: the node time a process began
+                               * to wait on this link (in, out or an ALT's
+                               * enbc), or 0 */
 } Channel;
 
 typedef struct _LinkIface_ {

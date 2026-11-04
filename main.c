@@ -1243,6 +1243,7 @@ int main (int argc, char **argv)
 	t4_in_mainloop = 0;
         if (want_threads)
                 t4_join_thread_nodes();
+	t4_ls_report ();
 
 #if __profile__
 	/* METROWERKS PROFILER. */
@@ -1378,6 +1379,7 @@ void t4_signal_exit (int signal)
 
         fflush (stdout);
         t9k_report ();
+        t4_ls_report ();
         fprintf(stderr, "[FINAL_STATE] signal=%d IPtr=0x%08X WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X\n",
                 signal, IPtr, WPtr, AReg, BReg, CReg);
         /* T4_WATCH=addr[,words] dumps guest memory at exit.  A hang in a list

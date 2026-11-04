@@ -43,12 +43,19 @@ int  t4_net_stop_requested(void);
  * (t4_ls_stamps) orders link events by it; T4_LOCKSTEP_WINDOW=W
  * (t4_ls_window) keeps every running node within about W instructions of
  * the slowest.  Both are off by default; t4_ls_active is either.
- * t4_ls_tick() runs in the timer block when there is a window, the
- * park/unpark pair around a node's idle waits and its mainloop(). */
-extern int t4_ls_active, t4_ls_stamps, t4_ls_window;
+ * t4_ls_tick() runs in the timer block (it publishes the node's time, and
+ * with a window waits), the park/unpark pair around a node's idle waits
+ * and its mainloop().  t4_ls_trace: T4_LOCKSTEP_DEBUG=2, every link send
+ * and take on stderr. */
+extern int t4_ls_active, t4_ls_stamps, t4_ls_window, t4_ls_trace;
+/* T4_LOCKSTEP_LINK=B,P,A: a packet of n bytes reaches the far end B*n+P
+ * instructions after it is sent, its acknowledge the sender A after the
+ * far end takes it.  0,0,0 by default. */
+extern uint32_t t4_ls_byte, t4_ls_pkt, t4_ls_ack;
 void t4_ls_tick(void);
 void t4_ls_park(void);
 void t4_ls_unpark(void);
+void t4_ls_report(void);
 /* the node's time, a jump forward to t, and whether a message stamped
  * `stamp` has reached the node yet */
 uint64_t t4_ls_now(void);
