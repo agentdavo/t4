@@ -1371,8 +1371,43 @@ to clear.  At 16 nodes on the 20-core host (load 1-7, the two builds
 alternating) the farm finished 5 times in 25 with the fix and 12 in 23
 with only the predicate reverted; at 8 nodes 8 in 10 and 9 in 10; from 24
 nodes up both deadlock every time.  With the program fixed the farm
-cannot deadlock, so the wake-ups now cost only time; a spin of a few tens
-of microseconds before sleeping might win some back, not tried.
+cannot deadlock, so the wake-ups now cost only time.
+
+Spinning before sleeping buys back too little for what it costs (tried
+2026-11-04: an idle node watched its links and its wake count for N us
+before the condition variable; fixed images, model 3, each case three
+times, alternating, host load 4-25).  With N = 50 the mean render was
+8-21% shorter at 8, 16 and 24 nodes, inside the spread of three runs
+(8 nodes 1.2-3.0 s, 24 nodes 1.0-2.3 s whatever N), for 20-40% more user
+CPU (24 nodes: 12-13 s at 0, 15-19 s at 50).  At 80 nodes, on 20 cores,
+it cost five times the CPU (270-315 s of user time against 47-56 s), and
+N = 200 stalled the network: none of three runs finished in 120 s.  Not
+kept.
+
+At 80 nodes the chain boot, not the render, is most of a run: about 37 s
+at host load 5, 53-63 s at load 17-29, against 4-5 s of rendering.  Each
+booted node forwards the rest of the 260 KB image, in small chunks, a
+wake-up a hand-over; over the boot the nodes spend about 5% of a core
+each in futex calls.  Not looked into further.
+
+**Waiting to be booted.**  A node waited 60 tries of `LTO_BOOT` (1 s)
+for its boot code and then gave up: a threaded node stopped the whole
+network (a worker that fails stops the farm), a process exited.  A transputer waits
+for as long as it takes (TCWG 9), and a long chain can take longer than
+a minute to reach its last node: threaded at 80 nodes on a loaded host
+(53-63 s above, and the old predicate's spinning made it worse: nodes
+75-79 gave up), and `-sl` at 80 nodes, where nodes 60-79 gave up after
+60 s and the network never rendered.  Now a threaded node waits until
+it is booted or the network stops, which it does when node 0 ends, so a
+node nobody boots still ends with the run.  A process waits up to
+`T4_BOOT_WAIT` seconds (default 600): it cannot always tell that its node
+0 has gone (only the processes node 0 started itself hear it, through
+SharedEvents, and those now stop waiting at once).  With that, all 80
+`-sl` processes are booted; loading the configured program through them
+still had not finished after 15 minutes at host load 60-70 (80 processes
+polling their mailboxes, and another project's jobs on 14 of the 20
+cores), where 64 took 129 s at load about 10.  `-sl` polls; only
+threaded nodes sleep on their links.
 
 **Where the line falls.**  The count of jobs out when the fill stops
 hardly depends on N: 30-47 at 24 nodes over several runs, 35-45 at 32
@@ -1425,7 +1460,7 @@ rendered the reference image):
 |---|---|---|
 | `--threads`, sizes 1-80, models 1-4 | 52 of 52, 0-19 s a run (80 nodes 13-17 s) | 52 of 52, 3-112 s (80 nodes 48-112 s) |
 | `--ipc`, sizes 1-80, model 3 | 13 of 13, 2-7 s | 13 of 13, 3-10 s |
-| `-sl`, model 3 | 1-64 pass (5-129 s); 80 had not booted in 180 s | 2, 8, 24, 48 pass (9-81 s) |
+| `-sl`, model 3 | 1-64 pass (5-129 s); 80 had not booted in 180 s (nodes 60-79 gave up) | 2, 8, 24, 48 pass (9-81 s); 80 booted, not loaded in 15 min at load 60-70 |
 
 The second column's times are the host's load (another project took
 15 of the 20 cores), not the changes: the same images rendered in the

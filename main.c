@@ -150,7 +150,7 @@ static int t4_boot_node_file(int node)
 static void *t4_node_thread(void *arg)
 {
         cpu_t *c = arg;
-        int tries, booted;
+        int booted;
         cpu_bind(c);
         t9k_thread_init(c->cpu_nodeid);         /* T4_T9000: a clock of its own */
         init_processor();
@@ -159,14 +159,16 @@ static void *t4_node_thread(void *arg)
                 t4_net_request_stop();
                 return NULL;
         }
-        tries = 1;
-        while (!booted && tries++ < 60 && 0 == linkcomms("boot", TRUE, LTO_BOOT))
-                if (t9k_ctl_busy())     /* configuring over CLink0 */
-                        tries = 1;
-        if (tries > 60) {
-                printf("-E-EMU414: Node%d failed to get bootstrap code!\n", c->cpu_nodeid);
-                t4_net_request_stop();
-                return NULL;
+        /* A transputer waits for its boot code for as long as it takes
+         * (TCWG 9), and a threaded network stops when node 0 does, so a
+         * node nobody boots ends with it.  Giving up after 60 s, as this
+         * did, stopped the whole network whenever a long chain took longer
+         * to boot: 80 nodes on a loaded host, the last five while node 0
+         * was still booting them. */
+        while (!booted) {
+                if (t4_net_stop_requested())
+                        return NULL;
+                booted = 0 != linkcomms("boot", TRUE, LTO_BOOT);
         }
         /* a T9000 control system restarts a stopped CPU (Run, Reboot) */
         t4_in_mainloop = 1;
@@ -621,11 +623,17 @@ int main (int argc, char **argv)
                                                  * (four 4 Kbyte banks) is the
                                                  * RAM at #80000000-#80003FFF
                                                  * (HRM 9.6.1, figure 9.13).
-                                                 * Not modelled: RamSize
-                                                 * (#2001) turning it into
-                                                 * cache.  MemStart is the
-                                                 * T800's, as the VCP's
-                                                 * channel words assume. */
+                                                 * RamSize/DoRamSize and
+                                                 * DoAllocate (#2001-#2005)
+                                                 * are only stored: a line
+                                                 * that changes role writes
+                                                 * back and refills (HRM
+                                                 * 9.5), so without a cache
+                                                 * model no memory a program
+                                                 * reads changes.  MemStart
+                                                 * is the T800's, as the
+                                                 * VCP's channel words
+                                                 * assume. */
                                                 Txxx=9000;
                                                 CoreSize    = 16 * 1024;
                                                 MemStart    = 0x80000070;
@@ -1082,6 +1090,17 @@ int main (int argc, char **argv)
         }
         else if ((FALSE == serve) && (nodeid >= 0))
         {
+                /* A node of a network of processes waits up to
+                 * T4_BOOT_WAIT seconds (default 600) for its boot code: a
+                 * transputer waits for ever (TCWG 9), but a process whose
+                 * node 0 has gone would wait for ever too, and only the
+                 * nodes node 0 itself started hear that it has
+                 * (SharedEvents).  It was 60 s, and -sl's polled links
+                 * took longer than that to boot the 60th node of 80. */
+                extern u_char *SharedEvents;
+                const char *bw = getenv ("T4_BOOT_WAIT");
+                int maxwait = (bw && atoi (bw) > 0) ? atoi (bw) : 600;
+
                 temp = 1;
                 do
                 {
@@ -1089,8 +1108,10 @@ int main (int argc, char **argv)
                                 printf ("-I-EMU414: Node%d waiting for bootstrap code... (%d)\n", nodeid < 0 ? 0 : nodeid, temp);
                         if (t9k_ctl_busy ())    /* configuring over CLink0 */
                                 temp = 1;
-                } while ((temp++ < 60) && (0 == linkcomms ("boot", TRUE, LTO_BOOT)));
-                if (temp > 60)
+                        if (SharedEvents && SharedEvents[nodeid])
+                                temp = maxwait + 1;     /* node 0 has stopped */
+                } while ((temp++ < maxwait) && (0 == linkcomms ("boot", TRUE, LTO_BOOT)));
+                if (temp > maxwait)
                 {
                         printf ("-E-EMU414: Failed to get bootstrap code!\n");
                         handler (-1);

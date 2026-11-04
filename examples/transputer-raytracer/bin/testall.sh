@@ -49,7 +49,9 @@
 # burn a full second of usleep(50) spinning; they now poll with a
 # few-millisecond timeout and 1ms slices, so large arrangements are no
 # longer pathologically slow.  Oversubscribed runs still take wall time,
-# so give them a budget; -sl at 80 nodes needs several minutes.
+# so give them a budget.  -sl processes poll their links: at 64 nodes a
+# run takes minutes, at 80 more than 15 on a busy host.  A worker waits
+# up to T4_BOOT_WAIT seconds (default 600) for its boot code.
 #
 # Results are only meaningful on an idle machine.  This box also runs chip
 # jobs (yosys, klayout, ngspice); at load > ~10 runs fail spuriously with

@@ -8,10 +8,14 @@
  *
  * Two low priority processes spin through a j each and note the low
  * priority clock (64us ticks) whenever one finds the other was running
- * last.  NTURNS turns after the first must take NTURNS * 32 ticks, or
- * NTURNS * 8 on a T9000.  Over that many the average does not depend on
- * how coarsely t4's timer thread moves the clock (every ~100us).  The
- * first turn starts anywhere in a period and is not counted.
+ * last.  The NTURNS turns after the first must take 32 ticks each, or 8
+ * on a T9000.  The first turn starts anywhere in a period and is not
+ * counted.  What is checked is the mean of the middle half of the turns,
+ * sorted by length: over 16 turns it does not depend on how coarsely t4's
+ * timer thread moves the clock (every ~100us), and a turn the host
+ * stretched by descheduling t4's thread, or cut short by delivering
+ * several periods at once, falls outside the middle half.  The plain mean
+ * of all of them failed now and then at host load 20-27 (2026-11-04).
  *
  * lddevid tells the parts apart (ISM table A.14: a T9000 is 300-319);
  * run_t9000_vcp.sh says which part it asked t4 for with -DEXPECT_T9000.
@@ -42,7 +46,8 @@ static void uart_putdec(int v)
 
 #define NTURNS 32
 
-static volatile int owner, nswitch, first, last;
+static volatile int owner, nswitch;
+static volatile int at[NTURNS + 2];     /* the clock at switch 1..NTURNS+1 */
 static Channel done;
 static int ws1[PROC_WS_MIN / 4], ws2[PROC_WS_MIN / 4];
 
@@ -59,9 +64,10 @@ top:
     }
     if (owner != me) {
         if (owner != 0) {       /* the other one was timesliced */
-            if (++nswitch == 1)
-                first = now;
-            last = now;
+            int n = ++nswitch;
+
+            if (n <= NTURNS + 1)
+                at[n] = now;
         }
         owner = me;
     }
@@ -86,8 +92,9 @@ void test_main(void)
 {
     int t9000 = (unsigned)(__lddevid() - 300) < 20;
     int period = t9000 ? 256 : 1024;            /* us */
-    int expect = NTURNS * 2 * period / 64;      /* low priority ticks */
-    int got, err;
+    int expect = 2 * period / 64;               /* low priority ticks */
+    int d[NTURNS];
+    int i, j, mid, all, err;
 
 #ifdef EXPECT_T9000
     check("part", t9000 == EXPECT_T9000);
@@ -97,14 +104,31 @@ void test_main(void)
     PRun(PSetup(ws2, sizeof ws2, spin2) | PRI_LOW);
     ChanInInt(&done);
     ChanInInt(&done);
-    got = last - first;
-    err = got - expect;
+    all = 0;
+    for (i = 0; i < NTURNS; i++) {              /* insertion sort */
+        int t = at[i + 2] - at[i + 1];
+
+        all += t;
+        for (j = i; j > 0 && d[j - 1] > t; j--)
+            d[j] = d[j - 1];
+        d[j] = t;
+    }
+    mid = 0;                                    /* the middle half */
+    for (i = NTURNS / 4; i < NTURNS - NTURNS / 4; i++)
+        mid += d[i];
+    err = mid - expect * (NTURNS / 2);
     if (err < 0)
         err = -err;
-    check("period", err <= expect / 4);
+    check("period", err <= expect * (NTURNS / 2) / 4);
     if (!pass) {
-        uart_puts("turns=");
-        uart_putdec(got);
+        uart_puts("middle=");
+        uart_putdec(mid);
+        uart_puts("/16 all=");
+        uart_putdec(all);
+        uart_puts("/32 min=");
+        uart_putdec(d[0]);
+        uart_puts(" max=");
+        uart_putdec(d[NTURNS - 1]);
         uart_puts(" expected=");
         uart_putdec(expect);
         uart_puts(" lddevid=");

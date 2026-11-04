@@ -459,8 +459,8 @@ emulator with a message.
 
 `-s9` selects the T9000 part: the T800's MemStart (`#80000070`), 16
 Kbytes of on-chip RAM at `#80000000`-`#80003FFF` (the cache after reset,
-four 4 Kbyte banks: HRM 9.6.1; RamSize, which makes it cache, is not
-modelled), instructions and FPU, `lddevid` 300 (ISM table A.14), and a
+four 4 Kbyte banks: HRM 9.6.1), instructions and FPU, `lddevid` 300
+(ISM table A.14), and a
 timeslice period of 256 µs where every other part has the T800's 1024 µs
 (TCWG 6.3.1).  The other tests here run as `-s806`, a T800 core, which
 executes the T9000 instructions too.  A low priority process is
@@ -473,6 +473,14 @@ Not modelled: for a P-process every interrupt point is a timeslicing point,
 and a timeslice traps to its supervisor (`t.Time`; ISM table 8.4, 10.3,
 13.5).  t4 timeslices a P-process only at `j` and `lend`, and reschedules
 it as it would an L-process.
+
+The cache configuration registers (RamSize #2001, DoRamSize #2002,
+RamLineNumber #2003, RamAddress #2004, DoAllocate #2005; HRM 9.5) are
+stored and read back, and do nothing else.  That is exact for what a
+program sees: a line that becomes cache or RAM, or is locked at a new
+address, writes its old contents back and fetches the new ones from
+external memory (HRM 9.5.2), so every address keeps its value.  Only the
+time an access takes would differ, and t4 has no cache timing.
 
 ## Network timing and C programs on every node
 
@@ -585,9 +593,15 @@ same FFN on an 8-node hypercube of byte-stream links takes 6.73 ms.
   alone (ISM `enbc`, `disc`, `enbs`, `diss`); and the `eqc;cj` and `gt;cj`
   pairs t4 fuses leave a taken jump's 0 in A, as `cj` does (ISM `cj`).
 * `tests/test_timeslice_period.c` - two low priority processes spinning
-  through a `j` take 32 turns, which must last 32 x 512 µs at `-s9` and
-  32 x 2048 µs at `-s806` (to 25%; measured within 1%), on one node and on
-  two threaded nodes.  `lddevid` confirms the part.
+  through a `j` take 32 turns, which must last 512 µs each at `-s9` and
+  2048 µs at `-s806` (to 25%; measured within 1%), on one node and on
+  two threaded nodes.  `lddevid` confirms the part.  What is checked is
+  the mean of the middle half of the turns, since 2026-11-04: the mean of
+  all 32 failed 10 runs in 16 at host load 30-36, when the host
+  deschedules t4's threads for whole periods, and the middle half 1 in 16;
+  at load 24-26, on two builds, 12 in 16 and 4 in 16 (most T800 turns
+  then last 30-40% long).  The old check passed on a quiet host; the new
+  one has only been run under load so far.
 
 Run them with `make -f Makefile.linux test-vcp` or `tests/run_t9000_vcp.sh`
 (`T4_BIN` picks the emulator).  They build with `transputer-tcc` and
