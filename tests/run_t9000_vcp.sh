@@ -28,6 +28,9 @@
 #   test_timer_alt      one node: a timer ALT a channel won leaves the timer
 #                       list (ISM dist), one its time woke is queued once,
 #                       and one whose time has passed carries on (taltwt)
+#   test_thread_timeslice two threaded nodes: low priority processes are
+#                       timesliced, and the low priority clock keeps time
+#                       (TCWG 6.3.1)
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).
@@ -175,6 +178,12 @@ printf '%s\n' 'Connect HOST to processor 0 link 0' \
     'Connect processor 0 link 2 to processor 1 link 2' >"$tmp/sync.map"
 run_test test_link_sync \
     "$TESTS/test_link_sync.c $TOP/lib/transputer-conc.c" \
+    5s SPYNET="$tmp/sync.map" -- -st -sn -2
+# The timer thread serves threaded nodes on a path of its own.  Without
+# the fix the first part spins for ever; node 1 is never booted, so the
+# run ends at the timeout either way.
+run_test test_thread_timeslice \
+    "$TESTS/test_thread_timeslice.c $TOP/lib/transputer-conc.c" \
     5s SPYNET="$tmp/sync.map" -- -st -sn -2
 
 exit $(( failures > 0 ))

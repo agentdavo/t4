@@ -60,15 +60,31 @@ static int timer_thread_fn(void *arg)
                 }
                 n = 0;
             }
-            for (i = 0; i < n; i++) {
-                cpu_t *c = list[i];
-                if (!c)
-                    continue;
-                if (c->s_Timers == tb->TimersGo_val) {
-                    c->s_ClockReg[0] += (uint32_t)elapsed_us;
-                    c->s_ClockReg[1] += (uint32_t)(elapsed_us / 64);
+            /* Every node of a threaded network sees the same elapsed time,
+             * so the remainders carry over in one pair of accumulators.
+             * Dividing each ~100us step alone gave the low priority clock
+             * only one or two 64us ticks a step and the timeslice none
+             * (TCWG 6.3.1: a period ends every 1024us), so a low priority
+             * process was descheduled only when this thread overslept. */
+            if (n > 0) {
+                int lo_ticks, ts_ticks;
+
+                lo_accum += (int)elapsed_us;
+                lo_ticks = lo_accum / 64;
+                lo_accum &= 63;
+                ts_accum += (int)elapsed_us;
+                ts_ticks = ts_accum / 1024;
+                ts_accum &= 1023;
+                for (i = 0; i < n; i++) {
+                    cpu_t *c = list[i];
+                    if (!c)
+                        continue;
+                    if (c->s_Timers == tb->TimersGo_val) {
+                        c->s_ClockReg[0] += (uint32_t)elapsed_us;
+                        c->s_ClockReg[1] += (uint32_t)lo_ticks;
+                    }
+                    c->s_timeslice += ts_ticks;
                 }
-                c->s_timeslice += (int)(elapsed_us / 1024);
             }
         }
     }
