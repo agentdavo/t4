@@ -457,8 +457,10 @@ emulator with a message.
 
 ## Timeslicing (ISM 8.2.4, 13.5; HRM 3.3)
 
-`-s9` selects the T9000 part: the T800's memory map (MemStart
-`#80000070`), instructions and FPU, `lddevid` 300 (ISM table A.14), and a
+`-s9` selects the T9000 part: the T800's MemStart (`#80000070`), 16
+Kbytes of on-chip RAM at `#80000000`-`#80003FFF` (the cache after reset,
+four 4 Kbyte banks: HRM 9.6.1; RamSize, which makes it cache, is not
+modelled), instructions and FPU, `lddevid` 300 (ISM table A.14), and a
 timeslice period of 256 µs where every other part has the T800's 1024 µs
 (TCWG 6.3.1).  The other tests here run as `-s806`, a T800 core, which
 executes the T9000 instructions too.  A low priority process is

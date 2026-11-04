@@ -614,13 +614,22 @@ int main (int argc, char **argv)
 					  }
 					  else
                                           {
-                                                /* T9000: the T800's memory
-                                                 * map, the T9000's timeslice
-                                                 * period and device id */
+                                                /* T9000: the T9000's timeslice
+                                                 * period and device id, and
+                                                 * its on-chip memory: after
+                                                 * reset the 16 Kbyte cache
+                                                 * (four 4 Kbyte banks) is the
+                                                 * RAM at #80000000-#80003FFF
+                                                 * (HRM 9.6.1, figure 9.13).
+                                                 * Not modelled: RamSize
+                                                 * (#2001) turning it into
+                                                 * cache.  MemStart is the
+                                                 * T800's, as the VCP's
+                                                 * channel words assume. */
                                                 Txxx=9000;
-                                                CoreSize    = 4 * 1024;
+                                                CoreSize    = 16 * 1024;
                                                 MemStart    = 0x80000070;
-                                                ExtMemStart = 0x80001000;
+                                                ExtMemStart = 0x80004000;
                                           }
 					  break;
 				case 'a': if (argv[arg][3]!='\0')
