@@ -582,7 +582,7 @@ int t4_node_idle_wait(cpu_t *c, int timeout_ms)
 }
 ```
 
-`node_channels_ready(c)` (in the code, `t4_node_any_ready()`) is the same predicate as the `linkcomms` walk (`SCHLength != 0` for In / `== 0` for an Out that has pending `Length` or whose `out` is waiting for the far end to empty the mailbox, `ackwait`). Leaving `ackwait` out loses the wakeup when the far end empties the mailbox between the walk and the wait, and the `out` then completes only at the `LTO_IDLE` timeout. In channels are published under this same `idle_mu` (mailbox owner is the receiver). Out channels live on the peer; the happens-before for POLLOUT is `t4_node_wake(sender)` (Issue 2), which holds this mutex. Re-checking Out `SCHLength` here is best-effort; `idle_gen` is not needed as a separate waiter snapshot if the loop predicate is “ready or quit.”
+`node_channels_ready(c)` (in the code, `t4_node_any_ready()`, which asks `t4_link_ready()` in `p.c`) is the same predicate as the `linkcomms` walk, over the same channels: those a process is waiting on, every In while booting (`SCHLength != 0` for In / `== 0` for an Out that has pending `Length` or whose `out` is waiting for the far end to empty the mailbox, `ackwait`). Until 2026-11-04 it looked at every In mailbox, waited on or not, so a packet no process was ready for made it true at once and the node spun instead of sleeping (`tests/test_idle_mailbox.c`; "The reworked tracer at 24 nodes and more", below). Leaving `ackwait` out loses the wakeup when the far end empties the mailbox between the walk and the wait, and the `out` then completes only at the `LTO_IDLE` timeout. In channels are published under this same `idle_mu` (mailbox owner is the receiver). Out channels live on the peer; the happens-before for POLLOUT is `t4_node_wake(sender)` (Issue 2), which holds this mutex. Re-checking Out `SCHLength` here is best-effort; `idle_gen` is not needed as a separate waiter snapshot if the loop predicate is “ready or quit.”
 
 `linkcomms` still walks `SCHLength` after the wait to fill `revents`.
 
@@ -986,7 +986,7 @@ No new privileges. No SHM, so no leftover `0666` SysV segments in threaded mode 
 
 - **Logs.** Prefix with node id (`-I-EMU414[n3]:`). `verbose` (`-si`) on 80 threads will interleave; v1 accepts that (`-sb` already forces process-global `verbose`). Optional later: a line mutex.
 - **Counters.** `Link[i].In/Out.IOBytes` become per-node with `cpu_t`. `profile[10]` in `main.c:141` does **not** — `PROFILE()` is compiled out in release (`-DNDEBUG`). Debug `-su` remains process-global in v1.
-- **Hang diagnosis.** A stuck `--threads` run is one PID. `thread apply all bt` in gdb shows N `cpu_run` frames plus the C11 timer thread. Document this in `examples/transputer-raytracer/bin/README`.
+- **Hang diagnosis.** A stuck `--threads` run is one PID. `thread apply all bt` in gdb shows N `cpu_run` frames plus the C11 timer thread. Document this in `examples/transputer-raytracer/bin/README`. `T4_NET_DUMP=1` (2026-11-04) prints at exit, signal included, every node's queues and, per link, the waiting process, the transfer in progress and both mailboxes: the link half of the wait-for graph.
 - **Metrics (manual).** Wall time of `testall.sh --threads` vs `--ipc` at N=8 and N=80. Success is **correctness first**; a 2× wall-time win is expected from blocking idle and one address space but is not the merge gate.
 - **Alerting.** N/A (local tool). `timeout -k 5` in `testall.sh` stays.
 
@@ -1237,7 +1237,9 @@ Looking for it turned up the threaded timer's lost timeslices ("Timer",
 above), which this tracer turned out not to depend on, and showed that
 24 and 40 nodes hang with node time off on every build tried (the
 current tree, a63dd76 and the in-tree binary): node 0 sends 47 jobs, no
-patch comes back, and the nodes keep spinning.  Not investigated.
+patch comes back, and the nodes keep spinning.  That is the same farm
+deadlock, and the spinning was a t4 bug of its own: "The reworked tracer
+at 24 nodes and more", below.
 
 Measured 2026-11-04 (threaded; the original-tracer sweep under 8 busy
 loops, host load 12-14; the rest at load 0-13):
@@ -1257,3 +1259,154 @@ stale build of 2026-11-02 that predates the `__vxfer` builtin: it linked
 the call to address 0 (the warning is hidden by the scripts'
 `2>/dev/null`), and five of the eight wild-jumped on every t4.  That row
 is from a current compiler.
+
+### The reworked tracer at 24 nodes and more (2026-11-04)
+
+The hang is the farm deadlock `testall.sh` describes, reached during the
+opening fill, and it is the program's.  The spinning was a separate t4
+bug, now fixed: idle nodes holding a packet no process was ready for
+never slept.
+
+**What every node waits on.**  `T4_NET_DUMP=1` prints, with the exit
+report (so `timeout -s INT` works), every node of a threaded network:
+its queues, the process waiting on each link channel with its IPtr, what
+the link is doing (`len`, `ackwait`) and both mailboxes.  A 24-node
+model-3 run that had printed 46 `S c.render` and no `R patch`:
+
+```
+node 0    Link2In   -        mailbox 32   Link2Out  waiting  ackwait  mailbox 4
+node 1-6  Link1In   -        mailbox 4    Link1Out  waiting  ackwait  mailbox 32
+          Link2In   -        mailbox 32   Link2Out  waiting  ackwait  mailbox 4
+node 7    Link1In   -        mailbox 4    Link1Out  waiting  ackwait  mailbox 32
+          Link2In   -        mailbox 4    Link2Out  -
+node 8-15 a pixel word or row waiting to go up (Link1Out), no job going down
+node 16   Link1In   waiting (throughPut, for a job)
+node 17-23 nothing: they never had a job
+```
+
+Every node is idle.  On nodes 0-6 throughPut is in `toNext !` (Link2Out),
+the job's first word sitting in the next node's Link1In mailbox, where no
+process reads it because that node's throughPut is in `toNext !` too; and
+pixelBypass is in `toPrev !` (Link1Out), a row of pixels sitting in the
+Link2In mailbox above it, unread for the same reason.  On node 7 the job
+chain ends: its throughPut is outputting on no link, so it is in
+`feedPixels !`, handing its buffered job to a renderer that is still
+sending its last patch up (renderers 1-15 had all finished one).  On node
+0 the dump cannot see the soft channels, but the log ends at
+loadBalance's 46th `S c.render`, which it prints just before sending
+that job: outputBuffer waits on throughPut0, loadBalance on outputBuffer,
+and returnBuffer, with the pixels, on loadBalance.  So: loadBalance -> outputBuffer ->
+throughPut0 .. throughPut6 -> throughPut7 (`feedPixels !`) -> renderer 7
+(`pixelsOut !`) -> pixelBypass7 .. pixelBypass0 -> returnBuffer ->
+loadBalance.  Nothing is lost in t4: each waiting output's packet is in
+its mailbox with `ackwait` set, and an output that completes only once
+the far process has input it is what a link does (ISM 8.4.2; HRM C100
+1.3.1; `tests/test_link_sync.c`).
+
+**Why the program reaches it.**  loadBalance (`occ/cntlsys.occ`) holds
+two credits per worker, 48 at 24 nodes, and its `PRI ALT` puts the job
+guard first: the first ready guard in textual order wins (ISM 7.6, the
+disables in order), so while it has credits and sendPatches has a job it
+takes no patch back.  A job moves down the chain one synchronous output
+at a time, each throughPut keeping one job rendering and one buffered.
+A renderer that finishes signals `done` before sending its pixels, so
+its throughPut then sits in `feedPixels !` until the pixels have gone,
+and they go only as far as loadBalance takes them.  If loadBalance has
+another job to send meanwhile, and that job's path runs through such a
+throughPut, the cycle above closes.  It needs a renderer on the path to
+finish before the fill is over.  The fill is 2N jobs down an N-node
+chain, three words a job a hop; a patch takes the same time whatever N
+is.  So the odds grow with N and with the cost of a link handover
+against an instruction: on t4 a host thread waking another takes tens of
+microseconds, thousands of t4 instructions, where a real link moves a
+word in the time of a few dozen.  The same cycle can close later in a
+run too, whenever a job is held up behind a renderer that is sending its
+pixels and loadBalance earns another credit before it is through (the
+8-node runs that stop after some 850 jobs on a loaded host); that one is
+open on real hardware as well, only with a far narrower window.
+
+**What would fix it** is in the occam: an outputBuffer that can hold
+every credited job (2N), so that loadBalance never blocks sending one
+and always gets back to taking patches.  Swapping the `PRI ALT`'s guards
+is not enough, since loadBalance can still block in `out !` with a patch
+arriving behind it.  The images would have to be rebuilt with the INMOS
+toolset (`occ/makefile`, `mknumprocs.sh`); not done.
+
+**Why the nodes spun.**  An idle node waits in `linkcomms()` on the
+links its processes are waiting on, and `t4_node_idle_wait()` first asks
+whether one is ready already.  That question counted every full In
+mailbox, waited on or not.  Every node above holds a packet nobody is
+inputting, so for them it was true at once, every time round the idle
+loop: on the in-tree t4 the threads of nodes 0-11 ran at 100% for as long
+as the run was left, those of nodes 12-23 slept.  The same happened in
+live runs to any idle node that a job or a pixel row had reached while
+its throughPut or pixelBypass was busy, taking a host core from a node
+with work.  `t4_link_ready()` (`p.c`) now chooses the channels as
+`linkcomms()` does: an In only if a process is waiting on it (or while
+booting, or a listening virtual link), an Out only while its output is
+in progress.  A deadlocked 24-node run then sleeps (25 threads asleep,
+0.1 s of CPU in 10 s); `tests/test_idle_mailbox.c` has node 0 idle with
+one link waited on and a word nobody reads in the other's mailbox: 4.1 s
+of host CPU in a 4 s run before, 0.14 s after.  This does not end the
+deadlock.
+
+It does shift its odds where the host has cores to spare.  A spinning
+node saw an acknowledge or a packet the moment it came; a sleeping one is
+woken through its condition variable, so in a backed-up farm each
+handover now costs a thread wake-up, and a renderer's pixels take longer
+to clear.  At 16 nodes on the 20-core host (load 1-7, the two builds
+alternating) the farm finished 5 times in 25 with the fix and 12 in 23
+with only the predicate reverted; at 8 nodes 8 in 10 and 9 in 10; from 24
+nodes up both deadlock every time.  Spinning for a few tens of
+microseconds before sleeping might win the latency back without the
+cost of a hung run; not tried.
+
+**Where the line falls.**  The count of jobs out when the fill stops
+hardly depends on N: 30-47 at 24 nodes over several runs, 35-45 at 32
+to 80 (threaded, node time off).  That is how many jobs node 0 gets
+down the chain before the first renderer on the path has a patch done,
+and the fill needs 2N of them, so 16 nodes (32) pass and 24 (48) do
+not.  With `T4_LOCKSTEP_WINDOW=256` the count is 84-87, so 40 nodes
+(80) pass and 48 (96) do not.  With node time and the link timing of a
+20 MHz T800 on 20 Mbit/s links as t4 models it (`T4_LOCKSTEP=1
+T4_LOCKSTEP_WINDOW=256 T4_LOCKSTEP_LINK=3,0,1`) it is 89 at 48 nodes and
+92 at 80, both deadlocked: by that model a real chain of 48 would
+deadlock in the fill as well.  Node time counts instructions, not cycles,
+so that is an estimate, but it puts the fault in the program's design,
+not in how fast t4's links are.
+
+**Arrangements** (`testall.sh`, model 3, 20-core host at load 0-2
+unless noted; `--limit 60`, the window runs `--limit 400`):
+
+| N | `--threads` | `--threads`, in-tree t4 (old predicate) | `--threads`, `T4_LOCKSTEP_WINDOW=256` | `--ipc` |
+|---|---|---|---|---|
+| 1-4 | pass, 1-5 s | pass | pass, 6-11 s | pass, 3-6 s |
+| 6 | pass, 1 s | pass | stopped mid-render: 270 jobs, 258 patches | pass, 3 s |
+| 8, 16 | pass, 1 s (16: 5 of 25 over more runs, above) | pass (16: 12 of 23) | pass, 10-15 s | pass, 2-3 s |
+| 24 | deadlock | deadlock, SIGKILLed (load 25) | pass, 12 s | pass, 2 s |
+| 32, 40 | deadlock | deadlock, SIGKILLed | pass, 10-11 s | pass, 2 s |
+| 48 | deadlock | deadlock | deadlock at 84 jobs | pass, 2 s |
+| 64 | deadlock | still booting at 60 s | deadlock at 87 jobs | pass, 2 s |
+| 80 | deadlock | nodes 75-79 "failed to get bootstrap code" | deadlock at 86 jobs | pass, 3 s |
+
+At 24 nodes `-sl` processes deadlock after 5 jobs, and a window of 2000
+(with or without `T4_LOCKSTEP=1`) deadlocks as no window does; 256 with
+the stamps passes as 256 without them.  `-sl` polls its mailboxes, so its
+handovers are slower still.  `ipc://` never deadlocks: there an output
+completes when nanomsg accepts it, before the far end has input it,
+which no transputer link does, so no throughPut blocks in `toNext !` and
+the chain cannot back up (node 0's own renderer could still close the
+cycle through the soft channels there, but none of these runs did).
+The 6-node stop under the window, every credit out, is the mid-run form
+of the cycle.  The old predicate's spinning nodes also starved the chain
+boot: at 64 nodes the in-tree t4 was still booting when the run was
+killed, and at 80 the last five nodes gave up waiting (60 tries of
+`LTO_BOOT`).  A deadlocked threaded network is idle now: at 80 nodes
+all 81 threads sleep.
+
+**Still spinning: a timer wait.**  A threaded node whose only process
+waits on a timer does not sleep either: with the timer queue non-empty,
+`start_process()` polls the links with `LTO_COMM` (no wait) and goes
+round again, so a 2 s `tin` costs 2 s of host CPU (measured: 4.07 s of
+CPU in a 4.1 s run).  The ray tracer's farm has no timer waits, so this
+played no part here.  Not fixed.

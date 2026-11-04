@@ -3276,6 +3276,61 @@ void alt_channel(Channel *chan)
 #define SCH_POLL        50
 #define SCH_POLL_IDLE   1000
 
+/* Whether a mailbox linkcomms() polls is ready: the In and Out channels it
+ * chooses, chosen the same way.  t4_node_idle_wait() asks this before it
+ * sleeps.  It must see everything linkcomms() would, or a packet that came
+ * after linkcomms() looked and before the sleep is a lost wakeup; and
+ * nothing more, or a packet that no process is waiting for wakes the node
+ * at once, every time, and an idle node spins on the host.  It used to
+ * count every full In mailbox: in a farm where a node's throughPut is busy
+ * feeding its renderer while the next job waits in its mailbox, that node
+ * burnt a whole core doing nothing (2026-11-04, the ray tracer at 24
+ * nodes). */
+int t4_link_ready (int doBoot)
+{
+        uint32_t w;
+        int i;
+
+        if (nodeid < 0 && !t4cpu->s_loopback)
+                return 0;
+        for (i = 0; i < 4; i++)
+        {
+                Channel *in = &Link[i].In, *out = &Link[i].Out;
+
+                if ((0 == i) && serve)
+                        continue;
+                if (t4cpu->s_link_halted & (1u << i))
+                        continue;
+                if (t9k_link_virtual (i))
+                {
+                        if (doBoot)
+                                continue;
+                        if (t9k_link_listening (i) && in->schbuf &&
+                            SCHLength(in))
+                                return 1;
+                        if (t9k_link_tx_pending (i) && out->schbuf &&
+                            !SCHLength(out))
+                                return 1;
+                        continue;
+                }
+                w = word (in->LinkAddress);
+                if (doBoot || (GetDescWPtr(w) != NotProcess_p))
+                {
+                        if (!(doBoot && BootLink && in->LinkAddress != BootLink) &&
+                            (in->npend || (in->schbuf && SCHLength(in))))
+                                return 1;
+                }
+                if (doBoot)
+                        continue;
+                w = word (out->LinkAddress);
+                if ((GetDescWPtr(w) != NotProcess_p) &&
+                    (out->Length || out->ackwait) &&
+                    out->schbuf && !SCHLength(out))
+                        return 1;
+        }
+        return t9k_ctl_ready ();
+}
+
 int linkcomms (char *where, int doBoot, int timeOut)
 {
         struct nn_pollfd pfd[8];
@@ -3464,7 +3519,7 @@ int linkcomms (char *where, int doBoot, int timeOut)
                                 if (t4cpu && t4cpu->idle) {
                                         int ms = timeOut / 1000;
                                         if (ms < 1) ms = 1;
-                                        t4_node_idle_wait(t4cpu, ms);
+                                        t4_node_idle_wait(t4cpu, ms, doBoot);
                                         timeOut = 0;
                                         continue;
                                 } else {
@@ -3949,6 +4004,79 @@ void processor_state (void)
         printf ("\tBPtr0  queue)  #%08X\n", BPtrReg[0]);
         printf ("\tTPtr1 (Timer   #%08X\n", TPtrLoc[1]);
         printf ("\tTPtr0  queues) #%08X\n", TPtrLoc[0]);
+}
+
+/* T4_NET_DUMP=1: at exit, every node of a threaded network - the process
+ * waiting on each link channel (its Wdesc and IPtr), what the link is in
+ * the middle of, and both mailboxes - so a stuck network can be read as a
+ * wait-for graph.  Diagnostic only: it reads the other nodes' state while
+ * their threads still run. */
+static void dump_link_chan (const char *dir, int i, Channel *ch)
+{
+        uint32_t w = word_int (ch->LinkAddress);
+
+        printf ("    Link%d%-3s", i, dir);
+        if (GetDescWPtr (w) == NotProcess_p)
+                printf (" -                           ");
+        else
+                printf (" Wdesc #%08X IPtr #%08X",
+                        w, word_int (GetDescWPtr (w) + 4 * Iptr_s));
+        printf (" len %4u%s%s", (unsigned)ch->Length,
+                ch->ackwait ? " ackwait" : "",
+                ch->npend ? " pend" : "");
+        if (ch->schbuf)
+                printf (" mailbox %u", (unsigned)SCHLength (ch));
+        printf ("\n");
+}
+
+void t4_net_dump (void)
+{
+        cpu_t *self = t4cpu;
+        int n, i;
+
+        if (!t4_fabric)
+                return;
+        for (n = 0; n < t4_fabric->nnodes; n++)
+        {
+                cpu_t *c = t4_fabric->cpus[n];
+                uint32_t p;
+                int k;
+
+                if (!c)
+                        continue;
+                t4cpu = c;
+                printf ("-I-EMU414: node %d: IPtr #%08X WPtr #%08X%s\n", n,
+                        IPtr, WPtr, Idle ? " idle" : "");
+                for (k = 0; k < 2; k++)
+                {
+                        int m = 0;
+
+                        if (FPtrReg[k] == NotProcess_p)
+                                continue;
+                        printf ("    %s queue:", k ? "low" : "high");
+                        for (p = FPtrReg[k]; p != NotProcess_p && m < 16;
+                             p = word_int (p + 4 * Link_s), m++)
+                        {
+                                printf (" #%08X", word_int (p + 4 * Iptr_s));
+                                if (p == BPtrReg[k])
+                                        break;
+                        }
+                        printf ("\n");
+                }
+                for (k = 0; k < 2; k++)
+                        if (TPtrLoc[k] != NotProcess_p)
+                                printf ("    %s timer queue: #%08X\n",
+                                        k ? "low" : "high", TPtrLoc[k]);
+                for (i = 0; i < 4; i++)
+                {
+                        if (!Link[i].Out.schbuf && !Link[i].In.schbuf)
+                                continue;
+                        dump_link_chan ("In", i, &Link[i].In);
+                        dump_link_chan ("Out", i, &Link[i].Out);
+                }
+        }
+        t4cpu = self;
+        fflush (stdout);
 }
 
 void save_dump (void)

@@ -512,26 +512,15 @@ void t4_node_wake(cpu_t *c)
         idle_wake(c->idle);
 }
 
-int t4_node_any_ready(void)
+/* the mailboxes linkcomms() is polling: t4_link_ready() in p.c */
+int t4_node_any_ready(int doBoot)
 {
-        int i;
         if (!t4cpu)
                 return 0;
-        for (i = 0; i < 4; i++) {
-                Channel *in = &t4cpu->s_Link[i].In;
-                Channel *out = &t4cpu->s_Link[i].Out;
-                if (in->schbuf && SCHLength(in) != 0)
-                        return 1;
-                /* room for the next packet, or the acknowledge an out
-                 * waits for (ackwait): the far end has emptied it */
-                if (out->schbuf && (out->Length || out->ackwait) &&
-                    SCHLength(out) == 0)
-                        return 1;
-        }
-        return t9k_ctl_ready();
+        return t4_link_ready(doBoot);
 }
 
-int t4_node_idle_wait(cpu_t *c, int timeout_ms)
+int t4_node_idle_wait(cpu_t *c, int timeout_ms, int doBoot)
 {
         t4_idle_t *id;
         unsigned gen;
@@ -539,7 +528,7 @@ int t4_node_idle_wait(cpu_t *c, int timeout_ms)
 
         if (!c || !c->idle || timeout_ms <= 0)
                 return 0;
-        if (t4_node_any_ready())
+        if (t4_node_any_ready(doBoot))
                 return 1;
 #if defined(__linux__)
         {
@@ -554,16 +543,16 @@ int t4_node_idle_wait(cpu_t *c, int timeout_ms)
                         unsigned gen = fid->idle_gen;
                         fts.tv_sec = timeout_ms / 1000;
                         fts.tv_nsec = (timeout_ms % 1000) * 1000000L;
-                        if (!t4_node_any_ready() && fid->idle_gen == gen)
+                        if (!t4_node_any_ready(doBoot) && fid->idle_gen == gen)
                                 syscall(SYS_futex, &fid->idle_gen, FUTEX_WAIT_PRIVATE,
                                         gen, &fts, NULL, 0);
-                        return t4_node_any_ready();
+                        return t4_node_any_ready(doBoot);
                 }
         }
 #endif
         id = c->idle;
         pthread_mutex_lock(&id->mu);
-        if (t4_node_any_ready()) {
+        if (t4_node_any_ready(doBoot)) {
                 pthread_mutex_unlock(&id->mu);
                 return 1;
         }
@@ -575,7 +564,7 @@ int t4_node_idle_wait(cpu_t *c, int timeout_ms)
                         break;
         }
         pthread_mutex_unlock(&id->mu);
-        return t4_node_any_ready();
+        return t4_node_any_ready(doBoot);
 }
 
 /* ---- router engine ------------------------------------------------------- */

@@ -34,8 +34,9 @@ int  t4_idle_init(cpu_t *c);
 void t4_idle_destroy(cpu_t *c);
 void t4_node_wake(cpu_t *c);
 void t4_wake_node_id(int nid);
-int  t4_node_idle_wait(cpu_t *c, int timeout_ms);
-int  t4_node_any_ready(void);
+int  t4_node_idle_wait(cpu_t *c, int timeout_ms, int doBoot);
+int  t4_node_any_ready(int doBoot);
+int  t4_link_ready(int doBoot);   /* p.c */
 void t4_net_request_stop(void);
 int  t4_net_stop_requested(void);
 

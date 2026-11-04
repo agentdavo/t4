@@ -1398,6 +1398,14 @@ void t4_signal_exit (int signal)
         fflush (stdout);
         t9k_report ();
         t4_ls_report ();
+        {
+                extern void t4_net_dump (void);
+                const char *d = getenv ("T4_NET_DUMP");
+                static _Atomic int dumped;
+
+                if (d && *d && *d != '0' && !atomic_exchange (&dumped, 1))
+                        t4_net_dump ();
+        }
         fprintf(stderr, "[FINAL_STATE] signal=%d IPtr=0x%08X WPtr=0x%08X A=0x%08X B=0x%08X C=0x%08X\n",
                 signal, IPtr, WPtr, AReg, BReg, CReg);
         /* T4_WATCH=addr[,words] dumps guest memory at exit.  A hang in a list

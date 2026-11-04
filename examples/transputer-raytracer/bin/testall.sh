@@ -13,8 +13,10 @@
 #   ./testall.sh --max 8          # arrangements up to 8 processors
 #   ./testall.sh --ipc            # nanomsg ipc:// instead of -sl (needed at N>=8
 #                                 # under load; SHM idle-polling storms the CPU)
+#   ./testall.sh --threads        # one t4, a thread per node (-st)
 #   ./testall.sh --models 1,2,3,4 # all four scenes
 #   ./testall.sh --sizes 1,2,4    # just these
+#   ./testall.sh --limit 60       # give no run more than 60 seconds
 #
 # Exit status is 0 only if every run rendered and matched its reference.
 #
@@ -23,17 +25,50 @@
 # the 16-node wild jump to address 0 (the matching Link0Out write shim
 # dropped the word, see writeword_int()).
 #
-# The ray tracer itself can deadlock: when node 1's throughPut is handing
-# its buffered job to a renderer that still owes its pixels, and
-# loadBalance on node 0 is blocked sending the next job down, nothing
-# drains the results.  Real links make that window tiny; emulated nodes,
-# whose links are slow next to their CPUs, make it wide - shared-memory
-# processes (-sl) hit it at most sizes, threaded nodes now and then.  A
-# TIMEOUT whose log stops mid-render is that, not the link fabric.  Idle nodes
-# used to burn a full second of usleep(50) spinning; they now poll with a
-# few-millisecond timeout and 1ms slices, so large arrangements are no
-# longer pathologically slow.  Oversubscribed runs still take wall time,
-# so give them a budget.
+# The ray tracer itself can deadlock, and threaded runs of 24 nodes or
+# more nearly always do (2026-11-04).  loadBalance (occ/cntlsys.occ) has
+# two credits per worker, and its PRI ALT takes a new job before a
+# returning patch, so while it has credits it drains no results.  A job
+# goes down the chain from throughPut to throughPut, each keeping one job
+# rendering and one buffered and passing any other on with a synchronous
+# output; pixels come back up through the pixelBypasses.  Once a renderer
+# on a job's path has finished, its throughPut sits in `feedPixels !`
+# until the renderer has sent its pixels.  If loadBalance gets another
+# job out before then, everything stops: the job waits on that
+# throughPut, the jobs behind it, outputBuffer and loadBalance (blocked
+# sending the next job) wait on it, and the pixels wait on loadBalance.
+# Every process on every node is waiting (T4_NET_DUMP=1 prints the link
+# half of that cycle).  The opening fill needs 2N jobs, and node 0 gets
+# only so many down the chain before the first patch is done: 30-47 on
+# threaded nodes whatever N is, because on t4 one host thread hands over
+# to another in tens of microseconds, the time of thousands of
+# instructions, where a real link takes the time of a few dozen.  So
+# threaded runs pass up to 16 nodes and deadlock from 24 on (and smaller
+# farms now and then, later in the run: 16 nodes finish about one run in
+# five since idle nodes stopped spinning, 8 nodes most runs); shared-memory
+# processes (-sl, millisecond polling) deadlock at most sizes; ipc:// not
+# at all, because an ipc:// output completes when nanomsg accepts it,
+# before the far end has input it, which no transputer link does.  With
+# T4_LOCKSTEP_WINDOW=256 in the environment, which keeps every running
+# node within 256 instructions of the slowest, node 0 gets about 85 jobs
+# out first, so up to 40 nodes pass (slowly) and from 48 on deadlock.
+# Adding T4_LOCKSTEP=1 T4_LOCKSTEP_LINK=3,0,1, t4's model of a 20 MHz
+# T800 on 20 Mbit/s links, gives about 90: a real chain of 48 would
+# deadlock too.
+# A TIMEOUT whose log shows jobs sent and no patch back, or that stops
+# mid-render, is this, not the link fabric.  Fixing it means
+# changing the occam (an outputBuffer that can hold every credited job,
+# so that loadBalance never blocks sending one) and rebuilding the
+# images.  More in ../../../THREADED-NODES.md, "The reworked tracer at 24
+# nodes and more".
+#
+# A deadlocked threaded network now sleeps.  Until 2026-11-04 a node
+# holding a packet no process was waiting for spun on the host (counted
+# as ready, its idle wait never slept), so a hung 24-node run kept ~9
+# cores busy.  Idle nodes used to burn a full second of usleep(50)
+# spinning; they now poll with a few-millisecond timeout and 1ms slices,
+# so large arrangements are no longer pathologically slow.  Oversubscribed
+# runs still take wall time, so give them a budget.
 #
 # Results are only meaningful on an idle machine.  This box also runs chip
 # jobs (yosys, klayout, ngspice); at load > ~10 runs fail spuriously with
@@ -77,9 +112,10 @@ KEEP=0
 VERBOSE=0
 SL="-sl"   # shared-memory links; --ipc selects nanomsg ipc:// instead
 THREADS=0
+LIMIT=""  # --limit: no run gets longer than this
 
 usage() {
-    sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -89,6 +125,7 @@ while [ $# -gt 0 ]; do
         --sizes)   SIZES="${2//,/ }";  shift 2 ;;
         --max)     MAXN="$2";          shift 2 ;;
         --timeout) BASE_TIMEOUT="$2";  shift 2 ;;
+        --limit)   LIMIT="$2";         shift 2 ;;
         --ipc)     SL="";              shift ;;
         --threads) THREADS=1; SL="";   shift ;;
         --keep)    KEEP=1;             shift ;;
@@ -200,6 +237,9 @@ run_one() {
     local timeout_s=$(( BASE_TIMEOUT + n * 8 ))
     if [ "$n" -gt "$NCPU" ]; then
         timeout_s=$(( timeout_s * (n + NCPU - 1) / NCPU ))
+    fi
+    if [ -n "$LIMIT" ] && [ "$timeout_s" -gt "$LIMIT" ]; then
+        timeout_s=$LIMIT
     fi
 
     rm -f "$BIN_DIR/ray.ppm"

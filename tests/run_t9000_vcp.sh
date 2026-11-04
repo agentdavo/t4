@@ -35,6 +35,9 @@
 #                       process is timesliced after two periods, 256us
 #                       each on a T9000 (-s9, ISM 8.2.4) and 1024us on a
 #                       T800 (TCWG 6.3.1)
+#   test_idle_mailbox   two threaded nodes: an idle node sleeps while a
+#                       packet no process is waiting for sits in one of its
+#                       link mailboxes (checked by t4's host CPU time)
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).
@@ -72,10 +75,26 @@ emulate() {     # emulate NAME TIMEOUT [VAR=value...] -- [t4 option...]
     while [[ $# -gt 0 && "$1" != "--" ]]; do vars+=("$1"); shift; done
     [[ $# -gt 0 ]] && shift
     opts=("$@")
-    # -k: t4 exits on SIGTERM only between instructions
-    ( cd "$tmp" && env -u DISPLAY T4_UART_CONSOLE=0 T4_UART_LOG="$tmp/$name.uart" \
+    # -k: t4 exits on SIGTERM only between instructions.  `times` leaves
+    # the host CPU time of the run in NAME.times, for cpu_below.
+    ( cd "$tmp" && { env -u DISPLAY T4_UART_CONSOLE=0 T4_UART_LOG="$tmp/$name.uart" \
         "${vars[@]}" timeout -k 5 "$limit" "$T4_BIN" -s806 -sm 26 -ss \
-        "${opts[@]}" -sb "$tmp/$name.btl" >"$tmp/$name.log" 2>&1 ) || true
+        "${opts[@]}" -sb "$tmp/$name.btl" >"$tmp/$name.log" 2>&1 || true; } &&
+        times >"$tmp/$name.times" ) || true
+}
+
+cpu_below() {   # cpu_below NAME SECONDS: the run took less host CPU time
+    local cpu
+    # the second line of `times` is the children's, "0m1.234s 0m0.056s"
+    cpu="$(sed -n 2p "$tmp/$1.times" 2>/dev/null |
+           awk '{ n = 0; for (i = 1; i <= 2; i++) { split($i, t, /[ms]/)
+                  n += t[1] * 60 + t[2] }; printf "%.2f", n }')"
+    if [[ -n "$cpu" ]] && awk -v c="$cpu" -v l="$2" 'BEGIN { exit !(c < l) }'; then
+        echo "PASS $1: host CPU ${cpu}s, under ${2}s"
+    else
+        echo "FAIL $1: host CPU ${cpu:-?}s, limit ${2}s"
+        failures=$((failures + 1))
+    fi
 }
 
 verdict() {     # verdict NAME
@@ -199,5 +218,12 @@ run_test test_timeslice_t9000_net "$ts_src -DEXPECT_T9000=1" \
     5s SPYNET="$tmp/sync.map" -- -s9 -st -sn -2
 run_test test_timeslice_t800_net "$ts_src -DEXPECT_T9000=0" \
     5s SPYNET="$tmp/sync.map" -- -st -sn -2
+# Node 0 ends idle with one link mailbox full and nobody waiting on it.
+# Without the fix it spins until the timeout, a core's worth of CPU time;
+# with it the network sleeps.
+run_test test_idle_mailbox \
+    "$TESTS/test_idle_mailbox.c $TOP/lib/transputer-conc.c" \
+    4s SPYNET="$tmp/sync.map" -- -st -sn -2
+cpu_below test_idle_mailbox 1.5
 
 exit $(( failures > 0 ))
