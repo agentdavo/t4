@@ -179,19 +179,75 @@ FP stores 32.0 M to 31.7 M.  What is left is integer code:
 | pointSample | 464,272 | 115 | 105 | 0.91 |
 | TransGlobal | 193,974 | 91 | 68 | 0.75 |
 
+### Variable subscripts on local arrays (2026-11-05)
+
+In the first loop of `ellipsoidSect`, TinyCC parked the address of
+`point` before computing `&point[i]`. The same pattern occurred in
+the loops over `normal` and `matrix`. The backend can push the index
+first and the frame address second, in the order `wsub` takes them:
+
+    before: ldlp 37; stl 9; ldl 18; ldl 9; wsub
+    after:  ldl 18; ldlp 37; wsub
+
+Measured against compiler `310efe5b`, one T800, model 3 at 256 x 256,
+with fusion off and the same timing table for all three runs:
+
+| Build | Executed instructions | Modeled cycles | ellipsoidSect cycles/call |
+|---|---:|---:|---:|
+| Rebuilt Occam BTL from t4 `7dbdf73` | 1,058,991,394 | 2,947,938,372 | 1,048 |
+| TinyCC baseline | 1,284,141,947 | 3,265,578,467 | 1,266 |
+| TinyCC with direct local-array addressing | 1,240,136,003 | 3,201,615,573 | 1,180 |
+
+The change saved 63,962,894 cycles across the render, including
+31,168,530 in the 360,594 calls to `ellipsoidSect`. All four reference
+PPMs matched byte for byte on one and four nodes. Model 3 also matched
+on 16 and 64 nodes. Both C builds used the same T800 runtime archive.
+
+### Keeping a store address across FPU instructions (2026-11-05)
+
+In the first loops of `ellipsoidSect` and `coneSect`, Occam loads both
+indexed source floats, subtracts, then computes the destination address
+and executes `fpstnlsn`. C computes the destination first. Its address
+can stay on the integer stack while each `fpldnlsni` consumes the two
+words above it. The existing stack scheduler now knows those effects.
+From the disassembly of the first `ellipsoidSect` loop, with the same
+source loads and subtraction in both C builds:
+
+    before: ldl 18; ldlp 37; wsub; stl 9; <source loads and fpsub>; ldl 9; fpstnlsn
+    after:  ldl 18; ldlp 37; wsub;        <source loads and fpsub>;        fpstnlsn
+
+One T800, model 3, 256 x 256. The C builds used the same runtime built
+from `3fae103e`. Counts are for the whole render with instruction fusion off.
+
+| Build | Executed instructions | Modeled T800 cycles | coneSect cycles/call | ellipsoidSect cycles/call |
+|---|---:|---:|---:|---:|
+| Occam BTL | 1,058,991,381 | 2,947,938,342 | 1,706 | 1,048 |
+| TinyCC `3fae103e` | 1,240,130,302 | 3,201,610,690 | 1,809 | 1,180 |
+| With FPU instructions modeled by the scheduler | 1,203,123,620 | 3,142,698,837 | 1,753 | 1,124 |
+
+The scheduler saved 58,911,853 modeled cycles (1.84% of the C render).
+It eliminated 24.6 million `stl` and 21.8 million `ldl` executions,
+while adding 9.9 million `rev` executions where a store needed its two
+operands swapped. `coneSect` and `ellipsoidSect` together account for
+42.5 million cycles saved. The C gap to Occam fell from 8.61% to 6.61%.
+All four models matched the reference PPMs on one and four nodes. Model
+3 also matched on the 16- and 64-node chains.
+
 Reproducing: `ophist_patch.py` adds a `T4_OPHIST=file` counter to a copy
 of t4's `p.c` (fusion off; every instruction counted at its address with
 its length and timing operand, written at exit); `oph.py` reads the INMOS
 table, attributes the counts to routines and pairs them:
 
-    git -C ../../.. archive master | tar -x -C /tmp/t4op
+    mkdir -p /tmp/t4op
+    git -C ../../.. archive HEAD | tar -x -C /tmp/t4op
     python3 ophist_patch.py /tmp/t4op/p.c && make -C /tmp/t4op -f Makefile.linux t4
     printf '3\n' | SPYNET=../bin/raytrace1.map T4_OPHIST=occam.txt \
         /tmp/t4op/t4 -st -s8 -sn -1 -sb ../bin/raytrace1.btl
     printf '3\n' | SPYNET=bin256/raytrace1.map T4_OPHIST=c.txt \
         /tmp/t4op/t4 -st -s8 -sn -1 -sb bin256/raytrace1.btl
+    base=$(awk '/Code from .raytrace\.lku./ {getline; sub(/^#/, "0x", $1); print $1; exit}' ../bin/raytrace1.map)
     python3 oph.py ../../../utils/instructions.txt occam.txt occ_code.bin \
-        0x80002B8C c.txt bin256/obj/raytrace.elf.tccsym out
+        "$base" c.txt bin256/obj/raytrace.elf.tccsym out
 
 `occ_code.bin` is the occam's `raytrace.lku` as loaded (the
 `T4_DUMP_WORDS` dump under "Reproducing" below, as bytes).
@@ -424,17 +480,33 @@ expression values.
 ## Reproducing
 
 ```
-# occam: profile, and its code as loaded (T4_DUMP_WORDS, 256 words an address)
-W=; for i in $(seq 0 11); do W="$W$(printf 0x%08X $((0x80002B8C + i*1024))):256,"; done
-SPYNET=../bin/raytrace1.map T4_IPTR_SAMPLE=93001 T4_DUMP_WORDS=${W%,} \
-    t4 -st -s8 -sn -1 -sb ../bin/raytrace1.btl     # answer 3
+# Read the node 0 code range from the map shipped with the Occam BTL.
+read base size < <(awk '/Code from .raytrace\.lku./ {getline; sub(/^#/, "0x", $1); print $1, $3; exit}' ../bin/raytrace1.map)
+W=
+for ((off=0; off<size; off+=1024)); do
+    W+=$(printf '0x%08X:256,' "$((base + off))")
+done
+printf '3\n' | SPYNET=../bin/raytrace1.map T4_IPTR_SAMPLE=93001 T4_DUMP_WORDS=${W%,} \
+    t4 -st -s8 -sn -1 -sb ../bin/raytrace1.btl >occ-dump.log 2>&1
+python3 - "$base" "$size" <<'PY'
+import re, struct, sys
+base, size = int(sys.argv[1], 0), int(sys.argv[2])
+words = {}
+with open('occ-dump.log', 'rb') as log:
+    for line in log:
+        m = re.match(rb'M 0x([0-9A-F]+) 0x([0-9A-F]+)', line)
+        if m:
+            words[int(m[1], 16)] = int(m[2], 16)
+code = b''.join(struct.pack('<I', words[a]) for a in range(base, base + size, 4))
+with open('occ_code.bin', 'wb') as f:
+    f.write(code[:size])
+PY
 # C: the same, and the symbol map beside the ELF
 SPYNET=bin256/raytrace1.map T4_IPTR_SAMPLE=221001 \
     t4 -st -s8 -sn -1 -sb bin256/raytrace1.btl
 dast -O <addr> code.bin                            # transputer/ttools/dast
 ```
 
-`raytrace.lku` is at #80002B8C on node 0 (`../bin/raytrace1.map`).  The
-1991 `oc` in `../../itools` (2.01.01) does not compile this version of the
-source, so the occam side is the shipped boot file's code, dumped from
-memory.
+The older BTL put `raytrace.lku` at #80002B8C. The rebuilt one-node BTL
+in t4 `7dbdf73` puts its 12,248 bytes at #80002C94. Always use the map
+paired with the BTL being profiled.
