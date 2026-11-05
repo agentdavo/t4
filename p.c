@@ -169,6 +169,7 @@ int shlink_free (void){return EINVAL;}
 #include "tvx_q8k.h"
 #include "tvx_gfx.h"
 #include "t9000_group.h"
+#include "t800_cycles.h"
 #include "t9000_protect.h"
 #include "t9000_pmi.h"
 #include "t9000_vcp.h"
@@ -198,6 +199,10 @@ uint32_t MemSize     = 1 << 21;
  * from fb_legacy_base (that would wrap and swallow the UART at 0x10000000). */
 T4_THREAD_LOCAL t9k_state t9k;  /* per node thread in a threaded network */
 t9k_state t9k_proto;
+/* T4_EST_CYCLES (t800_cycles.h): the mode is set once at start-up, the
+ * totals are per node thread. */
+int t8c_enabled;
+T4_THREAD_LOCAL uint64_t t8c_cycles, t8c_insns, t8c_prefixes;
 
 /* For the C104 router threads (t4_fabric.c), which time packets with the
  * configured model rather than a node's own. */
@@ -2376,8 +2381,9 @@ static void t4_fill_combinations(void)
         int i;
         memset(combinations, 0, sizeof(combinations));
         /* -s414/-s425 check each instruction on its own (t4xx_has_opr):
-         * a fused pair would hide an FPU or T425 instruction */
-        if (t4_isa_strict)
+         * a fused pair would hide an FPU or T425 instruction.  The T800
+         * cycle estimate costs each instruction with its own registers. */
+        if (t4_isa_strict || t8c_enabled)
                 return;
         for (i = 0; NO_ICODE != combined[i].code0; i++)
                 combinations[(combined[i].code0 << 10) + combined[i].code1] = (u_char)(1 + i);
@@ -4746,7 +4752,7 @@ void mainloop (void)
 	 * settled by now.  One loop-invariant test keeps every one of them off
 	 * the common path; production runs pay a register test, not loads. */
 	rare_hooks = !production_quiet || stop_iptr || dcache_enabled > 0 ||
-	             t9k.enabled || t4_isa_strict ||
+	             t9k.enabled || t4_isa_strict || t8c_enabled ||
 #ifndef EMUDEBUG
 	             fast_block_enabled || fast_primary_enabled ||
 #endif
@@ -5590,6 +5596,10 @@ ExecuteInstr:
 				  t9k_bytes);
 		}
 	}
+	if (__builtin_expect(rare_hooks && t8c_enabled, 0))
+		t8c_count (Icode, OReg, AReg, BReg,
+			   (uint32_t)(IPtr - Icache[islot].ip),
+			   FAReg.length == FP_REAL64);
 	heartbeat_counter++;
 	/* The IPtr sampler and the framebuffer recorder both fire on
 	 * instruction counts: one compare against the nearer of their next
@@ -6974,6 +6984,8 @@ DescheduleOutWord:
 			   CReg = BReg;
 			   BReg = AReg;
 			   AReg = ClockReg[ProcPriority];
+			   if (__builtin_expect(t8c_enabled != 0, 0))
+				AReg = (uint32_t) (t8c_enabled == 1 ? t8c_cycles : t8c_insns);
 			   IPtr++;
 			   break;
                 case 0x23: /* testlds     */

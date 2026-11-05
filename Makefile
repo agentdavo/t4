@@ -54,7 +54,7 @@ OBJ	= $(FDMOBJ) curterm.o arithmetic.o fparithmetic.o netcfg.o shlink.o server.o
 # them silently leaves a stale t4 binary behind.
 HDR	= emu.h processor.h opcodes.h arithmetic.h fparithmetic.h fpiface.h \
 	  tvx.h tvx_vec.h tvx_iq.h tvx_gguf_tables.h tvx_gguf_decode.h tvx_q8k.h \
-	  t9000_group.h t9000_protect.h t9000_pmi.h display_backend.h \
+	  t9000_group.h t800_cycles.h t9000_protect.h t9000_pmi.h display_backend.h \
 	  mmio.h debug.h t4debug.h decode_cache.h
 
 t4 : $(SRC) $(HDR)

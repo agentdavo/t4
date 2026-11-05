@@ -54,6 +54,7 @@ typedef intptr_t pid_t;
 #include "cpu_state.h"
 #include "t4_fabric.h"
 #include "t9000_group.h"
+#include "t800_cycles.h"
 #include "t9000_ctl.h"
 #include "netcfg.h"
 #include "display_backend.h"
@@ -179,6 +180,7 @@ static void *t4_node_thread(void *arg)
         } while (t9k_ctl_after_halt());
         t4_in_mainloop = 0;
         t9k_report();
+        t8c_report();
         return NULL;
 }
 
@@ -935,6 +937,15 @@ int main (int argc, char **argv)
 			        "(estimate; see transputer/t4/t9000_group.h)\n");
 		}
 	}
+	{
+		const char *e = getenv ("T4_EST_CYCLES");
+		if (e && (*e == '1' || *e == '2')) {
+			t8c_enabled = *e - '0';
+			printf ("-I-EMU: T800 cycle estimate enabled, ldtimer "
+			        "counts %s (see transputer/t4/t800_cycles.h)\n",
+			        t8c_enabled == 1 ? "cycles" : "instructions");
+		}
+	}
         CLineTagsSize = ((MemSize >> T4CLINEBITS) >> 3);
 	if (cpu_setup_ram(&t4_cpu0) < 0)
 	{
@@ -1438,6 +1449,7 @@ void t4_signal_exit (int signal)
 
         fflush (stdout);
         t9k_report ();
+        t8c_report ();
         t4_ls_report ();
         {
                 extern void t4_net_dump (void);
