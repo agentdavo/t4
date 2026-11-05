@@ -3295,6 +3295,9 @@ void alt_channel(Channel *chan)
 
 #define SCH_POLL        50
 #define SCH_POLL_IDLE   1000
+/* the longest a -sl node sleeps on its wake count before it looks at its
+ * mailboxes anyway: what a wake-up that never came would cost */
+#define SHL_WAIT_US     5000
 
 /* Whether a mailbox linkcomms() polls is ready: the In and Out channels it
  * chooses, chosen the same way.  t4_node_idle_wait() asks this before it
@@ -3510,9 +3513,17 @@ int linkcomms (char *where, int doBoot, int timeOut)
                 ;
         else if (channels[0]->schbuf) /* shared channels? */
         {
+                /* a -sl node sleeps on its wake count (t4_fabric.c); read
+                 * before each look, so a wake between the look and the
+                 * wait ends the wait at once */
+                uint32_t *shl = (t4cpu && t4cpu->idle) ? NULL : t4_shl_word (nodeid);
+                uint32_t shlgen = 0;
+
                 timeOut *= 1000;
                 do
                 {
+                        if (shl)
+                                shlgen = __atomic_load_n (shl, __ATOMIC_ACQUIRE);
                         ret = 0;
                         for (i = 0; i < npfd; i++)
                         {
@@ -3542,6 +3553,11 @@ int linkcomms (char *where, int doBoot, int timeOut)
                                         t4_node_idle_wait(t4cpu, ms, doBoot);
                                         timeOut = 0;
                                         continue;
+                                } else if (shl) {
+                                        long w = timeOut < SHL_WAIT_US ? timeOut : SHL_WAIT_US;
+
+                                        timeOut -= t4_shl_wait (shl, shlgen, w);
+                                        if (timeOut < 0) timeOut = 0;
                                 } else {
                                         int slice = (timeOut >= SCH_POLL_IDLE) ? SCH_POLL_IDLE : SCH_POLL;
                                         usleep (slice); timeOut -= slice;

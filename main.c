@@ -343,6 +343,7 @@ void stop_xputers (void)
                 for (i = 1; -1 != xputers[i]; i++)
                 {
                         SharedEvents[i] = 1;
+                        t4_wake_node_id (i);    /* if it sleeps on a link */
                         xputers[i] = -1;
                 }
         }

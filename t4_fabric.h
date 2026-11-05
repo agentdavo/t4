@@ -38,6 +38,10 @@ int  t4_node_idle_wait(cpu_t *c, int timeout_ms, int doBoot);
 int  t4_node_idle_wait_us(cpu_t *c, long timeout_us, int doBoot);
 int  t4_node_any_ready(int doBoot);
 int  t4_link_ready(int doBoot);   /* p.c */
+/* a -sl node's wake count in the shared segment, or NULL; and a bounded
+ * wait for it to move from g (returns the microseconds waited) */
+uint32_t *t4_shl_word(int nid);
+long t4_shl_wait(uint32_t *w, uint32_t g, long us);
 void t4_net_request_stop(void);
 int  t4_net_stop_requested(void);
 

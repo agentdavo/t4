@@ -11,8 +11,7 @@
 #
 #   ./testall.sh                  # every arrangement, model 3, shared-memory links
 #   ./testall.sh --max 8          # arrangements up to 8 processors
-#   ./testall.sh --ipc            # nanomsg ipc:// instead of -sl (needed at N>=8
-#                                 # under load; SHM idle-polling storms the CPU)
+#   ./testall.sh --ipc            # nanomsg ipc:// instead of -sl
 #   ./testall.sh --threads        # one t4, a thread per node (-st)
 #   ./testall.sh --models 1,2,3,4 # all four scenes
 #   ./testall.sh --sizes 1,2,4    # just these
@@ -49,9 +48,11 @@
 # burn a full second of usleep(50) spinning; they now poll with a
 # few-millisecond timeout and 1ms slices, so large arrangements are no
 # longer pathologically slow.  Oversubscribed runs still take wall time,
-# so give them a budget.  -sl processes poll their links: at 64 nodes a
-# run takes minutes, at 80 more than 15 on a busy host.  A worker waits
-# up to T4_BOOT_WAIT seconds (default 600) for its boot code.
+# so give them a budget.  -sl processes sleep on their links since
+# 2026-11-05 (a futex word in the shared segment, which the far process
+# wakes): 80 nodes take 12-30 s, where polling them took 201 s, and on a
+# busy host more than 15 minutes.  A worker waits up to T4_BOOT_WAIT
+# seconds (default 600) for its boot code.
 #
 # Results are only meaningful on an idle machine.  This box also runs chip
 # jobs (yosys, klayout, ngspice); at load > ~10 runs fail spuriously with

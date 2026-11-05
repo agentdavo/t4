@@ -498,12 +498,83 @@ void t4_idle_destroy(cpu_t *c)
         c->idle = NULL;
 }
 
+/* ---- waking a node of a -sl network (another process) --------------------
+ *
+ * A node of a network of processes with shared-memory links (-sl) used to
+ * look at its mailboxes in 1 ms usleep slices whenever it had nothing to
+ * run, so every hand-over waited for the far process's next look.  Each
+ * node now has a wake count in the segment's spare space (after the event
+ * bytes, SHLINK_EXTRA in p.c), which whoever fills or empties one of its
+ * mailboxes bumps and futex-wakes (t4_wake_node_id, the same call that
+ * wakes a threaded node), and an idle node futex-waits on it
+ * (linkcomms).  The wait is bounded (SHL_WAIT_US in p.c), so a wake-up that
+ * never comes costs a few milliseconds, never a hang: a futex on this
+ * segment was tried once before (SharedWake) and reverted after an 8-node
+ * run "hung, 0 R patch", which the ray tracer's own farm deadlock also
+ * produced.  Linux only; elsewhere, and past 128 nodes, -sl polls. */
+extern u_char *SharedEvents;
+
+#define SHL_WAKE_OFF    512             /* bytes into the spare space */
+#define SHL_WAKE_NODES  128             /* (1024 - 512) / 4 */
+
+uint32_t *t4_shl_word(int nid)
+{
+#if defined(__linux__)
+        if (!SharedEvents || nid < 0 || nid >= SHL_WAKE_NODES)
+                return NULL;
+        return (uint32_t *)(SharedEvents + SHL_WAKE_OFF) + nid;
+#else
+        (void)nid;
+        return NULL;
+#endif
+}
+
+static void t4_shl_wake(int nid)
+{
+#if defined(__linux__)
+        uint32_t *w = t4_shl_word(nid);
+
+        if (!w)
+                return;
+        __atomic_add_fetch(w, 1, __ATOMIC_RELEASE);
+        syscall(SYS_futex, w, FUTEX_WAKE, 1, NULL, NULL, 0);
+#else
+        (void)nid;
+#endif
+}
+
+/* Wait at most us microseconds for the wake count at w to move from g;
+ * returns how long it waited, at least 1. */
+long t4_shl_wait(uint32_t *w, uint32_t g, long us)
+{
+#if defined(__linux__)
+        struct timespec t0, t1, ts;
+        long el;
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        ts.tv_sec = us / 1000000L;
+        ts.tv_nsec = (us % 1000000L) * 1000L;
+        if (__atomic_load_n(w, __ATOMIC_ACQUIRE) == g)
+                syscall(SYS_futex, w, FUTEX_WAIT, g, &ts, NULL, 0);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        el = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000L;
+        return el > 0 ? el : 1;
+#else
+        (void)w; (void)g;
+        return us;      /* not reached: t4_shl_word() is NULL here */
+#endif
+}
+
 void t4_wake_node_id(int nid)
 {
         t4_fabric_t *f = t4_fabric;
         t4_router_t *r;
 
-        if (!f || nid < 0)
+        if (!f) {
+                t4_shl_wake(nid);       /* a -sl network, if any */
+                return;
+        }
+        if (nid < 0)
                 return;
         if (nid < f->nnodes)
                 t4_node_wake(f->cpus[nid]);

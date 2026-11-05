@@ -47,6 +47,8 @@
 #                       each node keeps its own boot link
 #   test_timer_sleep_one one node: waiting only on a timer, it sleeps, and
 #                       the timers keep time (checked by host CPU time)
+#   test_sl_wake        two processes with shared-memory links (-sl): a
+#                       node waiting on a link is woken by the far process
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).
@@ -253,5 +255,53 @@ run_test test_boot_links "$TESTS/test_boot_links.c $TOP/lib/transputer-conc.c" \
 run_test test_timer_sleep_one \
     "$TESTS/test_timer_sleep_one.c $TOP/lib/transputer-conc.c" 5s
 cpu_below test_timer_sleep_one 0.6
+
+# Two processes with shared-memory links (-sl), as testall.sh starts them:
+# node 1 first, which creates the segment (keyed by ftok(map, 1984)), then
+# node 0 with the program.  Node 1 is stopped and the segment removed after.
+shm_key() {     # shm_key FILE: ftok(FILE, 1984) as glibc computes it
+    local dev ino
+    eval "$(stat -c 'dev=%d ino=%i' "$1")"
+    printf '0x%08x' $(( (192 << 24) | ((dev & 255) << 16) | (ino & 65535) ))
+}
+shm_drop() {    # shm_drop KEY
+    local id
+    id=$(ipcs -m | awk -v k="$1" '$1 == k { print $2 }')
+    [[ -n "$id" ]] && ipcrm -m "$id" 2>/dev/null
+    return 0
+}
+run_sl_test() { # run_sl_test NAME "SOURCES" TIMEOUT MAP
+    local name="$1" sources="$2" limit="$3" map="$4" key n1 waited=0
+    # shellcheck disable=SC2086 # SOURCES is a word list
+    if ! build "$name" $sources; then
+        echo "FAIL $name: build"
+        sed 's/^/    /' "$tmp/$name.build"
+        failures=$((failures + 1))
+        return
+    fi
+    key=$(shm_key "$map")
+    shm_drop "$key"
+    # exec: $! is then timeout itself, which passes the kill below to t4
+    ( cd "$tmp" && exec env -u DISPLAY SPYNET="$map" T4_UART_CONSOLE=0 \
+        T4_UART_LOG="$tmp/$name.n1.uart" timeout -k 2 "$limit" "$T4_BIN" \
+        -s806 -sm 26 -sl -sn 1 </dev/null >"$tmp/$name.n1.log" 2>&1 ) &
+    n1=$!
+    until ipcs -m | awk -v k="$key" '$1 == k { f = 1 } END { exit !f }' ||
+          [[ $waited -ge 50 ]]; do
+        sleep 0.1; waited=$((waited + 1))
+    done
+    emulate "$name" "$limit" SPYNET="$map" -- -sl -sn 0
+    kill "$n1" 2>/dev/null || true
+    wait "$n1" 2>/dev/null || true
+    shm_drop "$key"
+    verdict "$name"
+}
+# 1000 round trips between the two processes must take < 0.4 s: an idle
+# -sl node polled in 1 ms slices (1.1 s); now the far process wakes it
+# (25-60 ms).
+printf '%s\n' 'Connect HOST to processor 0 link 0' \
+    'Connect processor 0 link 1 to processor 1 link 1' >"$tmp/sl.map"
+run_sl_test test_sl_wake "$TESTS/test_sl_wake.c $TOP/lib/transputer-conc.c" \
+    4s "$tmp/sl.map"
 
 exit $(( failures > 0 ))

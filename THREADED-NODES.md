@@ -76,7 +76,7 @@ One thread per *node* preserves that rule: each thread is the unique mutator of 
 ### Pain points this refactor addresses
 
 - **Process tax.** N=80 is 80 address spaces, 80 timer threads, 80 copies of the 11k-line text, 80 SysV/ipc objects. Oversubscribe on 10 cores is already the `testall.sh` warning.
-- **SHM operational hazards.** `testall.sh` is mostly a SHM janitor: `ftok` reconstruction, `ipcrm`, wait-for-detach, start-node-1-first. Futex-on-SharedWake was tried and reverted (N=8 SHM hung, 0 R patch) — that was a *cross-process* futex on SysV memory, not an in-process private wait.
+- **SHM operational hazards.** `testall.sh` is mostly a SHM janitor: `ftok` reconstruction, `ipcrm`, wait-for-detach, start-node-1-first. Futex-on-SharedWake was tried and reverted (N=8 SHM hung, 0 R patch) — that was a *cross-process* futex on SysV memory, not an in-process private wait.  (2026-11-05: the project lifted that rule, and `-sl` nodes now sleep on a bounded cross-process futex; see rule 5 below.)
 - **Idle poll.** `linkcomms()` on schbuf busy-waits in 1 ms `usleep` slices (`p.c` ~2815–2842). `npfd==0` now sleeps `timeOut` ms and returns 1 (not instant deadlock). That is correct but still wakes 80 idle workers every few milliseconds.
 - **`t4 -sn -N` always forces `-sl`.** There is no in-process option.
 
@@ -88,7 +88,7 @@ Cite and keep:
 2. **Per-channel `CtrlByte`** (`Channel.CtrlByte` in `processor.h`; comment in `p.c` ~2392–2408). Was a file-scope global; a concurrent `handleboot()` left `WPtr=0`.
 3. **Idle poll.** `LTO_IDLE=5` (`processor.h:82`), `SCH_POLL_IDLE=1000` (`p.c:2720`), `npfd==0` sleeps and returns 1 (`p.c` ~2793–2804).
 4. **`schedule(IdleProcess_p)` ignored.** `schedule()` returns if `GetDescWPtr(wdesc) == NotProcess_p` (`p.c` ~9411–9413). `IdleProcess_p` is `NotProcess_p | LoPriority`.
-5. **Futex-on-SharedWake reverted.** Do not resurrect cross-process futex on SHM.
+5. ~~**Futex-on-SharedWake reverted.** Do not resurrect cross-process futex on SHM.~~ **Lifted by the user on 2026-11-05.** A `-sl` node now sleeps on a wake count in the shared segment, futex-woken by the far process, and every wait is bounded at 5 ms, so a lost wake-up costs 5 ms and never a hang ("`-sl` nodes sleep on their links", near the end).
 
 ### `emu_t` is not a substitute for this work
 
@@ -112,7 +112,7 @@ Cite and keep:
 - Threading a single node’s ISA (decode vs execute, concurrent `word_int` on one `mem`).
 - Changing occam/config/BTL, the map file format, or the boot protocol (`handleboot` C_POKE/C_PEEK/C_BOOT).
 - Replacing nanomsg for *cross-process* networks.
-- Making `-sl` SysV SHM faster (leave it as-is; threaded mode is the in-process replacement).
+- Making `-sl` SysV SHM faster (leave it as-is; threaded mode is the in-process replacement).  Done after all on 2026-11-05, as its idle wait only (rule 5).
 - Windows/macOS threaded mode in the first landing (Makefiles exist; Linux is first).
 - Finishing the `emu_t` / `cpu.c` rewrite, closing the remaining ~1.45× Dhrystone gap to the 2023 source (`T4_PERF.md`), or JIT.
 - Per-node SDL windows, per-node TAP devices, or migrating a node between threads.
@@ -1489,7 +1489,8 @@ SharedWake futex was reverted when "N=8 SHM hung, 0 R patch".  That
 symptom, no patch back at 8 nodes, is also what the ray tracer's own
 farm deadlock produced (fixed in the program, above), so the futex may
 not have been the cause; nothing here shows either way, and the rule
-stands until the project lifts it.
+stands until the project lifts it.  (It did, the same day: "`-sl` nodes
+sleep on their links", below.)
 
 Waiting without a limit exposed a bug the limit had hidden: the link a
 node is being booted on (`BootLink`, the one `linkcomms()` then listens
@@ -1567,8 +1568,9 @@ round again, so a 2 s `tin` cost 2 s of host CPU (4.07 s of CPU in a
 (`timer_wait_us()`: the high priority clock ticks every 1us, the low
 every 64us, TCWG 6.3.1), or until a link wakes it, and polls only that
 last stretch, so a timer fires as promptly as before.  Since 2026-11-05
-a node on its own sleeps too (`usleep`, ended early by a signal), and a
-node of a `-sl` or `ipc://` network polls its links for the time
+a node on its own sleeps too (`usleep`, ended early by a signal), a node
+of a `-sl` network sleeps on its wake count ("`-sl` nodes sleep on their
+links", below) and one of an `ipc://` network polls its links for the time
 (`tests/test_timer_sleep_one.c`: 1.9 s of host CPU in 1.8 s of waits
 before, 0.15 s after; the Linux image boots to its desktop as before,
 its idle loop being no timer wait).  `tests/test_timer_sleep.c`: a word that
@@ -1596,3 +1598,46 @@ the TCWG also defines ffw as "the smallest word address > MemStart +
 Codelength", one word higher when the code ends on a word, and the INMOS
 loaders (icollect's bootstrap) wild-jump there, so they were written for
 the first reading.
+
+**`-sl` nodes sleep on their links** (2026-11-05).  A `-sl` node with
+nothing to run looked at its mailboxes in 1 ms `usleep` slices
+(`SCH_POLL_IDLE`), so every hand-over between two processes waited for
+the far process's next look, and 80 idle processes woke 80,000 times a
+second between them.  Rule 5 of "Recent fixes this design must not
+re-litigate" forbade the fix, a futex on the shared segment; the user
+lifted it the same day.  Each node now has a 32-bit wake count in the
+segment's spare space (`SHLINK_EXTRA`, after the per-node event bytes:
+byte 512 on, so 128 nodes; a node past that polls as before).  Whoever
+fills or empties a mailbox bumps the far node's count and `FUTEX_WAKE`s
+it (`t4_wake_node_id()`, the call that already wakes a threaded node,
+which with no fabric goes to the segment), and an idle node reads its
+count before it looks at its mailboxes and, if nothing is ready,
+`FUTEX_WAIT`s for the count to move (`linkcomms()`, `t4_shl_wait()`).
+The operations are the shared ones, not `_PRIVATE`: waiter and waker are
+different processes, and the kernel keys the word by the segment's page.
+A wake between the look and the wait has already moved the count, so the
+wait returns at once; and every wait is bounded at 5 ms (`SHL_WAIT_US`),
+so a lost wake-up costs 5 ms, never a hang.  Node 0 of `t4 -sn -N` also
+wakes the children it tells to stop.  Linux only; elsewhere `-sl` polls.
+Why the old SharedWake futex hung is not known: its code was never
+committed, and only this document mentions it.
+
+`tests/test_sl_wake.c` (`run_t9000_vcp.sh` starts node 1, which creates
+the segment, then node 0): 1000 round trips between two `-sl` processes
+take 1.09-1.12 s polling and 25-57 ms woken; the test allows 0.4 s.  The
+ray tracer, model 3, `testall.sh` with `-sl`, the new t4 and then the
+old (7261da5) on the same host, load 1-8:
+
+| N | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 | 64 | 80 | all ten |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| polling | 5 s | 8 s | 9 s | 12 s | 18 s | 26 s | 38 s | 72 s | 128 s | 201 s | 8 min 53 s |
+| woken | 6 s | 2 s | 1 s | 2 s | 1 s | 2 s | 2 s | 5 s | 7 s | 12 s | 56 s |
+
+Every run rendered the reference image.  Models 1, 2 and 4 at 2, 8, 24
+and 80 nodes pass too (80 nodes 47-61 s, load 8-12), as does `t4 -sn -N`
+(node 0 spawns the `-sl` children): 8 nodes 14.9 s -> 3.2 s, 32 nodes
+40.5 s -> 5.3 s, and every child exits with node 0.  `--threads` and
+`--ipc` are unchanged (only a `-sl` node has a wake count).  At 80 nodes on a busy host (load 10-16, run alternately) `-sl`
+took 29 s and 29 s, `--threads` 18 s and 51 s, `--ipc` 3 s and 5 s:
+`ipc://` is still the fastest, as an output completes there when nanomsg
+accepts it, before the far node has input it.
