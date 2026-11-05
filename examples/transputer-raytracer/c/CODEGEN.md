@@ -252,6 +252,52 @@ table, attributes the counts to routines and pairs them:
 `occ_code.bin` is the occam's `raytrace.lku` as loaded (the
 `T4_DUMP_WORDS` dump under "Reproducing" below, as bytes).
 
+### Global addresses kept in the frame (2026-11-05)
+
+Occam reaches `tree`, `worldModel` and the other globals through its
+static link, `ldl 25; ldnl 31`, about 4 cycles. C loaded each address with
+an `ldc` of eight nibbles, since RAM starts at MinInt: 8 cycles a use, and
+133 M cycles more than occam spent on `ldc` across the render. `sceneSect`
+reloaded `worldModel` three times for every object in the scene.
+
+The compiler's relaxation pass now loads such an address once, after the
+prologue, into a frame word added on top of the frame, and every use
+becomes an `ldl` of that word (`tp_gaddr_cache`). `sceneSect`, before and
+after:
+
+    before: ajw -46; ...; ldl 23; ldc worldModel; wsub; ldnl 0; eqc -1; ...
+    after:  ajw -47; ldc worldModel; stl 46; ...; ldl 23; ldl 46; wsub; ldnl 0; ...
+
+One T800, model 3, 256 x 256, both C builds on compiler main `073f2681`
+with the same runtime; counts for the whole render, fusion off.
+
+| Build | Executed instructions | Modeled T800 cycles | sceneSect | shadeNode | claim |
+|---|---:|---:|---:|---:|---:|
+| Occam BTL | 1,058,991,381 | 2,947,938,342 | 707 | 498 | 61 |
+| TinyCC `073f2681` | 1,203,123,548 | 3,142,698,589 | 680 | 646 | 89 |
+| Globals' addresses in the frame | 1,204,632,279 | 3,097,290,400 | 625 | 634 | 75 |
+| Repeated float constants too | 1,201,334,990 | 3,084,034,732 | 625 | 634 | 75 |
+
+(cycles per call for the three routines.) The addresses save 45,408,189
+modeled cycles (1.44%): `ldc` falls from 202.6 M to 138.5 M cycles,
+offset by 19 M of the `ldl`s that replace it. `sceneSect` is now cheaper
+than occam's. What remains of `ldc` in `shadeNode` (41 cycles a call
+against occam's 9) is mostly the three entry loads themselves, `lights`,
+`grunData` and `tree`, plus `worldModel`, used once.
+
+The same frame words hold a float constant a function loads repeatedly.
+`coneSect` built 1.0 five times and 0.001 four times from eight-nibble
+`ldc`s; now each is stored once at entry and loaded where it lies, a
+new scheduler rule (S10) folding the copy to a scratch word:
+
+    before: ldc #3F800000; stl 15; ldlp 15; fpldnlsn
+    after:  ldlp 62; fpldnlsn
+
+That is another 13,255,668 cycles (`coneSect` 1,753 -> 1,721 a call,
+occam 1,706). Together the C gap to Occam fell from 6.61% to 4.62%. All
+four models matched the reference PPMs on one and four nodes, and model
+3 on 16 and 64, with each build.
+
 ## Programming or compiler?
 
 Both, in that order of discovery.
