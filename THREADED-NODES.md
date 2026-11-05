@@ -1234,6 +1234,12 @@ open them is not established.  A window closes them:
 3.6 s and model 1 in 11 s (0.9 s and about 3 s with node time off);
 `=20000` still deadlocks.
 
+That deadlock was the program's own (below, "Why the program reaches
+it"): the fill loses a race with the first renderer to finish a patch,
+and the stamps had slowed node 0's fill.  The program is fixed since t4
+7dbdf73; how it runs now is in "With the farm fixed" and "Where the jobs
+go", below.
+
 Looking for it turned up the threaded timer's lost timeslices ("Timer",
 above), which this tracer turned out not to depend on, and showed that
 24 and 40 nodes hang with node time off on every build tried (the
@@ -1249,7 +1255,7 @@ loops, host load 12-14; the rest at load 0-13):
 |---|---|---|
 | original tracer, 3-34 nodes x models 1-4 | 14 of 28 images lack a patch; renders 243 s in all | 28 of 28 exact; 299 s |
 | C port, 16 / 64 nodes (three runs each) | exact, 0.68-0.84 / 2.0-3.6 s | exact, 1.30-1.37 / 1.43-1.57 s |
-| reworked occam tracer, 8 / 16 nodes, models 1 and 3 | 39 of 40 pass (40 of 40 without the timer fix) | all time out |
+| reworked occam tracer, 8 / 16 nodes, models 1 and 3 (the program before 7dbdf73) | 39 of 40 pass (40 of 40 without the timer fix) | all time out (all pass with the fixed program) |
 | t4 suite (`run_t9000_vcp.sh`, 12 tests) | pass | pass |
 | `tests/net` (8 scripts), compiler built 2026-11-03 17:53 | pass | pass |
 
@@ -1282,6 +1288,43 @@ run repeat exactly.  Probably the host side: node 0's iserver link is not
 a stamped mailbox, so when the host answers it is still the host's
 business (not checked).  Why stamps space the opening jobs out no longer
 decides whether the farm finishes; it is still not established.
+
+**Where the jobs go (2026-11-05).**  Alone, the stamps spread the farm's
+work badly: at 16 nodes 7-8 of the 16 workers get no job at all and the
+busiest renders about 220, where with node time off every worker gets
+some.  A node's clock is its own instruction count, so without a window
+the nodes nearest the controller run ahead of the rest, and a job crosses
+a hop only once the slower node's clock reaches the faster one's stamp:
+jobs seldom get past the first few workers.  A window bounds that skew.
+`T4_LOCKSTEP_WINDOW=2000` with the stamps spreads the work as evenly as
+node time off or better, at 1.7 times the stamps' render time at host
+load 10-12 and three to four times at load 18-20 (model 3, two runs a
+setting, the fewest and most jobs a worker rendered; 1024 in all):
+
+| 16 nodes, model 3 | node time off | `T4_LOCKSTEP=1` | `T4_LOCKSTEP=1 T4_LOCKSTEP_WINDOW=2000` |
+|---|---|---|---|
+| jobs a worker, t4 7261da5, host load 10-12 | 16-93, 44-88 | 0-219, 0-223 | 38-92, 26-96 |
+| render time | 1.5-1.6 s | 3.4 s | 5.6-5.9 s |
+| jobs a worker, t4 c9f2e7a, load 18-20 | 24-91, 9-144 | 0-230, 0-223 | 38-81, 34-93 |
+| render time | 2.2-3.0 s | 5.0 s | 15.7-19.1 s |
+
+On the other tracers (c9f2e7a, load 10-26, every image exact): the C port
+at 16 / 64 nodes in 1.4-2.5 / 1.8-2.2 s with node time off, 3.5-4.5 /
+3.6-4.4 s with the stamps, 10.9-16.3 / 10.4-16.7 s with the window too;
+the original tracer at 6, 10, 18 and 34 nodes, models 1 and 3, renders
+in 3.4-12 s with the stamps and 6.3-21 s with the window.
+
+Tried for a cheaper fair setting, and dropped (2026-11-05, reworked
+tracer at 16 nodes): a window against a node's link neighbours only (as
+fast as the stamps alone, but the skew adds up along the chain and the
+spread stays 2-152 jobs); a futex wait on the slowest node instead of
+yielding and sleeping (two to eight times slower: with a window of 2000
+the slowest node reaches a waiter's time within a few ticks, so every
+wait is a syscall round trip); and waits that only sleep, with the timer
+slack cut to 1 us, or only yield (no better; only yielding took 40-120 s
+and up to 1800 s of CPU).  The window's cost is the network moving at
+the pace of whichever node the host has descheduled, which no way of
+waiting avoids.
 
 ### The reworked tracer at 24 nodes and more (2026-11-04)
 
