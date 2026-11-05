@@ -45,6 +45,8 @@
 #                       (checked by t4's host CPU time too)
 #   test_boot_links     three threaded nodes booted through different links:
 #                       each node keeps its own boot link
+#   test_timer_sleep_one one node: waiting only on a timer, it sleeps, and
+#                       the timers keep time (checked by host CPU time)
 #
 # Builds with transputer-tcc and transputer-netload from the top of the
 # tinycc_transputer tree.  T4_BIN picks the emulator (default ../t4).
@@ -246,5 +248,10 @@ printf '%s\n' 'Connect HOST to processor 0 link 0' \
     'Connect processor 0 link 2 to processor 2 link 2' >"$tmp/boot3.map"
 run_test test_boot_links "$TESTS/test_boot_links.c $TOP/lib/transputer-conc.c" \
     6s SPYNET="$tmp/boot3.map" -- -st -sn -3
+# About 1.8 s of timer waits on one node: without the fix it spins through
+# them.  The node halts after its last test, so the run ends early.
+run_test test_timer_sleep_one \
+    "$TESTS/test_timer_sleep_one.c $TOP/lib/transputer-conc.c" 5s
+cpu_below test_timer_sleep_one 0.6
 
 exit $(( failures > 0 ))

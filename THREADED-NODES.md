@@ -1260,6 +1260,28 @@ the call to address 0 (the warning is hidden by the scripts'
 `2>/dev/null`), and five of the eight wild-jumped on every t4.  That row
 is from a current compiler.
 
+**With the farm fixed (2026-11-05).**  The "all time out" row above is the
+program's farm deadlock, which its rebuilt images no longer have ("The
+reworked tracer at 24 nodes and more", below).  Rerun on them (t4
+1286dc7, model 3, each case twice, host load 0-33), every setting renders
+the reference image at 8, 16, 24, 48 and 80 nodes:
+
+| setting | render time a run | the same work distribution twice |
+|---|---|---|
+| node time off | 0.45-1.3 s | no |
+| `T4_LOCKSTEP=1` | 1.8-2.8 s | no |
+| `T4_LOCKSTEP=1 T4_LOCKSTEP_LINK=3,0,1` | 1.8-3.8 s | no |
+| `T4_LOCKSTEP_WINDOW=256` | 18-106 s | no |
+| all three | 25-41 s | no |
+
+"The same work distribution" compares the rays each worker traced; the
+image is the same either way.  So stamps cost the farm two to three times
+its render time and a window thirty to a hundred, and no setting makes a
+run repeat exactly.  Probably the host side: node 0's iserver link is not
+a stamped mailbox, so when the host answers it is still the host's
+business (not checked).  Why stamps space the opening jobs out no longer
+decides whether the farm finishes; it is still not established.
+
 ### The reworked tracer at 24 nodes and more (2026-11-04)
 
 The hang is the farm deadlock `testall.sh` describes, reached during the
@@ -1493,8 +1515,12 @@ round again, so a 2 s `tin` cost 2 s of host CPU (4.07 s of CPU in a
 4.1 s run).  It now sleeps until 200 us before its first timer is due
 (`timer_wait_us()`: the high priority clock ticks every 1us, the low
 every 64us, TCWG 6.3.1), or until a link wakes it, and polls only that
-last stretch, so a timer fires as promptly as before.  One node alone
-(no fabric) is unchanged.  `tests/test_timer_sleep.c`: a word that
+last stretch, so a timer fires as promptly as before.  Since 2026-11-05
+a node on its own sleeps too (`usleep`, ended early by a signal), and a
+node of a `-sl` or `ipc://` network polls its links for the time
+(`tests/test_timer_sleep_one.c`: 1.9 s of host CPU in 1.8 s of waits
+before, 0.15 s after; the Linux image boots to its desktop as before,
+its idle loop being no timer wait).  `tests/test_timer_sleep.c`: a word that
 arrives while node 0 sleeps on a 2 s timer guard wins the ALT about
 200 ms in, and 1 s at low priority and 0.5 s at high priority end on
 time; 1.8 s of host CPU before, 0.3 s after.  The ray tracer's farm has

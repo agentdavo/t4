@@ -11108,12 +11108,13 @@ int run_process (void)
 	return (0);
 }
 
-/* How long a threaded node with nothing to run but a timer sleeps.  The
- * idle loop below only sleeps (in linkcomms) when the timer queues are
- * empty, so a node waiting on a timer went round it polling the links,
- * and a 2 s tin cost 2 s of a host core.  It now sleeps until TIMER_POLL_US
- * before its first timer is due, or a link wakes it, and polls only that
- * last stretch, so that a timer fires as promptly as it did. */
+/* How long a processor with nothing to run but a timer sleeps.  The idle
+ * loop below only sleeps (in linkcomms) when the timer queues are empty,
+ * so a processor waiting on a timer went round it polling, and a 2 s tin
+ * cost 2 s of a host core.  It now sleeps until TIMER_POLL_US before its
+ * first timer is due, or a link wakes it, and polls only that last
+ * stretch, so that a timer fires as promptly as it did.  Threaded nodes
+ * since 7dbdf73, single nodes and nodes of processes since 2026-11-05. */
 #define TIMER_POLL_US   200
 
 /* Microseconds until the first process on an enabled timer queue is due:
@@ -11238,13 +11239,26 @@ int start_process (void)
                 if (t4_net_stop_requested())
                         return 1;
                 /* nothing to run but a timer: sleep until it is nearly due
-                 * (timer_wait_us); a link event wakes the node sooner */
-                if (t4cpu->idle && ProcessQEmpty && !TimerQEmpty)
+                 * (timer_wait_us).  A threaded node waits on its condition
+                 * variable, which a link event signals; a node of processes
+                 * polls its links for the time (linkcomms, 1 ms slices); a
+                 * node with no links has nothing else that could wake it,
+                 * and a signal ends its usleep. */
+                if (ProcessQEmpty && !TimerQEmpty)
                 {
                         long us = timer_wait_us ();
 
                         if (us > TIMER_POLL_US)
-                                t4_node_idle_wait_us (t4cpu, us - TIMER_POLL_US, FALSE);
+                        {
+                                us -= TIMER_POLL_US;
+                                if (t4cpu->idle)
+                                        t4_node_idle_wait_us (t4cpu, us, FALSE);
+                                else if (nodeid < 0 && !t4cpu->s_loopback &&
+                                         !t4cpu->s_ctl_links)
+                                        usleep ((useconds_t)us);
+                                else if (us >= 1000)
+                                        linkcomms ("idle", FALSE, (int)(us / 1000));
+                        }
                 }
                 /* A pending SIGINT/SIGTERM is normally serviced at
                  * ExecuteInstr, which an idle emulator never reaches: a
@@ -11711,6 +11725,7 @@ void purge_timer (void)
  * decides by the clock, not by the list, so it chooses as before. */
 void t4_wake_alt (uint32_t wdesc)
 {
+        purge_timer_of (GetDescWPtr (wdesc), GetDescPriority (wdesc));
         t4_wake (wdesc);
 }
 
@@ -11731,8 +11746,6 @@ void schedule_timerq (int prio)
 		         * channel that becomes ready before the process runs
 		         * must not schedule it again (ISM 8.7: only a Waiting
 		         * ALT is descheduled) */
-		        if (word (index (TPtrLoc[prio], State_s)) == Ready_p)
-		                fprintf (stderr, "[TQ] scheduling a Ready ALT #%08X prio %d%c", TPtrLoc[prio], prio, 10);
 		        if (word (index (TPtrLoc[prio], State_s)) == Waiting_p)
 		                writeword (index (TPtrLoc[prio], State_s), Ready_p);
 		        schedule (TPtrLoc[prio] | prio);
