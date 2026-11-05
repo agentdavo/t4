@@ -298,6 +298,38 @@ occam 1,706). Together the C gap to Occam fell from 6.61% to 4.62%. All
 four models matched the reference PPMs on one and four nodes, and model
 3 on 16 and 64, with each build.
 
+### One-word copies and store addresses (2026-11-05)
+
+`shadeNode` copies the `W` union, one word, seven or eight times a call
+(`shadowNode[n_dx] = light[l_dx]` and the like). C did each as a block
+move with its two addresses parked, about 18 cycles:
+
+    before: ldl 30; ldnlp 15; ldl 28; ldnlp 3; rev; ldc 4; move
+    after:  ldl 28; ldnl 3; ldl 30; stnl 15
+
+A word-aligned one-word struct is now a load and a store, and a new
+scheduler rule recomputes the destination address at the store instead of
+carrying it under the value. Same conditions as above:
+
+| Build | Executed instructions | Modeled T800 cycles | shadeNode | shade |
+|---|---:|---:|---:|---:|
+| Occam BTL | 1,058,991,381 | 2,947,938,342 | 498 | 393 |
+| Repeated float constants | 1,201,334,990 | 3,084,034,732 | 634 | 454 |
+| Main before this, with other work since | 1,200,597,432 | 3,084,349,863 | 634 | 451 |
+| One-word copies, addresses at the store | 1,188,088,259 | 3,056,072,405 | 524 | 439 |
+
+28,277,458 cycles saved; the C gap to Occam is 3.67%. A first cut of the
+store rule hung model 3 on one node: `findRange`'s `if (c > max) max =
+c;` jumps over the copy into `max`, onto padding the rule stepped over, and
+the later read of `max` was replaced by the copy's source. A second left
+the scheduler's liveness stale after moving a read, so a later rewrite
+deleted a store still needed; the pictures did not show that one, but the
+compiler's test suites and the Linux kernel did. A third deleted an
+instruction a jump landed on, and another rule then carried a value across
+that join that only one path had pushed: two of 300 random programs from
+the differential fuzzer. All four models matched the reference PPMs on one
+and four nodes, and model 3 on 16 and 64, after all three fixes.
+
 ## Programming or compiler?
 
 Both, in that order of discovery.
