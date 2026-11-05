@@ -46,6 +46,7 @@ typedef struct cpu_t {
 
         REAL s_FAReg, s_FBReg, s_FCReg, s_FARegSave, s_FBRegSave, s_FCRegSave;
         int  s_FP_Error, s_RoundingMode, s_ResetRounding;
+        int  s_RoundingSticky;  /* a T9000 fprX mode, held until fprn */
 
         u_char  *s_mem;
         u_char  *s_core;
@@ -144,6 +145,7 @@ int    cpu_setup_ram(cpu_t *c);
 #define FP_Error      (t4cpu->s_FP_Error)
 #define RoundingMode  (t4cpu->s_RoundingMode)
 #define ResetRounding (t4cpu->s_ResetRounding)
+#define RoundingSticky (t4cpu->s_RoundingSticky)
 #define mem           (t4cpu->s_mem)
 #define core          (t4cpu->s_core)
 #define CLineTags     (t4cpu->s_CLineTags)

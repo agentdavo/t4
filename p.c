@@ -8879,7 +8879,7 @@ DescheduleOutWord:
 		case 0xd0: /* fprn - set round to nearest               (T9000) */
 		           BADCODE(IsT414);
                            fp_setrounding ("fprn", ROUND_N);
-                           /* Do not reset rounding mode. */
+                           RoundingSticky = FALSE;
 		           IPtr++;
 		           break;
 		case 0xd1: /* fpdivby2                                  (T9000) */
@@ -8900,19 +8900,22 @@ DescheduleOutWord:
 		case 0xd4: /* fprp - set round to plus infinity         (T9000) */
 		           BADCODE(IsT414);
                            fp_setrounding ("fprp", ROUND_P);
-                           /* Do not reset rounding mode. */
+                           /* The T9000's modes hold until fprn, unlike the
+                            * T800's fpurX, which govern the next FP
+                            * instruction only. */
+                           RoundingSticky = TRUE;
 		           IPtr++;
 		           break;
 		case 0xd5: /* fprm - set round to minus infinity        (T9000) */
 		           BADCODE(IsT414);
                            fp_setrounding ("fprm", ROUND_M);
-                           /* Do not reset rounding mode. */
+                           RoundingSticky = TRUE;
 		           IPtr++;
 		           break;
 		case 0xd6: /* fprz - set round to zero                  (T9000) */
 		           BADCODE(IsT414);
                            fp_setrounding ("fprz", ROUND_Z);
-                           /* Do not reset rounding mode. */
+                           RoundingSticky = TRUE;
 		           IPtr++;
 		           break;
 		case 0xd7: /* fpr32tor64                                (T9000) */
@@ -9016,15 +9019,19 @@ DescheduleOutWord:
 			              break;
 			   case 0x04: /* fpurp    */
                                       fp_setrounding ("fpurp", ROUND_P);
-                                      /* Do not reset rounding mode. */
+                                      /* Do not reset rounding mode: the
+                                       * next FP instruction does. */
+                                      RoundingSticky = FALSE;
 			              break;
 			   case 0x05: /* fpurm    */
                                       fp_setrounding ("fpurm", ROUND_M);
                                       /* Do not reset rounding mode. */
+                                      RoundingSticky = FALSE;
 			              break;
 			   case 0x06: /* fpurz    */
                                       fp_setrounding ("fpurz", ROUND_Z);
                                       /* Do not reset rounding mode. */
+                                      RoundingSticky = FALSE;
 			              break;
 			   case 0x07: /* fpur32tor64    */
 #ifdef EMUDEBUG
@@ -9126,6 +9133,7 @@ DescheduleOutWord:
 			   case 0x22: /* fpurn    */
                                       fp_setrounding ("fpurn", ROUND_N);
                                       /* Do not reset rounding mode. */
+                                      RoundingSticky = FALSE;
 			              break;
 			   case 0x23: /* fpuseterr    */
                                       FP_Error = TRUE;
@@ -10484,6 +10492,7 @@ DescheduleOutWord:
                                t9k_fp_load_reg (ptr + 20, &FCReg, t9k_fp_ldec ((st >> 4) & 3u));
                                FP_Error = (st & (1u << 6)) ? TRUE : FALSE;
                                fp_setrounding ("fpldall", (int)((st >> 8) & 7u));
+                               RoundingSticky = RoundingMode != ROUND_N;
                                AReg = BReg;
                                BReg = CReg;
                            }
@@ -10769,8 +10778,9 @@ BadCode:
         if (Icode != 0x20 && Icode != 0x60) {
                 OReg = 0;
         }
-                /* Reset rounding mode to round nearest. */
-                if (ResetRounding && (RoundingMode != ROUND_N))
+                /* Reset rounding mode to round nearest, unless a T9000
+                 * fprX set it: those hold until fprn. */
+                if (ResetRounding && (RoundingMode != ROUND_N) && !RoundingSticky)
                         fp_setrounding ("reset", ROUND_N);
 
 		PROFILE(profile[PRO_INSTR]++);
