@@ -1124,6 +1124,7 @@ Each PR is independently reviewable and mergeable. Process mode stays green thro
 - **Files:** `t4_fabric.c`.
 - **Dependencies:** PR 6 has been green at N=80 (`testall.sh --threads`). **Not v1.**
 - **Description:** Linux-only, behind `T4_IDLE_FUTEX=1`. Do not touch SysV SHM. Measure idle wake vs pthread_cond at N=80 before flipping any default.
+- **Done 2026-11-05: the default on Linux** (`T4_IDLE_FUTEX=0` for the condition variable).  `testall.sh --threads` is green at N=80 since the ray tracer's farm was fixed, and the futex wait measured faster in every pair: the ray tracer's chain boot (to its menu), alternating runs at host load 12-23, 32 nodes 3.1-3.8 s against 3.9-4.7 s, 80 nodes 26-36 s against 35-40 s, with about a fifth less kernel time.  The wake count is read and bumped with atomics now, since a futex waiter reads it without the mutex.  The boot stays bound by thread wake-ups: 80 nodes forward about 900,000 messages ("The reworked tracer at 24 nodes and more").
 
 ### PR 8 — (follow-up, after Linux oracle) macOS `-st`
 
@@ -1438,7 +1439,14 @@ signal.  With that, all 80
 still had not finished after 15 minutes at host load 60-70 (80 processes
 polling their mailboxes, and another project's jobs on 14 of the 20
 cores), where 64 took 129 s at load about 10.  `-sl` polls; only
-threaded nodes sleep on their links.
+threaded nodes sleep on their links.  Making `-sl` nodes sleep too needs
+a wake-up across processes, a futex on the shared segment, and rule 5 of
+"Recent fixes this design must not re-litigate" forbids one: a
+SharedWake futex was reverted when "N=8 SHM hung, 0 R patch".  That
+symptom, no patch back at 8 nodes, is also what the ray tracer's own
+farm deadlock produced (fixed in the program, above), so the futex may
+not have been the cause; nothing here shows either way, and the rule
+stands until the project lifts it.
 
 Waiting without a limit exposed a bug the limit had hidden: the link a
 node is being booted on (`BootLink`, the one `linkcomms()` then listens
